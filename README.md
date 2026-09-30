@@ -12,6 +12,7 @@ Learn about the Development of KisakCOD here: [https://lwss.github.io/Duty-Of-Ki
 
 ## Nintendo Switch port (work in progress)
 
+<img width="1280" height="720" alt="image" src="https://github.com/user-attachments/assets/a60bd86b-fc9b-461f-96b5-5497ee30eb56" />
 
 This fork runs the single-player campaign on the Nintendo Switch as a homebrew NRO.
 It is single-player only for now: multiplayer is not ported yet.
