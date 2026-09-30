@@ -1,4 +1,5 @@
 #include <universal/q_shared.h>
+#include <cstddef>
 #include "phys_local.h"
 #include <universal/com_memory.h>
 #include <qcommon/qcommon.h>
@@ -6,21 +7,7 @@
 
 void *(__cdecl *physAlloc)(int);
 
-cspField_t physPresetFields[10] =
-{
-  { "mass", 0, CSPFT_FLOAT },
-  { "bounce", 4, CSPFT_FLOAT },
-  { "friction", 8, CSPFT_FLOAT },
-  { "isFrictionInfinity", 12, CSPFT_QBOOLEAN },
-  { "bulletForceScale", 16, CSPFT_FLOAT },
-  { "explosiveForceScale", 20, CSPFT_FLOAT },
-  { "sndAliasPrefix", 24, CSPFT_STRING },
-  { "piecesSpreadFraction", 28, CSPFT_FLOAT },
-  { "piecesUpwardVelocity", 32, CSPFT_FLOAT },
-  { "tempDefaultToCylinder", 36, CSPFT_QBOOLEAN }
-}; // idb
-
-struct PhysPresetLite // LWSS add custom struct to adhere to the above field offfsets
+struct PhysPresetLite // LWSS add custom struct; the field table below indexes it by offsetof (LP64: sndAliasPrefix is pointer-width)
 {
     float mass;   // 0
     float bounce; // 4
@@ -33,6 +20,21 @@ struct PhysPresetLite // LWSS add custom struct to adhere to the above field off
     float piecesUpwardVelocity; // 32
     bool tempDefaultToCylinder; // 36
 };
+
+cspField_t physPresetFields[10] =
+{
+  { "mass", offsetof(PhysPresetLite, mass), 6 },
+  { "bounce", offsetof(PhysPresetLite, bounce), 6 },
+  { "friction", offsetof(PhysPresetLite, friction), 6 },
+  { "isFrictionInfinity", offsetof(PhysPresetLite, isFrictionInfinity), 5 },
+  { "bulletForceScale", offsetof(PhysPresetLite, bulletForceScale), 6 },
+  { "explosiveForceScale", offsetof(PhysPresetLite, explosiveForceScale), 6 },
+  { "sndAliasPrefix", offsetof(PhysPresetLite, sndAliasPrefix), 0 },
+  { "piecesSpreadFraction", offsetof(PhysPresetLite, piecesSpreadFraction), 6 },
+  { "piecesUpwardVelocity", offsetof(PhysPresetLite, piecesUpwardVelocity), 6 },
+  { "tempDefaultToCylinder", offsetof(PhysPresetLite, tempDefaultToCylinder), 5 }
+}; // idb
+
 
 void __cdecl PhysPreset_Strcpy(uint8_t *member, const char *keyValue)
 {
@@ -51,11 +53,11 @@ void __cdecl PhysPreset_Strcpy(uint8_t *member, const char *keyValue)
             v2 = *v4;
             *v3++ = *v4++;
         } while (v2);
-        *(_DWORD *)member = (_DWORD)buf;
+        *(const char **)member = buf; // LP64: pointer-width store
     }
     else
     {
-        *(_DWORD *)member = (_DWORD)"";
+        *(const char **)member = ""; // LP64: pointer-width store
     }
 }
 
@@ -95,7 +97,7 @@ PhysPreset *__cdecl PhysPresetLoadFile(const char *name, void *(__cdecl *Alloc)(
                         physAlloc = Alloc;
                         if (ParseConfigStringToStruct((unsigned char*)&pStruct, physPresetFields, 10, buffer, 0, 0, PhysPreset_Strcpy))
                         {
-                            iassert(sizeof(PhysPreset) == 44);
+                            iassert(sizeof(PhysPreset) == 44 || sizeof(void *) == 8); // LP64: name+sndAliasPrefix widen
 
                             physPreset = (PhysPreset *)Alloc(sizeof(PhysPreset));
 

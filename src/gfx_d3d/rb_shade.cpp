@@ -68,14 +68,11 @@ void __cdecl R_HW_SetPixelShader(IDirect3DDevice9 *device, const MaterialPixelSh
     {
         if (r_logFile && r_logFile->current.integer)
             RB_LogPrint("device->SetPixelShader( mtlShader ? mtlShader->prog.ps : 0 )\n");
-        if (mtlShader)
-        {
+
+        if (mtlShader && mtlShader->prog.ps)
             v2 = device->SetPixelShader(mtlShader->prog.ps);
-        }
         else
-        {
             v2 = device->SetPixelShader(0);
-        }
         hr = v2;
         if (v2 < 0)
         {
@@ -272,6 +269,7 @@ void __cdecl R_DrawTessTechnique(GfxCmdBufContext context, const GfxDrawPrimArgs
         R_SetupPass(context, passIndex);
         R_UpdateVertexDecl(context.state);
         R_SetupPassCriticalPixelShaderArgs(context);
+        R_SetupPassVertexShaderArgs(context);
         vb = gfxBuf.dynamicVertexBuffer->buffer;
         iassert(vb);
         R_SetStreamSource(&context.state->prim, vb, vertexOffset, 0x20u);
@@ -296,4 +294,3 @@ void __cdecl RB_TessOverflow()
     RB_BeginSurface(gfxCmdBufState.origMaterial, gfxCmdBufState.origTechType);
     g_primStats = primStats;
 }
-

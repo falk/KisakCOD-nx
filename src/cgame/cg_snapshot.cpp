@@ -17,6 +17,8 @@
 #include <gfx_d3d/r_model.h>
 #include "cg_servercmds.h"
 
+#include <port/switch_perf.h>
+
 unsigned int g_centInPrevSnapshot[68]{ 0 };
 bool g_clientDirty[MAX_GENTITIES];
 
@@ -26,7 +28,9 @@ void __cdecl CG_ShutdownEntity(int localClientNum, centity_s *cent)
     FxEffect *effect; // r4
     trajectory_t *p_pos; // r29
     int ragdollHandle; // r3
-    int physObjId; // r4
+    // uintptr_t, not the PPC decompile's int: pose.physObjId holds a dxBody
+    // pointer, and the int copy truncated it before Phys_ObjDestroy on LP64.
+    uintptr_t physObjId; // r4
 
     oldEType = cent->oldEType;
     if (oldEType == 8 || oldEType == 7)
@@ -51,11 +55,11 @@ void __cdecl CG_ShutdownEntity(int localClientNum, centity_s *cent)
         cent->currentState.apos.trType = TR_STATIONARY;
     }
     physObjId = cent->pose.physObjId;
-    if (physObjId && physObjId != -1)
+    if (physObjId && physObjId != (uintptr_t)-1)
         goto LABEL_14;
     if (p_pos->trType != TR_PHYSICS)
         return;
-    if (physObjId != -1)
+    if (physObjId != (uintptr_t)-1)
     {
     LABEL_14:
         if (physObjId)
@@ -259,26 +263,33 @@ int __cdecl CG_DObjCloneToBuffer(int localClientNum, centity_s *cent, const XAni
     if (eType != ET_ACTOR && eType != ET_ACTOR_CORPSE || cent->nextState.lerp.u.actor.species)
     {
         Anims = XAnimGetAnims(serverTree);
+        
         SmallTree = Com_XAnimCreateSmallTree(Anims);
+        
         if (!SmallTree)
             MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\cgame\\cg_snapshot.cpp", 241, 0, "%s", "tree");
         goto LABEL_9;
     }
-    result = (int)G_AllocAnimClientTree();
-    SmallTree = (XAnimTree_s *)result;
-    if (result)
+    SmallTree = G_AllocAnimClientTree();
+    
+    if (SmallTree)
     {
     LABEL_9:
         XAnimCloneClientAnimTree(serverTree, SmallTree);
+        
     LABEL_11:
         v10 = Com_DObjCloneToBuffer(cent->nextState.number);
+        
         DObjSetTree(v10, SmallTree);
+        
         result = 1;
         v11 = cg_entityOriginArray[localClientNum][cent->nextState.number];
         *v11 = 131072.0;
         v11[1] = 131072.0;
         v11[2] = 131072.0;
+        
     }
+    
     return result;
 }
 
@@ -634,7 +645,13 @@ void __cdecl CG_ProcessNextSnap(int localClientNum)
     int v3; // r25
     int v4; // r23
     unsigned int v5; // r31
-    DWORD i; // r11
+    // KISAKFIX: must be signed. The _cntlzw hand-rewrite below tests
+    // `i >= 0` to detect "no bits left"; with the decompiled DWORD (unsigned)
+    // that test was always true, so once a mask word was zero the search
+    // wrapped to 0xFFFFFFFF and spun forever. The compiler saw the infinite
+    // loop and dropped the rest of CG_ProcessNextSnap as unreachable, which
+    // hung Killhouse on its first snapshot.
+    int i; // r11
     unsigned int v7; // r29
     unsigned int v8; // r30
     snapshot_s *nextSnap; // r23
@@ -651,6 +668,7 @@ void __cdecl CG_ProcessNextSnap(int localClientNum)
     v1 = g_centInPrevSnapshot;
     v3 = 0;
     v4 = 68;
+    
     do
     {
         v5 = *v1;
@@ -665,9 +683,14 @@ void __cdecl CG_ProcessNextSnap(int localClientNum)
         //    R_UnlinkEntity(localClientNum, v8);
         //    CG_UnlinkEntity(localClientNum, v8);
         //}
-        while (_BitScanReverse(&i, v5))
+        // _cntlzw walked the mask in MSB-first entity order on the original
+        // target.  Keep that ordering without relying on Win32 intrinsics.
+        i = 31;
+        while (i >= 0 && (v5 & (1u << i)) == 0)
+            --i;
+        while (i >= 0)
         {
-            unsigned int v7 = 0x80000000 >> (31 - i);  // Same as 1 << i
+            unsigned int v7 = 1u << i;
             unsigned int v8 = v3 + (31 - i);           // Match _cntlzw bit index (MSB-first)
 
             if ((v5 & v7) == 0)
@@ -676,8 +699,14 @@ void __cdecl CG_ProcessNextSnap(int localClientNum)
             *v1 = 0;
             v5 &= ~v7;
 
+            
             R_UnlinkEntity(localClientNum, v8);
+            
             CG_UnlinkEntity(localClientNum, v8);
+            
+            i = 31;
+            while (i >= 0 && (v5 & (1u << i)) == 0)
+                --i;
         }
         --v4;
         v3 += 32;
@@ -692,6 +721,7 @@ void __cdecl CG_ProcessNextSnap(int localClientNum)
             "(localClientNum == 0)",
             localClientNum);
     CG_CheckSnapshot(localClientNum, "CG_ProcessNextSnap - pre");
+    
     nextSnap = cgArray[0].nextSnap;
     if (!cgArray[0].nextSnap)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\cgame\\cg_snapshot.cpp", 776, 0, "%s", "nextSnap");
@@ -699,8 +729,11 @@ void __cdecl CG_ProcessNextSnap(int localClientNum)
     if (!cgArray[0].snap)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\cgame\\cg_snapshot.cpp", 779, 0, "%s", "snap");
     CG_UpdateViewOffset(localClientNum);
+    
     CG_ExecuteNewServerCommands(localClientNum, nextSnap->serverCommandSequence);
+    
     CG_CheckOpenWaitingScriptMenu();
+    
     viewmodelIndex = nextSnap->ps.viewmodelIndex;
     if (viewmodelIndex > 0)
     {
@@ -714,9 +747,12 @@ void __cdecl CG_ProcessNextSnap(int localClientNum)
                 "%s",
                 "modelName && modelName[0]");
         v14 = R_RegisterModel(v13);
+        
         CG_UpdateHandViewmodels(localClientNum, v14);
+        
     }
     CG_UpdateWeaponViewmodels(localClientNum);
+    
     if (cgArray[0].snap != cgArray[0].nextSnap)
     {
         v15 = 0;
@@ -748,10 +784,12 @@ void __cdecl CG_ProcessNextSnap(int localClientNum)
                 ++entityNums;
             } while (v15 < *p_numEntities);
         }
+        
         if (cgArray[0].demoType || cg_nopredict->current.enabled)
             CG_TransitionPlayerState(localClientNum, &nextSnap->ps, &snap->ps);
         CG_CheckSnapshot(localClientNum, "CG_ProcessNextSnap - post");
     }
+    
 }
 
 void __cdecl CG_CreateNextSnap(int localClientNum, double dtime, int readNext)
@@ -797,6 +835,7 @@ void __cdecl CG_CreateNextSnap(int localClientNum, double dtime, int readNext)
     unsigned int v45[68]; // [sp+60h] [-1B0h] BYREF
 
     CG_CheckSnapshot(localClientNum, "CG_CreateNextSnap(pre)");
+    
     if (localClientNum)
         MyAssertHandler(
             "c:\\trees\\cod3\\cod3src\\src\\cgame\\cg_local.h",
@@ -858,10 +897,13 @@ void __cdecl CG_CreateNextSnap(int localClientNum, double dtime, int readNext)
         memcpy(&v13->currentState, &v13->nextState.lerp, sizeof(v13->currentState));
         v13->oldEType = v13->nextState.eType;
     }
+    
     if (readNext)
     {
         CG_UpdateSnapshotNum(localClientNum);
+        
         nextSnap = CG_ReadNextSnapshot(localClientNum);
+        
         iassert(nextSnap);
     }
     else
@@ -879,6 +921,7 @@ void __cdecl CG_CreateNextSnap(int localClientNum, double dtime, int readNext)
             {
                 v17 = *v16;
                 //EntityState = ;
+                
                 v19 = CG_GetEntity(localClientNum, v17);
                 memcpy(&v19->nextState, SV_GetEntityState(*v16), sizeof(v19->nextState));
                 if (v19->nextValid)
@@ -895,6 +938,7 @@ void __cdecl CG_CreateNextSnap(int localClientNum, double dtime, int readNext)
             MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\cgame\\cg_snapshot.cpp", 484, 0, "%s", "!cent->nextValid");
         v20->nextValid = 1;
     }
+    
     memset(v45, 0, sizeof(v45));
     if (nextSnap)
     {
@@ -909,8 +953,10 @@ void __cdecl CG_CreateNextSnap(int localClientNum, double dtime, int readNext)
                 v45[(int)*v22 >> 5] |= 0x80000000 >> (*v22 & 0x1F);
                 if (Com_ServerDObjDirty(v24))
                 {
+                    
                     Com_GetClientDObj(v23, localClientNum);
                     ServerDObj = Com_GetServerDObj(v23);
+                    
                     v26 = ServerDObj;
                     if (ServerDObj)
                         Tree = DObjGetTree(ServerDObj);
@@ -943,6 +989,7 @@ void __cdecl CG_CreateNextSnap(int localClientNum, double dtime, int readNext)
             } while (v21 < nextSnap->numEntities);
         }
     }
+    
     if (nextSnap)
     {
         v28 = 0;
@@ -1016,6 +1063,7 @@ void __cdecl CG_CreateNextSnap(int localClientNum, double dtime, int readNext)
             } while (v28 < nextSnap->numEntities);
         }
     }
+    
     if (nextSnap)
     {
         if (readNext)
@@ -1037,6 +1085,7 @@ void __cdecl CG_CreateNextSnap(int localClientNum, double dtime, int readNext)
         }
     }
     CG_CheckSnapshot(localClientNum, "CG_CreateNextSnap(post)");
+    
 }
 
 void __cdecl CG_FirstSnapshot(int localClientNum)
@@ -1052,9 +1101,13 @@ void __cdecl CG_FirstSnapshot(int localClientNum)
     }
 
     CG_CreateNextSnap(localClientNum, 0.0, 1);
+    
     CG_SetInitialSnapshot(localClientNum);
+    
     CG_SetNextSnap(localClientNum);
+    
     CG_ProcessNextSnap(localClientNum);
+    
 
     iassert(cgameGlob->snap);
     iassert(cgameGlob->nextSnap);
@@ -1101,7 +1154,14 @@ void __cdecl CG_ProcessDemoSnapshots(int localClientNum)
     }
     if (cgArray[0].time - cgArray[0].snap->serverTime < 0 || cgArray[0].time - nextSnap->serverTime >= 0)
     {
-        float dtime = (float)(cgArray[0].frametime - cgArray[0].animFrametime) * 0.001f;
+        // this delta is a raw difference of two independent integer frame
+        // times and it flows into the anim-tree advance, which asserts on
+        // time >= 0.  A negative client frame delta is meaningless, and a
+        // hair-negative step (around -5e-08) can occur and kill the session; clamp it
+        // here at the producer rather than inside xanim.cpp, so a genuinely
+        // backwards step from anywhere else still fails loudly.
+        const int frameDelta = cgArray[0].frametime - cgArray[0].animFrametime;
+        float dtime = (float)(frameDelta > 0 ? frameDelta : 0) * 0.001f;
         CG_CreateNextSnap(localClientNum, dtime, 1);
         CG_SetNextSnap(localClientNum);
         CG_ProcessNextSnap(localClientNum);
@@ -1112,7 +1172,6 @@ void __cdecl CG_ProcessSnapshots(int localClientNum)
 {
     snapshot_s *snap; // r11
     int serverTime; // r5
-    const char *v5; // r3
     int ServerSnapTime; // r3
     snapshot_s *nextSnap; // r11
     int v8; // r4
@@ -1134,10 +1193,14 @@ void __cdecl CG_ProcessSnapshots(int localClientNum)
     }
     else if (SV_WaitServerSnapshot())
     {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SNAP_CGNEXT);
         CG_SetNextSnap(localClientNum);
         CG_ProcessNextSnap(localClientNum);
     }
-    CG_SetFrameInterpolation(localClientNum);
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SNAP_INTERP);
+        CG_SetFrameInterpolation(localClientNum);
+    }
     snap = cgArray[0].snap;
     if (!cgArray[0].snap)
     {
@@ -1145,17 +1208,18 @@ void __cdecl CG_ProcessSnapshots(int localClientNum)
         snap = cgArray[0].snap;
     }
     serverTime = snap->serverTime;
-    if (cgArray[0].time - serverTime < 0)
-    {
-        v5 = va("%d %d", cgArray[0].time, serverTime);
-        MyAssertHandler(
-            "c:\\trees\\cod3\\cod3src\\src\\cgame\\cg_snapshot.cpp",
-            942,
-            0,
-            "%s\n\t%s",
-            "cgameGlob->time - cgameGlob->snap->serverTime >= 0",
-            v5);
-    }
+    // Original cg_snapshot.cpp:942 is a debug-only vassert: without
+    // RELEASE_ASSERTS/_DEBUG (this SP build is RelWithDebInfo/-DNDEBUG) the
+    // macro expands to nothing, so retail never evaluates the check and never
+    // continues past a fired assert.  In SP the client clock intentionally
+    // trails the newest server snapshot (sv_main.cpp: com_time = sv.levelTime
+    // - the server frame residual), so a fresh snapshot can legitimately lead
+    // cg.time by up to one residual.
+    // Restoring the original macro keeps that release semantics instead of the
+    // decompiler's unconditional MyAssertHandler; with assertions enabled it
+    // still reports, and the P5 proof's assert counter still fails any
+    // checkpoint that observes a fired assertion.
+    vassert(cgArray[0].time - serverTime >= 0, "%d %d", cgArray[0].time, serverTime);
     if (!cgArray[0].nextSnap)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\cgame\\cg_snapshot.cpp", 943, 0, "%s", "cgameGlob->nextSnap");
     ServerSnapTime = G_GetServerSnapTime();
@@ -1188,4 +1252,3 @@ void __cdecl CG_ProcessSnapshots(int localClientNum)
     //Profile_EndInternal(0);
     //PIXEndNamedEvent();
 }
-

@@ -45,7 +45,9 @@ struct DynEntityDef // sizeof=0x60
     PhysMass mass;
     int32_t contents;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(DynEntityDef) == 0x60);
+#endif
 
 struct DynEntityPose // sizeof=0x20
 {
@@ -56,12 +58,17 @@ static_assert(sizeof(DynEntityPose) == 0x20);;
 
 struct DynEntityClient // sizeof=0xC
 {
-    int32_t physObjId;
+    // Physics returns an opaque pointer on ODE/Switch.  Keep the retail
+    // 32-bit serialized shape, but widen the live handle on LP64 so object
+    // identity is never truncated before being passed back to physics.
+    uintptr_t physObjId;
     uint16_t flags;
     uint16_t lightingHandle;
     int32_t health;
 };
+#if UINTPTR_MAX == UINT32_MAX
 static_assert(sizeof(DynEntityClient) == 0xC);
+#endif
 
 struct DynEntityColl // sizeof=0x14
 {
@@ -81,7 +88,9 @@ struct DynEntityAreaParms // sizeof=0x14
     uint16_t maxCount;          // ...
     uint16_t count;             // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(DynEntityAreaParms) == 0x14);
+#endif
 
 struct DynEntSortStruct // sizeof=0x8
 {
@@ -97,12 +106,14 @@ static_assert(sizeof(DynEntSortStruct) == 0x8);
 struct BreakablePiece // sizeof=0xC
 {                                       // ...
     const XModel *model;                // ...
-    int32_t physObjId;                      // ...
+    uintptr_t physObjId;                 // live physics handle; widened on LP64
     uint16_t lightingHandle;    // ...
     bool active;                        // ...
     // padding byte
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(BreakablePiece) == 0xC);
+#endif
 
 struct pointtrace_t;
 struct trace_t;
@@ -256,7 +267,9 @@ struct DynEntityProps // sizeof=0x8
     bool usePhysics;
     bool destroyable;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(DynEntityProps) == 0x8);
+#endif
 
 struct DynEntityCreateParams // sizeof=0x1C0
 {                                       // ...
@@ -382,4 +395,3 @@ void __cdecl DynEnt_SetPhysObjCollision(const DynEntityDef *dynEntDef, dxBody *p
 
 extern int32_t numPieces;
 extern BreakablePiece g_breakablePieces[100];
-

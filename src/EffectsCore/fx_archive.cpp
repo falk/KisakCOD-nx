@@ -5,12 +5,30 @@
 
 #include <physics/phys_local.h>
 
+// Rebase the vis-state double buffer pointers of a restored FxSystem from
+// the saving process's addresses to the live FxSystemBuffers.  The saved
+// pointers must each name visState[0] or visState[1] of the saved base and
+// differ; anything else is a corrupt record.
+bool __cdecl FX_RebaseVisStateBuffers(FxSystem *system, uintptr_t savedVisState, uintptr_t savedRead,
+                                      uintptr_t savedWrite)
+{
+    const uintptr_t stride = sizeof(FxVisState);
+    const uintptr_t readOffset = savedRead - savedVisState;
+    const uintptr_t writeOffset = savedWrite - savedVisState;
+    if (!savedVisState || !system->visState)
+        return false;
+    if ((readOffset != 0 && readOffset != stride) || (writeOffset != 0 && writeOffset != stride) ||
+        readOffset == writeOffset)
+        return false;
+    system->visStateBufferRead = system->visState + readOffset / stride;
+    system->visStateBufferWrite = system->visState + writeOffset / stride;
+    return true;
+}
+
 void __cdecl FX_Restore(int32_t clientIndex, MemoryFile *memFile)
 {
     int32_t v2; // [esp+0h] [ebp-201Ch] BYREF
     FxEffectDefTable table; // [esp+4h] [ebp-2018h] BYREF
-    int32_t v4; // [esp+200Ch] [ebp-10h]
-    int32_t relocationDistance; // [esp+2010h] [ebp-Ch]
     void *p; // [esp+2014h] [ebp-8h]
     FxSystemBuffers *systemBuffers; // [esp+2018h] [ebp-4h]
 
@@ -21,18 +39,38 @@ void __cdecl FX_Restore(int32_t clientIndex, MemoryFile *memFile)
     if (!systemBuffers)
         MyAssertHandler(".\\EffectsCore\\fx_archive.cpp", 223, 0, "%s", "systemBuffers");
     FX_RestoreEffectDefTable(memFile, &table);
-    MemFile_ReadData(memFile, 2656, (uint8_t *)p);
-    if (!*((_BYTE *)p + 2526) || *((uint32_t *)p + 627))
+    // Native sizes, not the decompiler's ILP32 literals (0xA60 FxSystem,
+    // 0x47480 FxSystemBuffers): both are full of pointers on LP64, so the
+    // literal forms truncate the restore and leave isArchiving set.
+    FxSystem *system = (FxSystem *)p;
+    MemFile_ReadData(memFile, sizeof(FxSystem), (uint8_t *)system);
+    if (!system->isArchiving || system->iteratorCount)
         Com_Error(ERR_DROP, "Invalid save file");
-    FX_LinkSystemBuffers((FxSystem *)p, systemBuffers);
-    MemFile_ReadData(memFile, 291968, (uint8_t *)systemBuffers);
-    FX_FixupEffectDefHandles((FxSystem *)p, &table);
+    // The record holds the saving process's absolute visState pointers.
+    // Capture them before FX_LinkSystemBuffers overwrites visState: the
+    // double buffers are rebased by index below.
+    const uintptr_t savedVisState = (uintptr_t)system->visState;
+    const uintptr_t savedVisStateRead = (uintptr_t)system->visStateBufferRead;
+    const uintptr_t savedVisStateWrite = (uintptr_t)system->visStateBufferWrite;
+    FX_LinkSystemBuffers(system, systemBuffers);
+    MemFile_ReadData(memFile, sizeof(FxSystemBuffers), (uint8_t *)systemBuffers);
+    FX_FixupEffectDefHandles(system, &table);
+    // Legacy 32-bit system-address token (FX_Save writes the low half of
+    // the FxSystem pointer). The retail relocation added `system - token`
+    // to the saved visState pointers, which on LP64 is off by the whole
+    // high half once the image loads above 4 GiB. Keep reading the token
+    // (save format), but rebase from the full saved pointers instead.
     MemFile_ReadData(memFile, 4, (uint8_t *)&v2);
-    v4 = v2;
-    relocationDistance = (int)p - v2;
-    FX_RelocateSystem((FxSystem *)p, (int)p - v2);
-    FX_RestorePhysicsData((FxSystem *)p, memFile);
-    *((_BYTE *)p + 2526) = 0;
+    if (!FX_RebaseVisStateBuffers(system, savedVisState, savedVisStateRead, savedVisStateWrite))
+        Com_Error(ERR_DROP, "Invalid save file (FX vis state buffers)");
+    // Evidence for offline tooling: one line per FX restore.
+    Com_Printf(CON_CHANNEL_FX, "FX_RESTORE ok=1 read=%d write=%d effects=%d elems=%ld system=%p\n",
+               (int)(system->visStateBufferRead - system->visState),
+               (int)(system->visStateBufferWrite - system->visState),
+               (int)(system->firstNewEffect - system->firstActiveEffect), (long)system->activeElemCount,
+               (void *)system);
+    FX_RestorePhysicsData(system, memFile);
+    system->isArchiving = 0;
 }
 
 void __cdecl FX_RestoreEffectDefTable(MemoryFile *memFile, FxEffectDefTable *table)
@@ -86,7 +124,10 @@ void __cdecl FX_FixupEffectDefHandles(FxSystem *system, FxEffectDefTable *table)
     for (activeIndex = system->firstActiveEffect; activeIndex != system->firstNewEffect; ++activeIndex)
     {
         effect = FX_EffectFromHandle(system, system->allEffectHandles[activeIndex & 0x3FF]);
-        effectDef = FX_FindEffectDefInTable(table, (uint32_t)effect->def);
+        // Save files identify definitions by the original 32-bit pointer
+        // token.  Make the narrowing explicit through uintptr_t on LP64;
+        // the restored table still resolves the token by name.
+        effectDef = FX_FindEffectDefInTable(table, (uint32_t)(uintptr_t)effect->def);
         if (!effectDef)
             MyAssertHandler(".\\EffectsCore\\fx_archive.cpp", 139, 0, "%s", "effectDef");
         effect->def = effectDef;
@@ -99,7 +140,8 @@ FxEffect *__cdecl FX_EffectFromHandle(FxSystem *system, uint16_t handle)
 
     if (!system)
         MyAssertHandler("c:\\trees\\cod3\\src\\effectscore\\fx_system.h", 256, 0, "%s", "system");
-    if (handle >= 0x8000u || handle % 0x20u)
+    if (handle >= FX_EFFECT_LIMIT * sizeof(FxEffect) / FxEffect::HANDLE_SCALE
+        || handle % (sizeof(FxEffect) / FxEffect::HANDLE_SCALE))
     {
         v2 = va("%p %i", system->effects, handle);
         MyAssertHandler(
@@ -111,7 +153,7 @@ FxEffect *__cdecl FX_EffectFromHandle(FxSystem *system, uint16_t handle)
             ":HANDLE_SCALE) == 0",
             v2);
     }
-    return (FxEffect *)((char *)system->effects + 4 * handle);
+    return (FxEffect *)((char *)system->effects + FxEffect::HANDLE_SCALE * handle);
 }
 
 const FxEffectDef *__cdecl FX_FindEffectDefInTable(const FxEffectDefTable *table, uint32_t key)
@@ -152,7 +194,7 @@ void __cdecl FX_RestorePhysicsData(FxSystem *system, MemoryFile *memFile)
             elemHandleNext = elem->item.nextElemHandleInEffect;
             if (elemDef->elemType == 5 && (elemDef->flags & 0x8000000) != 0)
             {
-                elem->item.physObjId = (int)Phys_ObjLoad(PHYS_WORLD_FX, memFile);
+                elem->item.physObjId = (uintptr_t)Phys_ObjLoad(PHYS_WORLD_FX, memFile);
                 visuals = FX_GetElemVisuals(
                     elemDef,
                     (296 * elem->item.sequence + elem->item.msecBegin + (uint32_t)effect->randomSeed) % 0x1DF).model;
@@ -197,10 +239,12 @@ void __cdecl FX_Save(int32_t clientIndex, MemoryFile *memFile)
         MyAssertHandler(".\\EffectsCore\\fx_archive.cpp", 270, 0, "%s", "!system->isArchiving");
     system->isArchiving = 1;
     FX_SaveEffectDefTable(system, memFile);
-    MemFile_WriteData(memFile, 2656, system);
+    // sizeof, matching FX_Restore: the ILP32 literals (2656 / 291968) are the
+    // 32-bit struct sizes and truncate both records on LP64.
+    MemFile_WriteData(memFile, sizeof(FxSystem), system);
     UsedSize = MemFile_GetUsedSize(memFile);
     // ProfMem_Begin("systemBuffers", UsedSize);
-    MemFile_WriteData(memFile, 291968, systemBuffers);
+    MemFile_WriteData(memFile, sizeof(FxSystemBuffers), systemBuffers);
     v3 = MemFile_GetUsedSize(memFile);
     // ProfMem_End(v3);
     p = system;
@@ -220,11 +264,11 @@ void __cdecl FX_SaveEffectDefTable(FxSystem *system, MemoryFile *memFile)
 
 void __cdecl FX_SaveEffectDefTableEntry_FileLoadObj(const FxEffectDef* effectDef, MemoryFile* data)
 {
-    const FxEffectDef* p; // [esp+0h] [ebp-4h] BYREF
+    uint32_t key; // serialized 32-bit definition token
 
     MemFile_WriteCString(data, (char*)effectDef->name);
-    p = effectDef;
-    MemFile_WriteData(data, 4, &p);
+    key = (uint32_t)(uintptr_t)effectDef;
+    MemFile_WriteData(data, sizeof(key), &key);
 }
 
 void __cdecl FX_SaveEffectDefTable_LoadObj(MemoryFile* memFile)
@@ -277,4 +321,3 @@ void __cdecl FX_Archive(int32_t clientIndex, MemoryFile *memFile)
     else
         FX_Restore(clientIndex, memFile);
 }
-

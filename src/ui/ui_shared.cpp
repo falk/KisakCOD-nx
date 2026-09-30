@@ -33,6 +33,7 @@ int g_waitingForKey;
 int g_editingField;
 struct itemDef_s *g_editItem;
 int g_debugMode;
+extern itemDef_s *g_bindItem;
 void(__cdecl *captureFunc)(UiContext *, void *);
 void *captureData;
 
@@ -300,21 +301,6 @@ const commandDef_t commandList[46] =
   { "nextlevel", Script_ScriptNextLevel }
 };
 #endif
-
-bool __cdecl Window_IsVisible(int localClientNum, const windowDef_t *w)
-{
-    if (!w)
-        MyAssertHandler("c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h", 60, 0, "%s", "w");
-    if (localClientNum)
-        MyAssertHandler(
-            "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-            23,
-            0,
-            "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-            localClientNum,
-            1);
-    return (w->dynamicFlags[localClientNum] & 4) != 0;
-}
 
 #ifdef KISAK_MP
 void __cdecl Script_GetAutoUpdate(UiContext *dc, itemDef_s *item, const char **args)
@@ -589,16 +575,16 @@ void __cdecl Script_SetItemColor(UiContext *dc, itemDef_s *item, const char **ar
 
 int __cdecl Menu_ItemsMatchingGroup(menuDef_t *menu, char *name)
 {
-    int v2; // eax
+    const char *v2; // eax (LP64: was an int-truncated strstr result)
     int wildcard; // [esp+4h] [ebp-Ch]
     int i; // [esp+8h] [ebp-8h]
     int count; // [esp+Ch] [ebp-4h]
 
     count = 0;
     wildcard = -1;
-    v2 = (int)strstr(name, "*");
+    v2 = strstr(name, "*");
     if (v2)
-        wildcard = v2 - (uint32_t)name;
+        wildcard = (int)(v2 - name);
     for (i = 0; i < menu->itemCount; ++i)
     {
         if (wildcard == -1)
@@ -620,16 +606,16 @@ int __cdecl Menu_ItemsMatchingGroup(menuDef_t *menu, char *name)
 
 itemDef_s *__cdecl Menu_GetMatchingItemByNumber(menuDef_t *menu, int index, char *name)
 {
-    int v3; // eax
+    const char *v3; // eax (LP64: was an int-truncated strstr result)
     int wildcard; // [esp+4h] [ebp-Ch]
     int i; // [esp+8h] [ebp-8h]
     int count; // [esp+Ch] [ebp-4h]
 
     count = 0;
     wildcard = -1;
-    v3 = (int)strstr(name, "*");
+    v3 = strstr(name, "*");
     if (v3)
-        wildcard = v3 - (uint32_t)name;
+        wildcard = (int)(v3 - name);
     for (i = 0; i < menu->itemCount; ++i)
     {
         if (wildcard == -1)
@@ -772,38 +758,6 @@ void __cdecl Menus_Close(UiContext *dc, menuDef_t *menu)
         }
     }
     Window_RemoveDynamicFlags(dc->localClientNum, &menu->window, 6);
-}
-
-bool __cdecl Window_HasFocus(int localClientNum, const windowDef_t *w)
-{
-    if (!w)
-        MyAssertHandler("c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h", 70, 0, "%s", "w");
-    if (Window_IsVisible(localClientNum, w))
-    {
-        if (localClientNum)
-            MyAssertHandler(
-                "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-                23,
-                0,
-                "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-                localClientNum,
-                1);
-        return (w->dynamicFlags[localClientNum] & 2) != 0;
-    }
-    else
-    {
-        if (localClientNum)
-            MyAssertHandler(
-                "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-                23,
-                0,
-                "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-                localClientNum,
-                1);
-        if ((w->dynamicFlags[localClientNum] & 2) != 0 && !alwaysfails)
-            MyAssertHandler("c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h", 74, 0, "Hidden window has focus!");
-        return 0;
-    }
 }
 
 int __cdecl Menus_RemoveFromStack(UiContext *dc, menuDef_t *pMenu)
@@ -1795,7 +1749,7 @@ void __cdecl Script_ExecOnDvarFloatValue(UiContext *dc, itemDef_s *item, const c
 bool __cdecl Script_ExecIfFloatsEqual(const char *dvarValue, const char *testValue)
 {
     float v3; // [esp+4h] [ebp-10h]
-    long double v4; // [esp+8h] [ebp-Ch]
+    double v4; // [esp+8h] [ebp-Ch]
     float v5; // [esp+10h] [ebp-4h]
 
     v4 = atof(testValue);
@@ -2097,148 +2051,6 @@ void __cdecl Item_RunScript(UiContext *dc, itemDef_s *item, char *s)
     }
 }
 
-int __cdecl Item_SetFocus(UiContext *dc, itemDef_s *item, float x, float y)
-{
-    rectDef_s r; // [esp+28h] [ebp-2Ch] BYREF
-    const rectDef_s *textRect; // [esp+40h] [ebp-14h]
-    itemDef_s *oldFocus; // [esp+44h] [ebp-10h]
-    menuDef_t *focusedMenu; // [esp+48h] [ebp-Ch]
-    menuDef_t *parent; // [esp+4Ch] [ebp-8h]
-    int i; // [esp+50h] [ebp-4h]
-
-    if (!item)
-    {
-        MyAssertHandler(".\\ui\\ui_shared.cpp", 2183, 0, "%s", "item != NULL");
-        return 0;
-    }
-    if ((item->window.staticFlags & 0x100000) != 0 || !Window_IsVisible(dc->localClientNum, &item->window))
-        return 0;
-    if (Window_HasFocus(dc->localClientNum, &item->window) && Item_IsVisible(dc->localClientNum, item))
-        return 1;
-    parent = item->parent;
-    if (parent)
-    {
-        if (!Window_HasFocus(dc->localClientNum, &parent->window))
-        {
-            focusedMenu = Menu_GetFocused(dc);
-            if (focusedMenu)
-            {
-                if (Rect_ContainsPoint(dc->localClientNum, &focusedMenu->window.rect, x, y)
-                    && Rect_ContainsPoint(dc->localClientNum, &parent->window.rect, x, y))
-                {
-                    return 0;
-                }
-            }
-        }
-    }
-    if ((item->dvarFlags & 3) != 0 && !Item_EnableShowViaDvar(item, 1))
-        return 0;
-    if (!Item_IsVisible(dc->localClientNum, item))
-        return 0;
-    oldFocus = Menu_ClearFocus(dc, item->parent);
-    if (item->type)
-    {
-        Window_AddDynamicFlags(dc->localClientNum, &item->window, 2);
-        if (item->onFocus)
-            Item_RunScript(dc, item, (char*)item->onFocus);
-    }
-    else
-    {
-        textRect = Item_GetTextRect(dc->localClientNum, item);
-        r = *textRect;
-        r.y = r.y - r.h;
-        r.horzAlign = textRect->horzAlign;
-        r.vertAlign = textRect->vertAlign;
-        if (Rect_ContainsPoint(dc->localClientNum, &r, x, y))
-        {
-            Window_AddDynamicFlags(dc->localClientNum, &item->window, 2);
-        }
-        else if (oldFocus)
-        {
-            Window_AddDynamicFlags(dc->localClientNum, &oldFocus->window, 2);
-            if (oldFocus->onFocus)
-                Item_RunScript(dc, oldFocus, (char*)oldFocus->onFocus);
-        }
-    }
-    for (i = 0; i < parent->itemCount; ++i)
-    {
-        if (parent->items[i] == item && !Item_IsTextField(item))
-        {
-            Menu_SetCursorItem(dc->localClientNum, parent, i);
-            return 1;
-        }
-    }
-    return 1;
-}
-
-const rectDef_s *__cdecl Item_GetTextRect(int localClientNum, const itemDef_s *item)
-{
-    if (localClientNum)
-        MyAssertHandler(
-            "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-            43,
-            0,
-            "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-            localClientNum,
-            1);
-    if (!item)
-        MyAssertHandler("c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h", 44, 0, "%s", "item");
-    return &item->textRect[localClientNum];
-}
-
-itemDef_s *__cdecl Menu_ClearFocus(UiContext *dc, menuDef_t *menu)
-{
-    itemDef_s *ret; // [esp+Ch] [ebp-8h]
-    int i; // [esp+10h] [ebp-4h]
-
-    if (!menu)
-        return 0;
-    ret = 0;
-    for (i = 0; i < menu->itemCount; ++i)
-    {
-        if (Window_HasFocus(dc->localClientNum, &menu->items[i]->window))
-        {
-            if (ret)
-                MyAssertHandler(".\\ui\\ui_shared.cpp", 471, 0, "%s", "ret == NULL");
-            ret = menu->items[i];
-            Window_RemoveDynamicFlags(dc->localClientNum, &ret->window, 2);
-            if (menu->items[i]->leaveFocus)
-                Item_RunScript(dc, menu->items[i], (char*)menu->items[i]->leaveFocus);
-        }
-    }
-    return ret;
-}
-
-bool __cdecl Rect_ContainsPoint(int localClientNum, const rectDef_s *rect, float x, float y)
-{
-    float compareY; // [esp+8h] [ebp-24h]
-    rectDef_s compareRect; // [esp+Ch] [ebp-20h] BYREF
-    const ScreenPlacement *scrPlace; // [esp+24h] [ebp-8h]
-    float compareX; // [esp+28h] [ebp-4h]
-
-    if (!rect)
-        MyAssertHandler(".\\ui\\ui_shared.cpp", 492, 0, "%s", "rect");
-    compareRect.x = rect->x;
-    compareRect.y = rect->y;
-    compareRect.w = rect->w;
-    compareRect.h = rect->h;
-    scrPlace = &scrPlaceView[localClientNum];
-    compareX = ScrPlace_ApplyX(scrPlace, x, 4);
-    compareY = ScrPlace_ApplyY(scrPlace, y, 4);
-    ScrPlace_ApplyRect(
-        scrPlace,
-        &compareRect.x,
-        &compareRect.y,
-        &compareRect.w,
-        &compareRect.h,
-        rect->horzAlign,
-        rect->vertAlign);
-    return compareRect.x <= (double)compareX
-        && compareX <= compareRect.x + compareRect.w
-        && compareRect.y <= (double)compareY
-        && compareY <= compareRect.y + compareRect.h;
-}
-
 int __cdecl Item_ListBox_MaxScroll(int localClientNum, itemDef_s *item)
 {
     int v2; // esi
@@ -2314,26 +2126,6 @@ void __cdecl Item_ListBox_SetCursorPos(int localClientNum, itemDef_s *item, int 
     if (listPtr->startPos[localClientNum] <= newCursorPos - viewmax)
         listPtr->startPos[localClientNum] = newCursorPos - viewmax + 1;
     UI_FeederSelection(localClientNum, item->special, newCursorPos);
-}
-
-bool __cdecl Item_IsTextField(const itemDef_s *item)
-{
-    bool result; // al
-
-    switch (item->type)
-    {
-    case 4:
-    case 9:
-    case 0x10:
-    case 0x11:
-    case 0x12:
-        result = 1;
-        break;
-    default:
-        result = 0;
-        break;
-    }
-    return result;
 }
 
 int __cdecl Menu_OverActiveItem(int localClientNum, menuDef_t *menu, float x, float y)
@@ -2611,178 +2403,6 @@ int __cdecl Display_MouseMove(UiContext *dc)
     }
 }
 
-itemDef_s *g_bindItem;
-int inHandleKey;
-void __cdecl Menu_HandleKey(UiContext *dc, menuDef_t *menu, int key, int down)
-{
-    int v4; // eax
-    const rectDef_s *v5; // eax
-    float x; // [esp+0h] [ebp-1A4h]
-    float y; // [esp+4h] [ebp-1A0h]
-    itemDef_s it; // [esp+1Ch] [ebp-188h] BYREF
-    itemDef_s *item; // [esp+194h] [ebp-10h]
-    int inHandler; // [esp+198h] [ebp-Ch]
-    int i; // [esp+19Ch] [ebp-8h]
-    const char *binding; // [esp+1A0h] [ebp-4h]
-
-    item = 0;
-    inHandler = 1;
-    if (g_waitingForKey && down)
-    {
-        Item_Bind_HandleKey(dc, g_bindItem, key, down);
-        inHandler = 0;
-        return;
-    }
-    if (!g_editingField || !down)
-        goto LABEL_13;
-    if (!Item_TextField_HandleKey(dc, g_editItem, key))
-    {
-        g_editingField = 0;
-        g_editItem = 0;
-        inHandler = 0;
-        return;
-    }
-    if (key == K_MOUSE1 || key == K_MOUSE2 || key == K_MOUSE3)
-    {
-        g_editingField = 0;
-        g_editItem = 0;
-        Display_MouseMove(dc);
-    LABEL_13:
-        if (menu)
-        {
-            if (down
-                && (key & K_CHAR_FLAG) == 0
-                && menu->allowedBinding
-                && (binding = Key_GetBinding(dc->localClientNum, key)) != 0
-                && !I_stricmp(binding, menu->allowedBinding))
-            {
-                v4 = CL_ControllerIndexFromClientNum(dc->localClientNum);
-                Cbuf_ExecuteBuffer(dc->localClientNum, v4, (char *)binding);
-            }
-            else if (!down
-                || (menu->window.staticFlags & 0x1000000) != 0
-                || menu->fullScreen
-                || Rect_ContainsPoint(dc->localClientNum, &menu->window.rect, dc->cursor.x, dc->cursor.y)
-                || inHandleKey
-                || key != K_MOUSE1 && key != K_MOUSE2 && key != K_MOUSE3)
-            {
-                for (i = 0; i < menu->itemCount; ++i)
-                {
-                    if (Item_IsVisible(dc->localClientNum, menu->items[i]))
-                    {
-                        if (Window_HasFocus(dc->localClientNum, &menu->items[i]->window))
-                            item = menu->items[i];
-                    }
-                }
-                if (key != K_MWHEELDOWN && key != K_MWHEELUP || item && item->type == 6)
-                {
-                    if (item && Item_HandleKey(dc, item, key, down))
-                    {
-                        Item_Action(dc, item);
-                        inHandler = 0;
-                    }
-                    else if (down)
-                    {
-                        if (key <= 0 || key > 255 || !Menu_CheckOnKey(dc, menu, key))
-                        {
-                            switch (key)
-                            {
-                            case K_TAB:
-                            case K_DOWNARROW:
-                            case K_RIGHTARROW:
-                            case K_KP_DOWNARROW:
-                            case K_MWHEELDOWN:
-                                Menu_SetNextCursorItem(dc, menu);
-                                break;
-                            case K_ENTER:
-                            case K_KP_ENTER:
-                            case K_MOUSE3:
-                                if (item)
-                                {
-                                    if (Item_IsTextField(item))
-                                    {
-                                        item->cursorPos[dc->localClientNum] = 0;
-                                        g_editingField = 1;
-                                        g_editItem = item;
-                                        Key_SetOverstrikeMode(dc->localClientNum, 1);
-                                    }
-                                    else
-                                    {
-                                        Item_Action(dc, item);
-                                    }
-                                }
-                                break;
-                            case K_ESCAPE:
-                                if (!g_waitingForKey && menu->onESC)
-                                {
-                                    it.parent = menu;
-                                    Item_RunScript(dc, &it, (char*)menu->onESC);
-                                }
-                                break;
-                            case K_UPARROW:
-                            case K_LEFTARROW:
-                            case K_KP_UPARROW:
-                            case K_MWHEELUP:
-                                Menu_SetPrevCursorItem(dc, menu);
-                                break;
-                            case K_F11:
-                                if (Dvar_GetInt("developer"))
-                                    g_debugMode ^= 1u;
-                                break;
-                            case K_F12:
-                                if (Dvar_GetInt("developer"))
-                                    Cbuf_AddText(dc->localClientNum, "screenshot\n");
-                                break;
-                            case K_MOUSE1:
-                            case K_MOUSE2:
-                                if (item)
-                                {
-                                    if (item->type)
-                                    {
-                                        if (Rect_ContainsPoint(dc->localClientNum, &item->window.rect, dc->cursor.x, dc->cursor.y))
-                                        {
-                                            if (Item_IsTextField(item))
-                                                Item_TextField_BeginEdit(dc->localClientNum, item);
-                                            else
-                                                Item_Action(dc, item);
-                                        }
-                                    }
-                                    else
-                                    {
-                                        y = dc->cursor.y;
-                                        x = dc->cursor.x;
-                                        v5 = Item_CorrectedTextRect(dc->localClientNum, item);
-                                        if (Rect_ContainsPoint(dc->localClientNum, v5, x, y))
-                                            Item_Action(dc, item);
-                                    }
-                                }
-                                break;
-                            default:
-                                return;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        inHandler = 0;
-                    }
-                }
-            }
-            else
-            {
-                inHandleKey = 1;
-                Menus_HandleOOBClick(dc, menu, key, down);
-                inHandleKey = 0;
-                inHandler = 0;
-            }
-        }
-        else
-        {
-            inHandler = 0;
-        }
-    }
-}
-
 bool __cdecl Item_TextField_HandleKey(UiContext *dc, itemDef_s *item, int key)
 {
     char *VariantString; // eax
@@ -3020,26 +2640,43 @@ void __cdecl Item_TextField_EnsureCursorVisible(int localClientNum, itemDef_s *i
     }
 }
 
+// LP64: the capture callbacks used to index the scrollInfo_s block as a
+// raw int/pointer array (*((itemDef_s **)p + 6) etc.), which only lines up
+// with the struct when pointers are 4 bytes.  They now use the struct.
+struct scrollInfo_s // sizeof=0x20
+{                                       // ...
+    int nextScrollTime;                 // ...
+    int nextAdjustTime;                 // ...
+    int adjustValue;                    // ...
+    int scrollKey;                      // ...
+    float xStart;                       // ...
+    float yStart;                       // ...
+    itemDef_s *item;                    // ...
+    int scrollDir;                      // ...
+};
+scrollInfo_s scrollInfo;
+
 void __cdecl Scroll_ListBox_AutoFunc(UiContext *dc, void *p)
 {
-    if (dc->realTime > *(_DWORD *)p)
+    scrollInfo_s *si = (scrollInfo_s *)p;
+
+    if (dc->realTime > si->nextScrollTime)
     {
-        Item_ListBox_HandleKey(dc, *((itemDef_s **)p + 6), *((_DWORD *)p + 3), 1, 0);
-        *(_DWORD *)p = *((_DWORD *)p + 2) + dc->realTime;
+        Item_ListBox_HandleKey(dc, si->item, si->scrollKey, 1, 0);
+        si->nextScrollTime = si->adjustValue + dc->realTime;
     }
-    if (dc->realTime > *((_DWORD *)p + 1))
+    if (dc->realTime > si->nextAdjustTime)
     {
-        *((_DWORD *)p + 1) = dc->realTime + 150;
-        if (*((int *)p + 2) > 20)
-            *((_DWORD *)p + 2) -= 40;
+        si->nextAdjustTime = dc->realTime + 150;
+        if (si->adjustValue > 20)
+            si->adjustValue -= 40;
     }
 }
 
 void __cdecl Scroll_ListBox_ThumbFunc(UiContext *dc, void *p)
 {
-    int v2; // [esp+0h] [ebp-3Ch]
-    int v3; // [esp+4h] [ebp-38h]
-    int v4; // [esp+8h] [ebp-34h]
+    scrollInfo_s *si; // [esp+0h] [ebp-3Ch]
+    const windowDef_t *w; // [esp+4h] [ebp-38h]
     int pos; // [esp+10h] [ebp-2Ch]
     int posa; // [esp+10h] [ebp-2Ch]
     int max; // [esp+14h] [ebp-28h]
@@ -3050,24 +2687,22 @@ void __cdecl Scroll_ListBox_ThumbFunc(UiContext *dc, void *p)
     float r_12; // [esp+24h] [ebp-18h]
     listBoxDef_s *listPtr; // [esp+34h] [ebp-8h]
 
+    si = (scrollInfo_s *)p;
     if (dc->isCursorVisible)
     {
-        listPtr = Item_GetListBoxDef(*((itemDef_s **)p + 6));
+        listPtr = Item_GetListBoxDef(si->item);
         if (listPtr)
         {
-            v4 = *((_DWORD *)p + 6);
-            if (!v4)
+            w = &si->item->window;
+            if (!w)
                 MyAssertHandler("c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h", 53, 0, "%s", "w");
-            if ((*(_DWORD *)(v4 + 76) & 0x200000) != 0)
+            if ((w->staticFlags & 0x200000) != 0) // ILP32 offset 76 = staticFlags (WINDOW_HORIZONTAL)
             {
-                if (*((float *)p + 4) == dc->cursor.x)
+                if (si->xStart == dc->cursor.x)
                     return;
-                v3 = *((_DWORD *)p + 6);
-                if (!v3)
-                    MyAssertHandler("c:\\trees\\cod3\\src\\ui\\ui_utils_api.h", 36, 0, "%s", "w");
-                r = *(float *)(v3 + 4) + 16.0 + 1.0;
-                r_8 = *(float *)(v3 + 12) - 32.0 - 2.0;
-                max = Item_ListBox_MaxScroll(dc->localClientNum, *((itemDef_s **)p + 6));
+                r = w->rect.x + 16.0 + 1.0;
+                r_8 = w->rect.w - 32.0 - 2.0;
+                max = Item_ListBox_MaxScroll(dc->localClientNum, si->item);
                 pos = (int)((dc->cursor.x - r - 8.0) * (double)max / (r_8 - 16.0));
                 if (pos >= 0)
                 {
@@ -3079,16 +2714,13 @@ void __cdecl Scroll_ListBox_ThumbFunc(UiContext *dc, void *p)
                     pos = 0;
                 }
                 listPtr->startPos[dc->localClientNum] = pos;
-                *((float *)p + 4) = dc->cursor.x;
+                si->xStart = dc->cursor.x;
             }
-            else if (*((float *)p + 5) != dc->cursor.y)
+            else if (si->yStart != dc->cursor.y)
             {
-                v2 = *((_DWORD *)p + 6);
-                if (!v2)
-                    MyAssertHandler("c:\\trees\\cod3\\src\\ui\\ui_utils_api.h", 36, 0, "%s", "w");
-                r_4 = *(float *)(v2 + 8) + 16.0 + 1.0;
-                r_12 = *(float *)(v2 + 16) - 32.0 - 2.0;
-                maxa = Item_ListBox_MaxScroll(dc->localClientNum, *((itemDef_s **)p + 6));
+                r_4 = w->rect.y + 16.0 + 1.0;
+                r_12 = w->rect.h - 32.0 - 2.0;
+                maxa = Item_ListBox_MaxScroll(dc->localClientNum, si->item);
                 posa = (int)((dc->cursor.y - r_4 - 8.0) * (double)maxa / (r_12 - 16.0));
                 if (posa >= 0)
                 {
@@ -3100,18 +2732,7 @@ void __cdecl Scroll_ListBox_ThumbFunc(UiContext *dc, void *p)
                     posa = 0;
                 }
                 listPtr->startPos[dc->localClientNum] = posa;
-                *((float *)p + 5) = dc->cursor.y;
-            }
-            if (dc->realTime > *(_DWORD *)p)
-            {
-                Item_ListBox_HandleKey(dc, *((itemDef_s **)p + 6), *((_DWORD *)p + 3), 1, 0);
-                *(_DWORD *)p = *((_DWORD *)p + 2) + dc->realTime;
-            }
-            if (dc->realTime > *((_DWORD *)p + 1))
-            {
-                *((_DWORD *)p + 1) = dc->realTime + 150;
-                if (*((int *)p + 2) > 20)
-                    *((_DWORD *)p + 2) -= 40;
+                si->yStart = dc->cursor.y;
             }
         }
     }
@@ -3139,23 +2760,11 @@ int __cdecl Item_Slider_OverSlider(int localClientNum, itemDef_s *item, float x,
 
 void __cdecl Scroll_Slider_SetThumbPos(UiContext *dc, itemDef_s *item);
 
-void __cdecl Scroll_Slider_ThumbFunc(UiContext *dc, itemDef_s **p)
+void __cdecl Scroll_Slider_ThumbFunc(UiContext *dc, void *p)
 {
-    Scroll_Slider_SetThumbPos(dc, p[6]);
+    Scroll_Slider_SetThumbPos(dc, ((scrollInfo_s *)p)->item);
 }
 
-struct scrollInfo_s // sizeof=0x20
-{                                       // ...
-    int nextScrollTime;                 // ...
-    int nextAdjustTime;                 // ...
-    int adjustValue;                    // ...
-    int scrollKey;                      // ...
-    float xStart;                       // ...
-    float yStart;                       // ...
-    itemDef_s *item;                    // ...
-    int scrollDir;                      // ...
-};
-scrollInfo_s scrollInfo;
 void __cdecl Item_StartCapture(UiContext *dc, itemDef_s *item, int key)
 {
     int type; // [esp+8h] [ebp-8h]
@@ -3195,7 +2804,7 @@ void __cdecl Item_StartCapture(UiContext *dc, itemDef_s *item, int key)
         scrollInfo.xStart = dc->cursor.x;
         scrollInfo.yStart = dc->cursor.y;
         captureData = &scrollInfo;
-        captureFunc = (void(__cdecl *)(UiContext *, void *))Scroll_Slider_ThumbFunc;
+        captureFunc = Scroll_Slider_ThumbFunc;
         itemCapture = item;
     }
 }
@@ -3755,9 +3364,15 @@ int __cdecl Item_DvarEnum_EnumIndex(itemDef_s *item)
     enumIndex = atoi(enumString);
     if (enumIndex >= 0 && enumIndex < enumDvar->domain.enumeration.stringCount)
         return enumIndex;
+    // Same LP64 union-aliasing bug fixed in Dvar_StringToEnum
+    // (src/universal/dvar.cpp): domain.integer.max was a decompiler-era
+    // stand-in for domain.enumeration.strings that only worked because
+    // both fields shared the same 4-byte union offset on the original
+    // ILP32 binary. On LP64 the pointer moves to a different, padded
+    // offset, so integer.max no longer aliases it -- read the real field.
     for (enumIndexa = 0; enumIndexa < enumDvar->domain.enumeration.stringCount; ++enumIndexa)
     {
-        if (!I_stricmp(enumString, *(const char **)(enumDvar->domain.integer.max + 4 * enumIndexa)))
+        if (!I_stricmp(enumString, enumDvar->domain.enumeration.strings[enumIndexa]))
             return enumIndexa;
     }
     return 0;
@@ -4007,219 +3622,6 @@ void __cdecl Item_Action(UiContext *dc, itemDef_s *item)
         Item_RunScript(dc, item, (char*)item->action);
 }
 
-itemDef_s *__cdecl Menu_SetPrevCursorItem(UiContext *dc, menuDef_t *menu)
-{
-    int v3; // [esp+Ch] [ebp-40h]
-    int v4; // [esp+14h] [ebp-38h]
-    int v5; // [esp+1Ch] [ebp-30h]
-    int v6; // [esp+24h] [ebp-28h]
-    int v7; // [esp+2Ch] [ebp-20h]
-    int v8; // [esp+34h] [ebp-18h]
-    int v9; // [esp+3Ch] [ebp-10h]
-    int localClientNum; // [esp+40h] [ebp-Ch]
-    int oldCursor; // [esp+44h] [ebp-8h]
-    int wrapped; // [esp+48h] [ebp-4h]
-
-    wrapped = 0;
-    localClientNum = dc->localClientNum;
-    if (dc->localClientNum)
-        MyAssertHandler(
-            "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-            36,
-            0,
-            "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-            localClientNum,
-            1);
-    oldCursor = menu->cursorItem[localClientNum];
-    v9 = dc->localClientNum;
-    if (dc->localClientNum)
-        MyAssertHandler(
-            "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-            36,
-            0,
-            "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-            v9,
-            1);
-    if (menu->cursorItem[v9] < 0)
-    {
-        Menu_SetCursorItem(dc->localClientNum, menu, menu->itemCount - 1);
-        wrapped = 1;
-    }
-    do
-    {
-        v8 = dc->localClientNum;
-        if (dc->localClientNum)
-            MyAssertHandler(
-                "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-                36,
-                0,
-                "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-                v8,
-                1);
-        if (menu->cursorItem[v8] <= -1)
-            goto LABEL_27;
-        v7 = dc->localClientNum;
-        if (dc->localClientNum)
-            MyAssertHandler(
-                "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-                36,
-                0,
-                "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-                v7,
-                1);
-        Menu_SetCursorItem(dc->localClientNum, menu, menu->cursorItem[v7] - 1);
-        v6 = dc->localClientNum;
-        if (dc->localClientNum)
-            MyAssertHandler(
-                "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-                36,
-                0,
-                "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-                v6,
-                1);
-        if (menu->cursorItem[v6] < 0 && !wrapped)
-        {
-            wrapped = 1;
-            Menu_SetCursorItem(dc->localClientNum, menu, menu->itemCount - 1);
-        }
-        v5 = dc->localClientNum;
-        if (dc->localClientNum)
-            MyAssertHandler(
-                "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-                36,
-                0,
-                "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-                v5,
-                1);
-        if (menu->cursorItem[v5] < 0)
-        {
-        LABEL_27:
-            Menu_SetCursorItem(dc->localClientNum, menu, oldCursor);
-            return 0;
-        }
-        v4 = dc->localClientNum;
-        if (dc->localClientNum)
-            MyAssertHandler(
-                "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-                36,
-                0,
-                "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-                v4,
-                1);
-    } while (!Item_SetFocus(dc, menu->items[menu->cursorItem[v4]], dc->cursor.x, dc->cursor.y));
-    v3 = dc->localClientNum;
-    if (dc->localClientNum)
-        MyAssertHandler(
-            "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-            36,
-            0,
-            "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-            v3,
-            1);
-    return menu->items[menu->cursorItem[v3]];
-}
-
-itemDef_s *__cdecl Menu_SetNextCursorItem(UiContext *dc, menuDef_t *menu)
-{
-    int v3; // [esp+Ch] [ebp-38h]
-    int v4; // [esp+14h] [ebp-30h]
-    int v5; // [esp+1Ch] [ebp-28h]
-    int v6; // [esp+24h] [ebp-20h]
-    int v7; // [esp+2Ch] [ebp-18h]
-    int v8; // [esp+34h] [ebp-10h]
-    int localClientNum; // [esp+38h] [ebp-Ch]
-    int oldCursor; // [esp+3Ch] [ebp-8h]
-    int wrapped; // [esp+40h] [ebp-4h]
-
-    wrapped = 0;
-    localClientNum = dc->localClientNum;
-    if (dc->localClientNum)
-        MyAssertHandler(
-            "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-            36,
-            0,
-            "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-            localClientNum,
-            1);
-    oldCursor = menu->cursorItem[localClientNum];
-    v8 = dc->localClientNum;
-    if (dc->localClientNum)
-        MyAssertHandler(
-            "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-            36,
-            0,
-            "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-            v8,
-            1);
-    if (menu->cursorItem[v8] == -1)
-    {
-        Menu_SetCursorItem(dc->localClientNum, menu, 0);
-        wrapped = 1;
-    }
-    do
-    {
-        v7 = dc->localClientNum;
-        if (dc->localClientNum)
-            MyAssertHandler(
-                "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-                36,
-                0,
-                "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-                v7,
-                1);
-        if (menu->cursorItem[v7] >= menu->itemCount)
-        {
-            Menu_SetCursorItem(dc->localClientNum, menu, oldCursor);
-            return 0;
-        }
-        v6 = dc->localClientNum;
-        if (dc->localClientNum)
-            MyAssertHandler(
-                "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-                36,
-                0,
-                "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-                v6,
-                1);
-        Menu_SetCursorItem(dc->localClientNum, menu, menu->cursorItem[v6] + 1);
-        v5 = dc->localClientNum;
-        if (dc->localClientNum)
-            MyAssertHandler(
-                "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-                36,
-                0,
-                "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-                v5,
-                1);
-        if (menu->cursorItem[v5] >= menu->itemCount)
-        {
-            if (wrapped)
-                return menu->items[oldCursor];
-            wrapped = 1;
-            Menu_SetCursorItem(dc->localClientNum, menu, 0);
-        }
-        v4 = dc->localClientNum;
-        if (dc->localClientNum)
-            MyAssertHandler(
-                "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-                36,
-                0,
-                "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-                v4,
-                1);
-    } while (!Item_SetFocus(dc, menu->items[menu->cursorItem[v4]], dc->cursor.x, dc->cursor.y));
-    v3 = dc->localClientNum;
-    if (dc->localClientNum)
-        MyAssertHandler(
-            "c:\\trees\\cod3\\src\\ui\\../ui/ui_utils.h",
-            36,
-            0,
-            "localClientNum doesn't index MAX_POSSIBLE_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-            v3,
-            1);
-    return menu->items[menu->cursorItem[v3]];
-}
-
 rectDef_s rect;
 rectDef_s *__cdecl Item_CorrectedTextRect(int localClientNum, itemDef_s *item)
 {
@@ -4423,18 +3825,26 @@ double __cdecl Item_GetTextPlacementX(int alignX, float x0, float containerWidth
 
 double __cdecl Item_GetTextPlacementY(int alignY, float y0, float containerHeight, float selfHeight)
 {
+    // NOTE (retail UIText baseline semantics): the returned value is the text
+    // BASELINE that UI_DrawText/DrawText2D draws upward from (glyph y0 <= 0),
+    // not the top of the line box.  This matches the working Android port's
+    // independent reading of the same original (baseline = y + h + textaligny
+    // for list rows; (h + textH) / 2 centering for menu items) and the stock
+    // console, which passes lineTop + fontHeight as y.  The previous
+    // (containerHeight - selfHeight) form placed the line TOP at y, pushing
+    // every vertically-centered menu label ~one line height above its bar.
     switch (alignY)
     {
     case 0:
         return y0;
     case 4:
-        return (float)(y0 + selfHeight);
+        return y0 + selfHeight;
     case 8:
         return (float)((containerHeight + selfHeight) * 0.5 + y0);
     default:
         if (alignY != 12)
             MyAssertHandler(".\\ui\\ui_shared.cpp", 215, 0, "%s\n\t(alignY) = %i", "(alignY == 12)", alignY);
-        return (float)(y0 + containerHeight);
+        return (float)(containerHeight + y0);
     }
 }
 
@@ -4563,21 +3973,6 @@ int __cdecl Item_Bind_HandleKey(UiContext *dc, itemDef_s *item, int key, int dow
     }
 }
 
-menuDef_t *__cdecl Menu_GetFocused(UiContext *dc)
-{
-    int i; // [esp+10h] [ebp-4h]
-
-    for (i = dc->openMenuCount - 1; i >= 0; --i)
-    {
-        if (Window_HasFocus(dc->localClientNum, &dc->menuStack[i]->window)
-            && Window_IsVisible(dc->localClientNum, &dc->menuStack[i]->window))
-        {
-            return dc->menuStack[i];
-        }
-    }
-    return 0;
-}
-
 void __cdecl Menu_SetFeederSelection(UiContext *dc, menuDef_t *menu, int feeder, int index, const char *name)
 {
     int i; // [esp+8h] [ebp-Ch]
@@ -4617,18 +4012,6 @@ void __cdecl Menu_SetFeederSelection(UiContext *dc, menuDef_t *menu, int feeder,
             }
         }
     }
-}
-
-int __cdecl Menus_AnyFullScreenVisible(UiContext *dc)
-{
-    int i; // [esp+4h] [ebp-4h]
-
-    for (i = dc->openMenuCount - 1; i >= 0; --i)
-    {
-        if (Window_IsVisible(dc->localClientNum, &dc->menuStack[i]->window) && dc->menuStack[i]->fullScreen)
-            return 1;
-    }
-    return 0;
 }
 
 char __cdecl Menu_IsVisible(UiContext *dc, menuDef_t *menu)
@@ -4677,11 +4060,16 @@ char __cdecl Menu_Paint(UiContext *dc, menuDef_t *menu)
 
     PROF_SCOPED("Menu_Paint");
 
+    iassert(menu);
+    if (!menu || !menu->window.name)
+        return 0;
+
     ZoneText(menu->window.name, strlen(menu->window.name));
 
-    iassert(menu);
-
-    if (*(_BYTE *)ui_showMenuOnly->current.integer
+    // LP64: the decompiled `*(_BYTE *)...->current.integer` read the string's
+    // first byte through its own pointer value, which only works when a
+    // pointer fits 32 bits. Read the string directly instead.
+    if (ui_showMenuOnly->current.string[0]
         && menu->window.name
         && I_stricmp(menu->window.name, ui_showMenuOnly->current.string))
     {
@@ -5779,7 +5167,8 @@ const char *__cdecl Item_DvarEnum_Setting(itemDef_s *item)
             "enumIndex >= 0 && enumIndex < enumDvar->domain.enumeration.stringCount",
             v2);
     }
-    return *(const char **)(enumDvar->domain.integer.max + 4 * enumIndex);
+    // Same LP64 union-aliasing bug as Item_DvarEnum_EnumIndex above.
+    return enumDvar->domain.enumeration.strings[enumIndex];
 }
 
 void __cdecl Item_Slider_Paint(UiContext *dc, itemDef_s *item)
@@ -6677,11 +6066,6 @@ void __cdecl Item_GameMsgWindow_Paint(UiContext *dc, itemDef_s *item)
     }
 }
 
-int __cdecl Menu_Count(UiContext *dc)
-{
-    return dc->menuCount;
-}
-
 void __cdecl Menu_PaintAll_BeginVisibleList(char *stringBegin, uint32_t stringSize)
 {
     PROF_SCOPED("Menu_PaintAll_BeginVisibleList");
@@ -6730,7 +6114,7 @@ void __cdecl Menu_PaintAll_AppendToVisibleList(char *stringBegin, uint32_t strin
     //    //(std::reverse_iterator<char *>)stringBegin,
     //    &_Val)->current - 1;
     auto it = std::find<std::reverse_iterator<char *>, char>(_Last, _First, _Val); // KISAKTODO: i'd be surprised if this works.
-    lastNewline = it._Get_current() - 1;
+    lastNewline = it.base() - 1;
 
     if (stringEnd - lastNewline <= 80)
         terminus = ", ";
@@ -6788,6 +6172,107 @@ void __cdecl Menu_PaintAll(UiContext *dc)
 
     showVisibleList = ui_showList->current.enabled;
     KISAK_NULLSUB();
+    // Bounded hardware diagnostic: the Switch assert handler logs and
+    // continues, so a wild menu/name pointer is otherwise invisible until
+    // the crash report. Dump pointer values only (never dereference the
+    // name string) to the SD card once; screenshots + crash reports give
+    // the rest. fopen fails harmlessly on non-Switch builds.
+    {
+        static bool s_menuTableDumped = false;
+        if (!s_menuTableDumped)
+        {
+            s_menuTableDumped = true;
+            FILE *diag = fopen("sdmc:/switch/kisakcod/menu_table.txt", "w");
+            if (diag)
+            {
+                fprintf(diag, "menuCount=%d openMenuCount=%d\n", dc->menuCount, dc->openMenuCount);
+                for (int di = 0; di < dc->menuCount; ++di)
+                {
+                    menuDef_t *dm = dc->Menus[di];
+                    fprintf(diag, "menus[%d] menu=%p name=%p\n", di, (const void *)dm,
+                            (const void *)(dm ? dm->window.name : nullptr));
+                    // Text-placement inputs per item (address-independent
+                    // floats/ints only): lets us check the Item_SetTextExtents
+                    // math against screenshot pixels without
+                    // dereferencing anything wild.
+                    if (dm && dm->itemCount > 0 && dm->items)
+                    {
+                        int nic = dm->itemCount > 12 ? 12 : dm->itemCount;
+                        for (int ii = 0; ii < nic; ++ii)
+                        {
+                            itemDef_s *it = dm->items[ii];
+                            if (!it)
+                            {
+                                fprintf(diag, "  item[%d] null\n", ii);
+                                continue;
+                            }
+                            Font_s *fh = UI_GetFontHandle(&scrPlaceView[dc->localClientNum],
+                                                          it->fontEnum, it->textscale);
+                            fprintf(diag, "  item[%d] type=%d rect=[%.1f,%.1f,%.1f,%.1f] "
+                                    "alignMode=0x%x tax=%.2f tay=%.2f tscale=%.3f fontEnum=%d "
+                                    "font=%p pixH=%d textRect=[%.1f,%.1f,%.1f,%.1f]\n",
+                                    ii, it->type,
+                                    it->window.rect.x, it->window.rect.y,
+                                    it->window.rect.w, it->window.rect.h,
+                                    it->textAlignMode, it->textalignx, it->textaligny,
+                                    it->textscale, it->fontEnum,
+                                    (const void *)fh, fh ? fh->pixelHeight : -1,
+                                    it->textRect[dc->localClientNum].x,
+                                    it->textRect[dc->localClientNum].y,
+                                    it->textRect[dc->localClientNum].w,
+                                    it->textRect[dc->localClientNum].h);
+                        }
+                    }
+                }
+                for (int si = 0; si < dc->openMenuCount; ++si)
+                    fprintf(diag, "stack[%d] menu=%p\n", si, (const void *)dc->menuStack[si]);
+                fflush(diag);
+                fclose(diag);
+            }
+            // Live-registry oracle (same once-per-run gate): every registered
+            // record is valid by construction, so names are safe to print.
+            // Answers "which material/image does the font path resolve" and
+            // "what 16x16 images exist" without touching wild pointers.
+            {
+                static XAssetHeader matAssets[640];
+                int32_t nm = DB_GetAllXAssetOfType(ASSET_TYPE_MATERIAL, matAssets, 640);
+                FILE *md = fopen("sdmc:/switch/kisakcod/material_table.txt", "w");
+                if (md)
+                {
+                    fprintf(md, "materials=%d\n", nm);
+                    for (int32_t mi = 0; mi < nm; ++mi)
+                    {
+                        const Material *m = matAssets[mi].material;
+                        const GfxImage *ti = (m && m->textureCount > 0 && m->textureTable)
+                                                 ? MaterialTextureImage(m->textureTable[0])
+                                                 : nullptr;
+                        fprintf(md, "mat[%d] '%s' tc=%u img='%s' imgdim=%ux%u\n",
+                                mi, (m && m->info.name) ? m->info.name : "(null)",
+                                m ? m->textureCount : 0,
+                                (ti && ti->name) ? ti->name : "(null)",
+                                ti ? ti->width : 0, ti ? ti->height : 0);
+                    }
+                    fclose(md);
+                }
+                static XAssetHeader imgAssets[2048];
+                int32_t ni = DB_GetAllXAssetOfType(ASSET_TYPE_IMAGE, imgAssets, 2048);
+                FILE *id = fopen("sdmc:/switch/kisakcod/image_table.txt", "w");
+                if (id)
+                {
+                    fprintf(id, "images=%d\n", ni);
+                    for (int32_t ii = 0; ii < ni; ++ii)
+                    {
+                        const GfxImage *g = imgAssets[ii].image;
+                        fprintf(id, "img[%d] '%s' %ux%u cat=%u\n",
+                                ii, (g && g->name) ? g->name : "(null)",
+                                g ? g->width : 0, g ? g->height : 0,
+                                g ? g->category : 0);
+                    }
+                    fclose(id);
+                }
+            }
+        }
+    }
     if (showVisibleList)
         Menu_PaintAll_BeginVisibleList(visibleList, 0x400u);
     dc->blurRadiusOut = 0.0;
@@ -6800,6 +6285,8 @@ void __cdecl Menu_PaintAll(UiContext *dc)
         menu = dc->menuStack[menuIndex];
         if (!menu)
             MyAssertHandler(".\\ui\\ui_shared.cpp", 6124, 0, "%s", "menu");
+        if (!menu)
+            continue;
         if (menu->fullScreen)
         {
             drawStart = menuIndex;
@@ -6817,6 +6304,8 @@ void __cdecl Menu_PaintAll(UiContext *dc)
                 menua = dc->Menus[menuIndexa];
                 if (!menua)
                     MyAssertHandler(".\\ui\\ui_shared.cpp", 6139, 0, "%s", "menu");
+                if (!menua)
+                    continue;
                 if (!Menus_MenuIsInStack(dc, menua) && Menu_Paint(dc, menua) && showVisibleList)
                     Menu_PaintAll_AppendToVisibleList(visibleList, 0x400u, (char *)menua->window.name);
             }
@@ -6830,6 +6319,8 @@ void __cdecl Menu_PaintAll(UiContext *dc)
             menub = dc->menuStack[menuIndexb];
             if (!menub)
                 MyAssertHandler(".\\ui\\ui_shared.cpp", 6153, 0, "%s", "menu");
+            if (!menub)
+                continue;
             if (Menu_Paint(dc, menub) && showVisibleList)
                 Menu_PaintAll_AppendToVisibleList(visibleList, 0x400u, (char *)menub->window.name);
         }
@@ -6878,6 +6369,8 @@ void __cdecl UI_AddMenu(UiContext *dc, menuDef_t *menu)
         Com_Error(ERR_DROP, "UI_AddMenu: EXE_ERR_OUT_OF_MEMORY");
     if (!menu)
         MyAssertHandler(".\\ui\\ui_shared.cpp", 6297, 0, "%s", "menu");
+    if (!menu)
+        return;
     if (dc->menuCount >= 0x280u)
         MyAssertHandler(
             ".\\ui\\ui_shared.cpp",
@@ -6943,4 +6436,3 @@ MenuList *__cdecl UI_LoadMenus_FastFile(const char *menuFile)
 {
     return DB_FindXAssetHeader(ASSET_TYPE_MENULIST, menuFile).menuList;
 }
-

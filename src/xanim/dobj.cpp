@@ -192,12 +192,18 @@ bool __cdecl DObjSkelIsBoneUpToDate(DObj_s *obj, int boneIndex)
 
 void __cdecl DObjSetTree(DObj_s *obj, XAnimTree_s *tree)
 {
+    
     obj->tree = tree;
     if (tree)
     {
         if (tree->children)
+        {
+            
             XAnimResetAnimMap(obj, tree->children);
+            
+        }
     }
+    
 }
 
 void __cdecl DObjCreate(DObjModel_s *dobjModels, uint32_t numModels, XAnimTree_s *tree, DObj_s *obj, __int16 entnum)
@@ -338,8 +344,16 @@ void __cdecl DObjCreateDuplicateParts(DObj_s *obj, DObjModel_s *dobjModels, uint
     iassert(boneCount == (byte)boneCount);
     obj->numBones = boneCount;
     iassert(numModels > 0);
-    obj->models = (XModel **)MT_Alloc(5 * numModels, MT_TYPE_MODEL_LIST);
-    memcpy((unsigned __int8 *)obj->models, (unsigned __int8 *)models, 4 * numModels);
+    // LP64: the models array holds native pointers (8 bytes each) followed
+    // by one parent byte per model. The decompiled 5-byte stride (4-byte
+    // pointer + parent) silently truncated every model pointer past its low
+    // 32 bits (a valid XModel pointer read back with garbage in
+    // the high half, faulting the first DObjComputeBounds). Size everything from
+    // the native pointer width; the parents slot stays pointer-scaled and
+    // was already correct.
+    obj->models = (XModel **)MT_Alloc((sizeof(XModel *) + 1) * numModels, MT_TYPE_MODEL_LIST);
+    memcpy((unsigned __int8 *)obj->models, (unsigned __int8 *)models,
+           sizeof(XModel *) * numModels);
     memcpy((unsigned __int8 *)&obj->models[numModels], modelParents, numModels);
     iassert(g_empty);
     iassert(!obj->duplicateParts);
@@ -412,7 +426,7 @@ void __cdecl DObjFree(DObj_s *obj)
     models = obj->models;
     if (models)
     {
-        MT_Free((byte*)models, 5 * obj->numModels);
+        MT_Free((byte*)models, (sizeof(XModel *) + 1) * obj->numModels);
         obj->models = 0;
     }
     obj->numModels = 0; // LWSS: blops backport
@@ -526,8 +540,15 @@ void __cdecl DObjArchive(DObj_s *obj)
     obj->models = NULL;
     DObjFree(obj);
 
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
     static_assert((sizeof(DObj_s) - sizeof(obj->models)) == 96);
-    memcpy(obj, &savedObj, sizeof(DObj_s) - sizeof(obj->models));
+#endif
+    // Copy exactly the SavedDObj: on LP64 it is 104 bytes while the DObj_s
+    // prefix before models is 112, so the retail size over-read 8 bytes of
+    // stack past savedObj (-Wstringop-overread under LTO). DObjUnarchive
+    // reads back sizeof(SavedDObj).
+    static_assert(sizeof(SavedDObj) <= sizeof(DObj_s) - sizeof(obj->models));
+    memcpy(obj, &savedObj, sizeof(savedObj));
 }
 
 void __cdecl DObjUnarchive(DObj_s *obj)
@@ -545,7 +566,7 @@ void __cdecl DObjUnarchive(DObj_s *obj)
         model->model = savedObj.models[modelIndex];
         model->ignoreCollision = (savedObj.ignoreCollision & (1 << modelIndex)) != 0;
     }
-    MT_Free((_BYTE *)savedObj.models, 5 * savedObj.numModels);
+    MT_Free((_BYTE *)savedObj.models, (sizeof(XModel *) + 1) * savedObj.numModels);
     DObjCreate(dobjModels, savedObj.numModels, savedObj.tree, obj, savedObj.entnum);
     DObjSetHidePartBits(obj, savedObj.hidePartBits);
 }
@@ -1227,7 +1248,7 @@ void __cdecl DObjSetHidePartBits(DObj_s *obj, const uint32_t *partBits)
     obj->hidePartBits[3] = partBits[3];
 }
 
-int DObjGetNumSurfaces(const DObj_s *obj, char *lods)
+int DObjGetNumSurfaces(const DObj_s *obj, const int8_t *lods)
 {
     int result; // r3
     int v5; // r7
@@ -1266,7 +1287,15 @@ void DObjClone(const DObj_s *from, DObj_s *obj)
     if (obj->duplicateParts && duplicateParts != g_empty)
         SL_AddRefToString(duplicateParts);
     obj->tree = 0;
-    v5 = (XModel **)MT_Alloc(from->numModels + __ROL4__(from->numModels, 2), MT_TYPE_MODEL_LIST);
+    // LP64: model lists are (native XModel pointer + 1 parent byte) per
+    // model. The decompiled __ROL4__(numModels, 2) trick only expands to the
+    // 5-byte ILP32 stride (numModels + numModels*4); on LP64 the stride is
+    // 9 bytes, so the clone must allocate and copy sizeof(XModel*)+1 per
+    // model like DObjCreateDuplicateParts. Otherwise every model past the
+    // first reads heap garbage (seen as models[1]=0x4000001706d6238) and
+    // XAnimInitModelMap faults dereferencing it.
+    const size_t modelsBytes = (sizeof(XModel *) + 1) * from->numModels;
+    v5 = (XModel **)MT_Alloc(modelsBytes, MT_TYPE_MODEL_LIST);
     obj->models = v5;
-    memcpy(v5, from->models, from->numModels + __ROL4__(from->numModels, 2));
+    memcpy(v5, from->models, modelsBytes);
 }

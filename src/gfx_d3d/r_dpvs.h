@@ -301,7 +301,7 @@ float __cdecl R_DpvsPlaneMaxSignedDistToBox(const DpvsPlane *plane, const float 
 void R_SetCullDist(float dist);
 
 // r_dpvs_entity
-void __cdecl R_AddEntitySurfacesInFrustumCmd(uint16_t *data);
+void __cdecl R_AddEntitySurfacesInFrustumCmd(const DpvsEntityCmd *dpvsData);
 bool __cdecl R_BoundsInCell(mnode_t *node, int findCellIndex, const float *mins, const float *maxs);
 bool __cdecl R_BoundsInCell_r(mnode_t *node, int findCellIndex, const float *mins, const float *maxs);
 

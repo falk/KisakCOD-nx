@@ -2,6 +2,10 @@
 #include "com_memory.h"
 #include "assertive.h"
 
+#ifdef __SWITCH__
+#include <platform/switch/switch_hunk_core.h>
+#endif
+
 #include "script/scr_stringlist.h"
 
 #include <string.h>
@@ -9,8 +13,12 @@
 #include <qcommon/threads.h>
 
 #include <qcommon/mem_track.h>
+#ifndef __SWITCH__
 #include <win32/win_local.h>
+#endif
+#ifndef __SWITCH__
 #include <win32/win_net.h>
+#endif
 #include <database/database.h>
 #include "com_files.h"
 #include <qcommon/cmd.h>
@@ -26,11 +34,13 @@ static HunkUser* g_debugUser;
 static int32_t g_largeLocalPos;
 static unsigned char g_largeLocalBuf[0x80000];
 
+#if !defined(__SWITCH__)
 struct hunkUsed_t // sizeof=0x8
 {                                       // ...
 	int32_t permanent;                      // ...
 	int32_t temp;                           // ...
 };
+#endif
 struct hunkHeader_t // sizeof=0x10
 {
 	uint32_t magic;
@@ -39,12 +49,16 @@ struct hunkHeader_t // sizeof=0x10
 	int32_t dummy;
 };
 
+#if !defined(__SWITCH__)
 static hunkUsed_t hunk_high;
 static hunkUsed_t hunk_low;
+#endif
 
+#if !defined(__SWITCH__)
 unsigned char* s_hunkData;
 uint8_t *s_origHunkData;
 int32_t s_hunkTotal;
+#endif
 
 void __cdecl Hunk_AddAsset(XAssetHeader header, _DWORD *data)
 {
@@ -132,6 +146,7 @@ uint8_t* __cdecl Hunk_AllocXAnimServer(uint32_t size)
 //    track_static_alloc_internal(g_largeLocalBuf, 0x80000, "g_largeLocalBuf", 10);
 //}
 
+#if !defined(__SWITCH__)
 void* __cdecl Z_VirtualReserve(int32_t size)
 {
     void* buf; // [esp+0h] [ebp-4h]
@@ -213,6 +228,7 @@ void __cdecl Z_VirtualCommit(void* ptr, int32_t size)
 {
     Z_VirtualCommitInternal(ptr, size);
 }
+#endif
 
 const char* __cdecl CopyString(char* in)
 {
@@ -333,7 +349,10 @@ char* __cdecl Hunk_SetDataForFile(int32_t type, const char* name, void* data, vo
     hash = FS_HashFileName(name, 1024);
     if (Hunk_FindDataForFileInternal(type, name, hash))
         MyAssertHandler(".\\universal\\com_memory.cpp", 1483, 0, "%s", "!Hunk_FindDataForFileInternal( type, name, hash )");
-    fileData = (fileData_s*)alloc(strlen(name) + 10);
+    // LP64: fileData_s carries two native pointers, so the ILP32
+    // strlen(name)+10 literal under-allocated by sizeof(void*) and the name
+    // copy overran the next hunk block. Size from the native layout.
+    fileData = (fileData_s*)alloc(sizeof(fileData_s) + strlen(name));
     if (!Hunk_DataOnHunk((uint8_t*)fileData))
         MyAssertHandler(".\\universal\\com_memory.cpp", 1488, 0, "%s", "Hunk_DataOnHunk( fileData )");
     fileData->data = data;
@@ -358,7 +377,9 @@ void __cdecl Hunk_AddData(int32_t type, void* data, void* (__cdecl* alloc)(int))
 
     if (!Sys_IsMainThread())
         MyAssertHandler(".\\universal\\com_memory.cpp", 1511, 0, "%s", "Sys_IsMainThread()");
-    fileData = (fileData_s*)alloc(9);
+    // LP64: the ILP32 literal 9 stopped at name[0]; the native struct's
+    // next/type fields live past that and were overwriting hunk memory.
+    fileData = (fileData_s*)alloc(sizeof(fileData_s));
     if (!Hunk_DataOnHunk((uint8_t*)fileData))
         MyAssertHandler(".\\universal\\com_memory.cpp", 1516, 0, "%s", "Hunk_DataOnHunk( fileData )");
     fileData->data = data;
@@ -420,6 +441,7 @@ void __cdecl Hunk_ClearDataFor(fileData_s** pFileData, uint8_t* low, uint8_t* hi
     }
 }
 
+#if !defined(__SWITCH__)
 void __cdecl Hunk_ClearToMarkLow(int32_t mark)
 {
     uint8_t* endBuf; // [esp+0h] [ebp-Ch]
@@ -717,6 +739,7 @@ void Hunk_CheckTempMemoryHighClear()
     iassert(s_hunkData);
     iassert(hunk_high.temp == hunk_high.permanent);
 }
+#endif
 
 int32_t __cdecl Hunk_HideTempMemory()
 {
@@ -848,6 +871,7 @@ void __cdecl Hunk_FreeDebugMem(void* ptr)
     iassert(g_debugUser);
 }
 
+#if !defined(__SWITCH__)
 HunkUser* __cdecl Hunk_UserCreate(int32_t maxSize, const char* name, bool fixed, bool tempMem, int32_t type)
 {
     HunkUser* user; // [esp+0h] [ebp-4h]
@@ -975,6 +999,7 @@ char* __cdecl Hunk_CopyString(HunkUser* user, const char* in)
     } while (v3);
     return out;
 }
+#endif
 
 uint8_t* __cdecl Hunk_AllocXModelPrecache(uint32_t size)
 {

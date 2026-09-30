@@ -3,6 +3,7 @@
 #endif
 
 #include <universal/q_shared.h>
+#include <port/switch_perf.h>
 #include "cg_view.h"
 #include <EffectsCore/fx_system.h>
 #include "cg_main.h"
@@ -25,6 +26,8 @@
 #include <client/cl_scrn.h>
 #include <universal/profile.h>
 #include <game/g_main.h>
+#include <server/server.h>
+#include <gfx_d3d/r_init.h>
 
 ClientViewParams clientViewParamsArray[1][1] = { { { 0.0, 0.0, 1.0, 1.0 } } };
 TestEffect s_testEffect[1];
@@ -101,7 +104,7 @@ void __cdecl CG_FxTest()
 {
     const char *v0; // r3
     const char *v1; // r3
-    long double v2; // fp2
+    double v2; // fp2
 
     if (cmd_args.nesting >= 8u)
         MyAssertHandler(
@@ -328,7 +331,7 @@ float __cdecl CG_GetVerticalBobFactor(
     //    amplitude = maxAmp;
     //
     //v10 = (float)((float)v9 * (float)2.0);
-    //v11 = sin(*(long double *)&speed);
+    //v11 = sin(*(double *)&speed);
     //v12 = (float)*(double *)&v11;
     //*(double *)&v11 = ((cycle * 4.0f) + 1.5707964f);
     //v13 = sin(v11);
@@ -347,7 +350,7 @@ float __cdecl CG_GetHorizontalBobFactor(
     //int viewHeightTarget; // r11
     //const dvar_s *v5; // r11
     //double v6; // fp31
-    //long double v7; // fp2
+    //double v7; // fp2
     //double v8; // fp1
     //
     //viewHeightTarget = predictedPlayerState->viewHeightTarget;
@@ -370,7 +373,7 @@ float __cdecl CG_GetHorizontalBobFactor(
     //v6 = (float)(v5->current.value * (float)speed);
     //if (v6 > maxAmp)
     //    v6 = maxAmp;
-    //v7 = sin(*(long double *)&speed);
+    //v7 = sin(*(double *)&speed);
     //v8 = (float)((float)*(double *)&v7 * (float)v6);
     //return *((float *)&v8 + 1);
 }
@@ -677,10 +680,10 @@ float __cdecl CG_GetViewFov(int localClientNum)
 
 void __cdecl CG_CalcFov(int localClientNum)
 {
-    //long double v2; // fp2
-    //long double v3; // fp2
+    //double v2; // fp2
+    //double v3; // fp2
     //double v4; // fp29
-    //long double v5; // fp2
+    //double v5; // fp2
     //
     //if (localClientNum)
     //{
@@ -1555,6 +1558,11 @@ int __cdecl CG_DrawActiveFrame(
     double FarPlaneDist; // fp1
     FxCmd v32[9]; // [sp+50h] [-70h] BYREF
 
+#ifdef __SWITCH__
+    // SWITCH_PERF: whole cgame frame; `draw` is CG_DrawActive (which contains
+    // the frontend scene build), so sim = total - draw.
+    SWITCH_PERF_SCOPE(SWITCH_PERF_CGAME_TOTAL);
+#endif
     //Profile_Begin(13);
     R_ClearScene(localClientNum);
     FX_BeginUpdate(localClientNum);
@@ -1610,7 +1618,15 @@ int __cdecl CG_DrawActiveFrame(
             "cgameGlob->frametime - cgameGlob->animFrametime >= 0",
             v18);
     }
+#ifdef __SWITCH__
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_CGAME_SNAPSHOTS);
+        CG_ProcessSnapshots(localClientNum);
+    }
+#else
     CG_ProcessSnapshots(localClientNum);
+#endif
+    
     if (!cgArray[0].snap)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\cgame\\cg_view.cpp", 1425, 0, "%s", "cgameGlob->snap");
     if (!cgArray[0].nextSnap)
@@ -1625,11 +1641,14 @@ int __cdecl CG_DrawActiveFrame(
     if (CL_SkipRendering())
     {
         CG_PredictPlayerState(localClientNum);
+        
         //Profile_EndInternal(0);
         return 0;
     }
     CG_VisionSetsUpdate(localClientNum);
+    
     CG_UpdateViewOffset(localClientNum);
+    
     if (!CG_ModelPreviewerNeedsVieworgInterpSkipped(localClientNum))
     {
         cgArray[0].refdef.vieworg[0] = cgArray[0].refdef.viewOffset[0];
@@ -1639,10 +1658,19 @@ int __cdecl CG_DrawActiveFrame(
     cgArray[0].refdef.time = cgArray[0].time;
     R_SetLodOrigin(&cgArray[0].refdef);
     FX_SetNextUpdateTime(localClientNum, cgArray[0].time);
+    
+#ifdef __SWITCH__
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_CGAME_FX);
+        FX_FillUpdateCmd(localClientNum, v32);
+        R_UpdateNonDependentEffects(v32);
+    }
+#else
     FX_FillUpdateCmd(localClientNum, v32);
     //Profile_Begin(22);
     R_UpdateNonDependentEffects(v32);
     //Profile_EndInternal(0);
+#endif
     if (localClientNum)
         MyAssertHandler(
             "c:\\trees\\cod3\\cod3src\\src\\cgame\\cg_local.h",
@@ -1664,6 +1692,7 @@ int __cdecl CG_DrawActiveFrame(
     }
     ShellshockParms = BG_GetShellshockParms(shellshockIndex);
     CG_StartShellShock(cgArray, ShellshockParms, shellshockTime, shellshockDuration);
+    
     UpdateTurretScopeZoom(cgArray);
     CG_UpdateShellShock(
         localClientNum,
@@ -1671,11 +1700,28 @@ int __cdecl CG_DrawActiveFrame(
         cgArray[0].shellshock.startTime,
         cgArray[0].shellshock.duration);
     CG_ClearHudGrenades();
-    CG_UpdateEntInfo(localClientNum);
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_CGAME_ENTINFO);
+        CG_UpdateEntInfo(localClientNum);
+    }
+    
+#ifdef __SWITCH__
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_CGAME_ENTITIES);
+#endif
     if (CG_AddPacketEntities(localClientNum))
+    {
         viewlocked_entNum = cgArray[0].predictedPlayerState.viewlocked_entNum;
+        
+    }
     else
+    {
         viewlocked_entNum = ENTITYNUM_NONE;
+    }
+#ifdef __SWITCH__
+    }
+#endif
+    
     //CG_UpdateRumble(localClientNum); // KISAKTODO 
     if (!cgArray[0].predictedPlayerState.locationSelectionInfo)
     {
@@ -1689,6 +1735,17 @@ int __cdecl CG_DrawActiveFrame(
         cgArray[0].selectedLocation[0] = 0.5;
         cgArray[0].selectedLocation[1] = 0.5;
     }
+    // Retail PC CG_DrawActiveFrame (0x42f89a-0x42f8b2): throttle to the GPU
+    // here, running the next server frame in slices while it waits
+    // (SV_FrameRateSmoothing, 0x5c8390) unless there is no new snapshot to
+    // interpolate towards or smoothing does not apply.
+    {
+#ifdef __SWITCH__
+        SWITCH_PERF_SCOPE(SWITCH_PERF_CGAME_SYNCGPU);
+#endif
+        if (cgArray[0].snap == cgArray[0].nextSnap || !SV_FrameRateSmoothing())
+            R_SyncGpu(NULL);
+    }
     CL_Input(localClientNum);
 #ifndef KISAK_NO_FASTFILES
     CG_ModelPreviewerFrame(cgArray);
@@ -1696,15 +1753,26 @@ int __cdecl CG_DrawActiveFrame(
 #endif
     {
         PROF_SCOPED("player state");
+#ifdef __SWITCH__
+        SWITCH_PERF_SCOPE(SWITCH_PERF_CGAME_PREDICT);
+#endif
         CG_PredictPlayerState(localClientNum);
     }
+    
     {
         PROF_SCOPED("view anim");
+#ifdef __SWITCH__
+        SWITCH_PERF_SCOPE(SWITCH_PERF_CGAME_VIEW);
+#endif
         CG_UpdateViewWeaponAnim(localClientNum);
     }
     {
         PROF_SCOPED("view values");
+#ifdef __SWITCH__
+        SWITCH_PERF_SCOPE(SWITCH_PERF_CGAME_VIEW);
+#endif
         CG_CalcViewValues(localClientNum);
+        
     }
 
     //PIXBeginNamedEvent_Copy_NoVarArgs(0xFFFFFFFF, "player entity");
@@ -1719,8 +1787,17 @@ int __cdecl CG_DrawActiveFrame(
         cgArray[0].refdef.vieworg,
         cgArray[0].refdef.viewaxis);
     //CG_SetRumbleReceiver(localClientNum, cgArray[0].nextSnap->ps.clientNum, cgArray[0].refdef.vieworg); // KISAKTODO
+#ifdef __SWITCH__
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_CGAME_VIEW);
+        CG_AddViewWeapon(localClientNum);
+    }
+#else
     CG_AddViewWeapon(localClientNum);
+#endif
+    
     CG_UpdateTestFX(localClientNum);
+    
     if (cgArray[0].nextSnap->serverTime != G_GetServerSnapTime())
         MyAssertHandler(
             "c:\\trees\\cod3\\cod3src\\src\\cgame\\cg_view.cpp",
@@ -1728,22 +1805,45 @@ int __cdecl CG_DrawActiveFrame(
             0,
             "%s",
             "cgameGlob->nextSnap->serverTime == G_GetServerSnapTime()");
+#ifdef __SWITCH__
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_CGAME_ENTITYPROC);
+#endif
     CG_ProcessEntity(localClientNum, &cgArray[0].predictedPlayerEntity);
     if (viewlocked_entNum != ENTITYNUM_NONE)
         CG_AddPacketEntity(localClientNum, viewlocked_entNum);
     GetCeilingHeight(cgArray);
+    
     DumpAnims(localClientNum);
+#ifdef __SWITCH__
+    }
+#endif
     //PIXEndNamedEvent();
     //PIXBeginNamedEvent_Copy_NoVarArgs(0xFFFFFFFF, "remaining fx");
+#ifdef __SWITCH__
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_CGAME_FX);
+        R_UpdateRemainingEffects(v32);
+    }
+#else
     R_UpdateRemainingEffects(v32);
+#endif
+    
     //PIXEndNamedEvent();
     //PIXBeginNamedEvent_Copy_NoVarArgs(0xFFFFFFFF, "aim assist");
+#ifdef __SWITCH__
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_CGAME_AIM);
+#endif
     AimAssist_UpdateScreenTargets(
         localClientNum,
         cgArray[0].refdef.vieworg,
         cgArray[0].refdefViewAngles,
         cgArray[0].refdef.tanHalfFovX,
         cgArray[0].refdef.tanHalfFovY);
+#ifdef __SWITCH__
+    }
+#endif
     //PIXEndNamedEvent();
     cgArray[0].refdef.dof.nearStart = cgArray[0].snap->ps.dofNearStart;
     cgArray[0].refdef.dof.nearEnd = cgArray[0].snap->ps.dofNearEnd;
@@ -1755,7 +1855,15 @@ int __cdecl CG_DrawActiveFrame(
     R_AddCmdProjectionSet2D();
     DrawShellshockBlend(localClientNum);
     //Profile_Begin(350);
+#ifdef __SWITCH__
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_CGAME_DRAW2D);
+        CG_Draw2D(localClientNum);
+    }
+#else
     CG_Draw2D(localClientNum);
+#endif
+    
     //Profile_EndInternal(0);
     //PIXEndNamedEvent();
     if (cgArray[0].nextSnap->serverTime != G_GetServerSnapTime())
@@ -1768,9 +1876,16 @@ int __cdecl CG_DrawActiveFrame(
     Sys_AllowSendClientMessages();
     R_Cinematic_SetPaused((CinematicEnum)(cg_paused->current.integer != 0));
     //Profile_Begin(25);
+#ifdef __SWITCH__
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_CGAME_DRAW);
+        CG_DrawActive(localClientNum);
+    }
+#else
     CG_DrawActive(localClientNum);
+#endif
+    
     //Profile_EndInternal(0);
     //Profile_EndInternal(0);
     return 1;
 }
-

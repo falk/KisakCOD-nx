@@ -9,6 +9,7 @@
 #include "cg_main.h"
 #include <client/cl_input.h>
 #include "cg_servercmds.h"
+#include <port/switch_rumble.h>
 #endif
 
 void __cdecl CG_Respawn(int32_t localClientNum)
@@ -91,6 +92,13 @@ void __cdecl CG_DamageFeedback(int32_t localClientNum, int32_t yawByte, int32_t 
     int32_t i; // [esp+40h] [ebp-4h]
 
     cgameGlob = CG_GetLocalClientGlobals(localClientNum);
+#if defined(__SWITCH__)
+    // Local player's own damage feedback only (CG_DamageFeedback is only
+    // ever called for the local client's playerState_s in SP -- see the
+    // two CG_TransitionPlayerState call sites below).
+    if (damage > 0)
+        Switch_RumbleNotifyDamage(damage);
+#endif
     kick = (double)damage * bg_viewKickScale->current.value;
     if (bg_viewKickMin->current.value <= (double)kick)
     {

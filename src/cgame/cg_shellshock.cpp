@@ -337,7 +337,10 @@ void __cdecl EndShellShockSound(int32_t localClientNum)
     snd_alias_t *alias; // [esp+10h] [ebp-4h]
     cg_s *cgameGlob;
 
-    SND_DeactivateChannelVolumes(3, 0);
+    // SND_CHANNELVOLPRIO_SHELLSHOCK is 4 in SP (retail iw3sp 0x42a790 /
+    // 0x42a820); the literal 3 this code carried is the MP value, which in SP
+    // is SND_CHANNELVOLPRIO_PAIN.
+    SND_DeactivateChannelVolumes(SND_CHANNELVOLPRIO_SHELLSHOCK, 0);
     SND_DeactivateEnvironmentEffects(SND_ENVEFFECTPRIO_SHELLSHOCK, 0);
 
     cgameGlob = CG_GetLocalClientGlobals(localClientNum);
@@ -399,7 +402,7 @@ void __cdecl UpdateShellShockSound(int32_t localClientNum, const shellshock_parm
                 if (dt >= 0 && dt < parms->sound.fadeOutTime)
                 {
                     SND_DeactivateEnvironmentEffects(SND_ENVEFFECTPRIO_SHELLSHOCK, dt);
-                    SND_DeactivateChannelVolumes(3, dt);
+                    SND_DeactivateChannelVolumes(SND_CHANNELVOLPRIO_SHELLSHOCK, dt);
                 }
             }
             else
@@ -410,7 +413,7 @@ void __cdecl UpdateShellShockSound(int32_t localClientNum, const shellshock_parm
                     parms->sound.drylevel,
                     parms->sound.wetlevel,
                     0);
-                SND_SetChannelVolumes(3, parms->sound.channelvolume, 0);
+                SND_SetChannelVolumes(SND_CHANNELVOLPRIO_SHELLSHOCK, parms->sound.channelvolume, 0);
             }
         }
         else
@@ -421,7 +424,7 @@ void __cdecl UpdateShellShockSound(int32_t localClientNum, const shellshock_parm
                 parms->sound.drylevel,
                 parms->sound.wetlevel,
                 parms->sound.fadeInTime - time);
-            SND_SetChannelVolumes(3, parms->sound.channelvolume, parms->sound.fadeInTime - time);
+            SND_SetChannelVolumes(SND_CHANNELVOLPRIO_SHELLSHOCK, parms->sound.channelvolume, parms->sound.fadeInTime - time);
         }
         dta = parms->sound.loopFadeTime + parms->sound.loopEndDelay + duration - time;
         if (dta > 0)

@@ -1319,6 +1319,14 @@ server_demo_history_t *__cdecl SV_DemoGetBuffer()
                 MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\server\\sv_demo.cpp", 2230, 0, "%s", "!g_historySaving");
                 v0 = g_history;
             }
+            // the save-history thread is real on Switch now
+            // (switch_thread_sync.cpp's Sys_SpawnServerDemoThread and the
+            // g_saveHistory* events), so this publishes to it exactly like
+            // retail: SV_SaveHistoryLoop does the save and clears
+            // g_historySaving before signalling the done event.  This used to
+            // call SV_SaveHistory/SV_FreeHistoryData inline, because
+            // publishing to a no-op event shim and then claiming completion
+            // left g_historySaving pointing at the buffer.
             g_historySaving = v0;
             //__lwsync();
             g_savingHistory = 1;
@@ -1575,7 +1583,7 @@ int __cdecl SV_LoadHistoryForMark(const char *name)
     FileMarkSkip *MarkSkip; // r11
     server_demo_history_t *v5; // r11
 
-    v2 = (char)g_history;
+    v2 = g_history != nullptr; // LP64: was the pointer's low byte
     if (g_history)
         v2 = g_history->manual && I_stricmp(g_history->name, name) == 0;
     if (!v2)
@@ -1672,7 +1680,7 @@ void __cdecl SV_DemoBack_f()
     int v0; // r31
     int v1; // r31
     const char *v2; // r3
-    long double v3; // fp2
+    double v3; // fp2
 
     if (replay_time && replay_autosave)
     {
@@ -1712,7 +1720,7 @@ void __cdecl SV_DemoBack_f()
 void __cdecl SV_DemoForward_f()
 {
     const char *v0; // r3
-    long double v1; // fp2
+    double v1; // fp2
     int v2; // r28
     int v3; // r30
     server_demo_history_t *v4; // r11
@@ -1776,7 +1784,7 @@ void __cdecl SV_DemoFullForward_f()
 {
     int v0; // r11
     const char *v1; // r3
-    long double v2; // fp2
+    double v2; // fp2
 
     if (replay_time && replay_autosave)
     {
@@ -2243,4 +2251,3 @@ int __cdecl SV_DemoButtonPressed()
         return 0;
     }
 }
-

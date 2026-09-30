@@ -1,0 +1,55 @@
+diff --git a/source/compiler_iface.cpp b/source/compiler_iface.cpp
+index 7ce5809..74199e9 100644
+--- a/source/compiler_iface.cpp
++++ b/source/compiler_iface.cpp
+@@ -659,6 +659,38 @@ void DekoCompiler::OutputDksh(const char* dkshFile)
+ 	}
+ }
+ 
++bool DekoCompiler::OutputDkshToMemory(void** outData, uint32_t* outSize)
++{
++	DkshHeader hdr = {};
++	hdr.magic        = DKSH_MAGIC;
++	hdr.header_sz    = sizeof(DkshHeader);
++	hdr.control_sz   = Align256(sizeof(DkshHeader) + sizeof(DkshProgramHeader));
++	hdr.code_sz      = Align256((m_stage != pipeline_stage_compute ? 0x80 : 0x00) + m_codeSize) + Align256(m_dataSize);
++	hdr.programs_off = sizeof(DkshHeader);
++	hdr.num_programs = 1;
++
++	const uint32_t total = hdr.control_sz + hdr.code_sz;
++	uint8_t* out = (uint8_t*)calloc(1, total);
++	if (!out)
++		return false;
++	uint32_t pos = 0;
++	memcpy(out + pos, &hdr, sizeof(hdr)); pos += sizeof(hdr);
++	memcpy(out + pos, &m_dkph, sizeof(m_dkph));
++	pos = hdr.control_sz;
++	if (m_stage != pipeline_stage_compute)
++	{
++		pos += s_shaderStartOffset;
++		memcpy(out + pos, &m_nvsh, sizeof(m_nvsh)); pos += sizeof(m_nvsh);
++	}
++	memcpy(out + pos, m_code, m_codeSize); pos += m_codeSize;
++	pos = Align256(pos);
++	if (m_dataSize)
++		memcpy(out + pos, m_data, m_dataSize);
++	*outData = out;
++	*outSize = total;
++	return true;
++}
++
+ void DekoCompiler::OutputRawCode(const char* rawFile)
+ {
+ 	FILE* f = fopen(rawFile, "wb");
+diff --git a/source/compiler_iface.h b/source/compiler_iface.h
+index 63e1042..99ac105 100644
+--- a/source/compiler_iface.h
++++ b/source/compiler_iface.h
+@@ -39,6 +39,7 @@ public:
+ 
+ 	bool CompileGlsl(const char* glsl);
+ 	void OutputDksh(const char* dkshFile);
++	bool OutputDkshToMemory(void** outData, uint32_t* outSize);
+ 	void OutputRawCode(const char* rawFile);
+ 	void OutputTgsi(const char* tgsiFile);
+ };

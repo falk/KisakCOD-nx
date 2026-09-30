@@ -377,7 +377,7 @@ void __cdecl CG_ClipMoveToEntities_r(
             v13 = p2[sector->tree.axis] - sector->tree.dist;
         else
             v13 = p[sector->tree.axis] - sector->tree.dist;
-        if (offset > (double)v13)
+        if (offset > v13)
         {
             v12 = t1 - t2;
             if (v12 < 0.0)
@@ -386,7 +386,7 @@ void __cdecl CG_ClipMoveToEntities_r(
                 v11 = p[sector->tree.axis] - sector->tree.dist;
             if (v11 > -offset)
             {
-                if (p[3] >= (double)results->fraction)
+                if (p[3] >= results->fraction)
                     return;
                 diff = t2 - t1;
                 if (diff == 0.0)
@@ -502,7 +502,7 @@ void __cdecl CG_ClipMoveToEntity(const moveclip_t *clip, uint32_t entIndex, trac
                     v3,
                     cent->pose.origin,
                     angles);
-                if (oldFraction > (double)results->fraction)
+                if (oldFraction > results->fraction)
                 {
                     results->modelIndex = 0;
                     results->partName = 0;
@@ -599,7 +599,7 @@ void __cdecl CG_PointTraceToEntities_r(
         t2 = p2[sector->tree.axis] - sector->tree.dist;
         if (t1 * t2 < 0.0)
         {
-            if (p[3] >= (double)results->fraction)
+            if (p[3] >= results->fraction)
                 return;
             frac = t1 / (t1 - t2);
             iassert(frac >= 0.0f);
@@ -684,7 +684,7 @@ void __cdecl CG_PointTraceToEntity(const pointtrace_t *clip, uint32_t entIndex, 
                         DObjGeomTracelinePartBits(dobj, clip->contentmask, partBits);
                         CG_LocationTraceDobjCalcPose(dobj, &cent->pose, partBits);
                         DObjGeomTraceline(dobj, localStart, localEnd, clip->contentmask, &objTrace);
-                        if (results->fraction > (double)objTrace.fraction)
+                        if (results->fraction > objTrace.fraction)
                         {
                             results->fraction = objTrace.fraction;
                             results->surfaceFlags = objTrace.surfaceflags;
@@ -744,7 +744,7 @@ void __cdecl CG_PointTraceToEntity(const pointtrace_t *clip, uint32_t entIndex, 
                             v3,
                             cent->pose.origin,
                             angles);
-                        if (oldFraction > (double)results->fraction)
+                        if (oldFraction > results->fraction)
                         {
                             results->modelIndex = 0;
                             results->partName = 0;

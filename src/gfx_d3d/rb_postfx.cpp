@@ -1,4 +1,5 @@
 #include <universal/q_shared.h>
+#include "r_dynres.h"
 #include "rb_postfx.h"
 #include "r_dvars.h"
 #include "rb_state.h"
@@ -7,6 +8,7 @@
 #include "rb_imagefilter.h"
 #include <devgui/devgui.h>
 #include <universal/profile.h>
+#include <deko9/deko9_native.h>
 
 
 bool __cdecl R_UsingGlow(const GfxViewInfo *viewInfo)
@@ -73,6 +75,42 @@ void RB_GetResolvedScene()
     }
 }
 
+// The merged post effect overwrites the whole scene target with an opaque
+// filter of the resolved copy, so the scene image can be handed to the
+// resolved texture instead of copied. Glow/blur-only and split-screen views
+// blend onto the scene and keep the copy.
+static bool RB_MoveResolvedScene(const GfxViewInfo *viewInfo)
+{
+    if (!viewInfo->isRenderingFullScreen || !RB_UsingMergedPostEffects(viewInfo) || r_showFbColorDebug->current.integer ||
+        gfxCmdBufSourceState.input.codeImages[TEXTURE_SRC_CODE_RESOLVED_SCENE])
+        return false;
+    const GfxRenderTargetId scene = gfxCmdBufState.renderTargetId;
+    GfxImage *resolved = gfxRenderTargets[R_RENDERTARGET_RESOLVED_SCENE].image;
+    if (scene != R_RENDERTARGET_SCENE || !resolved || gfxRenderTargets[scene].image == resolved ||
+        resolved->width != gfxRenderTargets[scene].width || resolved->height != gfxRenderTargets[scene].height)
+        return false;
+    if (!Deko9_MoveContents(dx.device, gfxRenderTargets[scene].surface.color, resolved->texture.map))
+        Com_Error(ERR_FATAL, "Post effects: scene move failed (see FAIL:DEKO9_MOVE_CONTENTS)");
+    R_SetCodeImageTexture(&gfxCmdBufSourceState, TEXTURE_SRC_CODE_RESOLVED_SCENE, resolved);
+    return true;
+}
+
+// Logs each change of the post chain and of the resolve path.
+static void RB_LogPostChain(const GfxViewInfo *viewInfo, bool moved)
+{
+    const int dof = R_UsingDepthOfField(viewInfo), color = RB_UsingColorManipulation(viewInfo),
+              glow = R_UsingGlow(viewInfo), blur = RB_UsingBlur(viewInfo->blurRadius),
+              full = viewInfo->isRenderingFullScreen ? 1 : 0;
+    const int key = dof | color << 1 | glow << 2 | blur << 3 | (moved ? 1 : 0) << 4 | full << 5;
+    static int s_lastKey = -1, s_logged;
+    if (key == s_lastKey || s_logged >= 64)
+        return;
+    s_lastKey = key;
+    ++s_logged;
+    Com_Printf(CON_CHANNEL_SYSTEM, "R_POSTFX_CHAIN dof=%d color=%d glow=%d blur=%d fullscreen=%d resolve=%s\n", dof,
+               color, glow, blur, full, moved ? "move" : "copy");
+}
+
 void __cdecl RB_GetDepthOfFieldInputImages(float radius)
 {
     float v1; // [esp+Ch] [ebp-8h]
@@ -101,7 +139,10 @@ void __cdecl RB_ProcessPostEffects(const GfxViewInfo *viewInfo)
     {
         PROF_SCOPED("RB_ProcessPostEffects");
 
-        RB_GetResolvedScene();
+        const bool moved = RB_MoveResolvedScene(viewInfo);
+        if (!moved)
+            RB_GetResolvedScene();
+        RB_LogPostChain(viewInfo, moved);
 
         if (RB_UsingMergedPostEffects(viewInfo))
             RB_ApplyMergedPostEffects(viewInfo);
@@ -109,8 +150,8 @@ void __cdecl RB_ProcessPostEffects(const GfxViewInfo *viewInfo)
         if (R_UsingGlow(viewInfo))
         {
             RB_CalcGlowEffect(viewInfo);
-            R_SetRenderTargetSize(&gfxCmdBufSourceState, R_RENDERTARGET_FRAME_BUFFER);
-            R_SetRenderTarget(gfxCmdBufContext, R_RENDERTARGET_FRAME_BUFFER);
+            R_SetRenderTargetSize(&gfxCmdBufSourceState, R_RENDERTARGET_POST);
+            R_SetRenderTarget(gfxCmdBufContext, R_RENDERTARGET_POST);
             RB_ApplyGlowEffect(viewInfo);
         }
         if (RB_UsingBlur(viewInfo->blurRadius))
@@ -152,13 +193,13 @@ void __cdecl RB_CalcGlowEffect(const GfxViewInfo *viewInfo)
 
 void __cdecl RB_ApplyGlowEffect(const GfxViewInfo *viewInfo)
 {
-    if (gfxRenderTargets[gfxCmdBufState.renderTargetId].surface.color != gfxRenderTargets[R_RENDERTARGET_FRAME_BUFFER].surface.color)
+    if (gfxRenderTargets[gfxCmdBufState.renderTargetId].surface.color != gfxRenderTargets[R_RENDERTARGET_POST].surface.color)
         MyAssertHandler(
             ".\\rb_postfx.cpp",
             143,
             0,
             "%s",
-            "gfxRenderTargets[gfxCmdBufState.renderTargetId].surface.color == gfxRenderTargets[R_RENDERTARGET_FRAME_BUFFER].surface.color");
+            "gfxRenderTargets[gfxCmdBufState.renderTargetId].surface.color == gfxRenderTargets[R_RENDERTARGET_POST].surface.color");
     if (backEnd.glowCount > 0)
     {
         iassert( backEnd.glowCount == 1 );
@@ -210,13 +251,13 @@ void __cdecl RB_ApplyMergedPostEffects(const GfxViewInfo *viewInfo)
         dofEquation[3] = v10;
         if (!Vec4Compare(gfxCmdBufSourceState.input.consts[CONST_SRC_CODE_DOF_EQUATION_VIEWMODEL_AND_FAR_BLUR], dofEquation))
             R_SetCodeConstantFromVec4(&gfxCmdBufSourceState, CONST_SRC_CODE_DOF_EQUATION_VIEWMODEL_AND_FAR_BLUR, dofEquation);
-        v9 = 1.0f / (float)vidConfig.sceneHeight;
+        v9 = 1.0f / (float)gfxRenderTargets[R_RENDERTARGET_SCENE].height;
         R_UpdateCodeConstant(&gfxCmdBufSourceState, CONST_SRC_CODE_DOF_ROW_DELTA, 0.0, v9, 0.0f, 0.0f);
         smallFrac = RB_GetDepthOfFieldBlurFraction(viewInfo, 1.4f);
         mediumFrac = RB_GetDepthOfFieldBlurFraction(viewInfo, 3.5999999f);
         if (smallFrac <= 0.0f || mediumFrac <= smallFrac || mediumFrac >= 1.0f)
         {
-            v1 = va("%g, %g, %g, %i", smallFrac, mediumFrac, viewInfo->dof.nearBlur, vidConfig.sceneHeight);
+            v1 = va("%g, %g, %g, %i", smallFrac, mediumFrac, viewInfo->dof.nearBlur, (int)gfxRenderTargets[R_RENDERTARGET_SCENE].height);
             MyAssertHandler(
                 ".\\rb_postfx.cpp",
                 335,
@@ -235,8 +276,8 @@ void __cdecl RB_ApplyMergedPostEffects(const GfxViewInfo *viewInfo)
         v2 = mediumFrac / (mediumFrac - smallFrac);
         R_UpdateCodeConstant(&gfxCmdBufSourceState, CONST_SRC_CODE_DOF_LERP_BIAS, 1.0f, v2, v3, v4);
         RB_GetDepthOfFieldInputImages(viewInfo->dof.nearBlur);
-        R_SetRenderTargetSize(&gfxCmdBufSourceState, R_RENDERTARGET_FRAME_BUFFER);
-        R_SetRenderTarget(gfxCmdBufContext, R_RENDERTARGET_FRAME_BUFFER);
+        R_SetRenderTargetSize(&gfxCmdBufSourceState, R_RENDERTARGET_POST);
+        R_SetRenderTarget(gfxCmdBufContext, R_RENDERTARGET_POST);
         if (RB_UsingColorManipulation(viewInfo))
             RB_FullScreenFilter(rgp.postFxDofColorMaterial);
         else
@@ -324,7 +365,7 @@ float __cdecl RB_GetDepthOfFieldBlurFraction(const GfxViewInfo *viewInfo, float 
             "%s\n\t(viewInfo->dof.nearBlur) = %g",
             "(viewInfo->dof.nearBlur >= 4.0f)",
             viewInfo->dof.nearBlur);
-    normalizedRadius = pixelRadiusAtSceneRes * 480.0f / (double)vidConfig.sceneHeight;
+    normalizedRadius = pixelRadiusAtSceneRes * 480.0f / (double)gfxRenderTargets[R_RENDERTARGET_SCENE].height;
     fraction = normalizedRadius / viewInfo->dof.nearBlur;
     return pow(fraction, r_dof_bias->current.value);
 }
@@ -356,8 +397,8 @@ void __cdecl RB_BlurScreen(const GfxViewInfo *viewInfo, float blurRadius)
         blurRadius = 1440.0f / gfxCmdBufSourceState.sceneViewport.height;
     }
     RB_GaussianFilterImage(blurRadius, R_RENDERTARGET_RESOLVED_SCENE, R_RENDERTARGET_POST_EFFECT_0);
-    R_SetRenderTargetSize(&gfxCmdBufSourceState, R_RENDERTARGET_FRAME_BUFFER);
-    R_SetRenderTarget(gfxCmdBufContext, R_RENDERTARGET_FRAME_BUFFER);
+    R_SetRenderTargetSize(&gfxCmdBufSourceState, R_RENDERTARGET_POST);
+    R_SetRenderTarget(gfxCmdBufContext, R_RENDERTARGET_POST);
     R_SetCodeImageTexture(&gfxCmdBufSourceState, TEXTURE_SRC_CODE_FEEDBACK, gfxRenderTargets[R_RENDERTARGET_POST_EFFECT_0].image);
     if (viewInfo->film.enabled)
         RB_FullScreenColoredFilter(rgp.feedbackFilmBlendMaterial, color);

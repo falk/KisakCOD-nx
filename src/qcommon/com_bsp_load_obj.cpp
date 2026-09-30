@@ -268,7 +268,7 @@ ComPrimaryLight *Com_LoadPrimaryLights_Version14()
     ComPrimaryLight *result; // eax
 
     comWorld.primaryLightCount = 2;
-    comWorld.primaryLights = (ComPrimaryLight *)Hunk_Alloc(0x88u, "Com_LoadPrimaryLights", 12);
+    comWorld.primaryLights = (ComPrimaryLight *)Hunk_Alloc(2 * sizeof(ComPrimaryLight), "Com_LoadPrimaryLights", 12); // LP64: was ILP32 2 * 0x44
     if (comWorld.primaryLights->type != GFX_LIGHT_TYPE_NONE)
         MyAssertHandler(
             ".\\qcommon\\com_bsp_load_obj.cpp",
@@ -298,7 +298,7 @@ const DiskPrimaryLight_Version16 *Com_LoadPrimaryLights_Version16()
     if (diskLightCount <= 1)
         Com_Error(ERR_DROP, "no primary lights in bsp\n");
     comWorld.primaryLightCount = diskLightCount;
-    comWorld.primaryLights = (ComPrimaryLight *)Hunk_Alloc(68 * diskLightCount, "Com_LoadPrimaryLights", 12);
+    comWorld.primaryLights = (ComPrimaryLight *)Hunk_Alloc(sizeof(ComPrimaryLight) * diskLightCount, "Com_LoadPrimaryLights", 12); // LP64: was ILP32 68
     result = diskLights;
     in = diskLights;
     out = comWorld.primaryLights;
@@ -367,7 +367,7 @@ ComPrimaryLight *Com_LoadPrimaryLights()
     if (diskLightCount <= 1)
         Com_Error(ERR_DROP, "no primary lights in bsp\n");
     comWorld.primaryLightCount = diskLightCount;
-    comWorld.primaryLights = (ComPrimaryLight *)Hunk_Alloc(68 * diskLightCount, "Com_LoadPrimaryLights", 12);
+    comWorld.primaryLights = (ComPrimaryLight *)Hunk_Alloc(sizeof(ComPrimaryLight) * diskLightCount, "Com_LoadPrimaryLights", 12); // LP64: was ILP32 68
     in = diskLights;
     result = comWorld.primaryLights;
     out = comWorld.primaryLights;

@@ -429,7 +429,7 @@ void __cdecl R_AddShadowCookie(
     }
 }
 
-static void __cdecl R_GetSunAxes(float (*sunAxis)[3][3])
+void __cdecl R_GetSunAxes(float (*sunAxis)[3][3])
 {
     float v1; // [esp+0h] [ebp-1Ch]
     float *dir; // [esp+18h] [ebp-4h]

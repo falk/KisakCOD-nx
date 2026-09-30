@@ -10,7 +10,14 @@ int __cdecl compare_hudelems(const void *pe0, const void *pe1)
 {
     float delta; // [esp+0h] [ebp-Ch]
 
-    delta = *(float *)(*(uint32_t *)pe0 + 128) - *(float *)(*(uint32_t *)pe1 + 128);
+    // LP64: qsort hands this &elems[i], where each element is a hudelem_s*.
+    // Reading that through a uint32_t* keeps only the low half of the pointer
+    // and the deref lands on a wild address -- the hardware Data Abort in
+    // GetSortedHudElems. Offset 128 is hudelem_s::sort; hudelem_s is entirely
+    // scalar (sizeof 0xA0) so the offset is the same on both ABIs, it is only
+    // the pointer load that has to widen.
+    delta = *(const float *)((const char *)*(void *const *)pe0 + 128)
+          - *(const float *)((const char *)*(void *const *)pe1 + 128);
     if (delta >= 0.0)
         return delta > 0.0;
     else
@@ -598,10 +605,10 @@ void __cdecl add_StringWithString(Operand *leftSide, Operand *rightSide, Operand
             "(rightSide->dataType == VAL_STRING)",
             rightSide->dataType);
     result->dataType = VAL_STRING;
-    I_strncpyz(leftSideStr, (char *)leftSide->internals.intVal, 256);
-    I_strncpyz(rightSideStr, (char *)rightSide->internals.intVal, 256);
+    I_strncpyz(leftSideStr, leftSide->internals.string, 256);
+    I_strncpyz(rightSideStr, rightSide->internals.string, 256);
     Com_sprintf(resultStr, 0x100u, "%s%s", leftSideStr, rightSideStr);
-    result->internals.intVal = (int)resultStr;
+    result->internals.string = resultStr;
 }
 
 char resultStr_0[256];
@@ -626,9 +633,9 @@ void __cdecl add_StringWithInt(Operand *leftSide, Operand *rightSide, Operand *r
             "(rightSide->dataType == VAL_INT)",
             rightSide->dataType);
     result->dataType = VAL_STRING;
-    I_strncpyz(leftSideStr, (char *)leftSide->internals.intVal, 256);
+    I_strncpyz(leftSideStr, leftSide->internals.string, 256);
     Com_sprintf(resultStr_0, 0x100u, "%s%i", leftSideStr, rightSide->internals.intVal);
-    result->internals.intVal = (int)resultStr_0;
+    result->internals.string = resultStr_0;
 }
 
 char resultStr_1[256];
@@ -653,9 +660,9 @@ void __cdecl add_IntWithString(Operand *leftSide, Operand *rightSide, Operand *r
             "(rightSide->dataType == VAL_STRING)",
             leftSide->dataType);
     result->dataType = VAL_STRING;
-    I_strncpyz(rightSideStr, (char *)rightSide->internals.intVal, 256);
+    I_strncpyz(rightSideStr, rightSide->internals.string, 256);
     Com_sprintf(resultStr_1, 0x100u, "%i%s", leftSide->internals.intVal, rightSideStr);
-    result->internals.intVal = (int)resultStr_1;
+    result->internals.string = resultStr_1;
 }
 
 char resultStr_2[256];
@@ -680,9 +687,9 @@ void __cdecl add_FloatWithString(Operand *leftSide, Operand *rightSide, Operand 
             "(rightSide->dataType == VAL_STRING)",
             leftSide->dataType);
     result->dataType = VAL_STRING;
-    I_strncpyz(rightSideStr, (char *)rightSide->internals.intVal, 256);
+    I_strncpyz(rightSideStr, rightSide->internals.string, 256);
     Com_sprintf(resultStr_2, 0x100u, "%f%s", leftSide->internals.floatVal, rightSideStr);
-    result->internals.intVal = (int)resultStr_2;
+    result->internals.string = resultStr_2;
 }
 
 char resultStr_3[256];
@@ -707,9 +714,9 @@ void __cdecl add_StringWithFloat(Operand *leftSide, Operand *rightSide, Operand 
             "(rightSide->dataType == VAL_FLOAT)",
             rightSide->dataType);
     result->dataType = VAL_STRING;
-    I_strncpyz(leftSideStr, (char *)leftSide->internals.intVal, 256);
+    I_strncpyz(leftSideStr, leftSide->internals.string, 256);
     Com_sprintf(resultStr_3, 0x100u, "%s%f", leftSideStr, rightSide->internals.floatVal);
-    result->internals.intVal = (int)resultStr_3;
+    result->internals.string = resultStr_3;
 }
 
 void __cdecl multiply_IntByInt(Operand *leftSide, Operand *rightSide, Operand *result)

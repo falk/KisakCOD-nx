@@ -84,7 +84,7 @@ void __cdecl CG_mg42_DoControllers(const cpose_t *pose, const DObj_s *obj, int *
     double v9; // fp30
     double v11; // fp0
     double v12; // fp31
-    long double v13; // fp2
+    double v13; // fp2
     double roll; // fp0
     double v15; // fp13
     float aimAngles[3]; // [sp+50h] [-70h] BYREF

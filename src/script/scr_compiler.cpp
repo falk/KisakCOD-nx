@@ -518,7 +518,7 @@ void __cdecl EmitCallBuiltinOpcode(int param_count, sval_u sourcePos)
         EmitByte(param_count);
 }
 
-int __cdecl AddFunction(int func, const char *name)
+int __cdecl AddFunction(intptr_t func, const char *name)
 {
     int i; // [esp+0h] [ebp-4h]
 
@@ -769,7 +769,7 @@ void __cdecl EmitPostScriptThread(sval_u func, int param_count, bool bMethod, sv
         EmitOpcode(OP_ScriptThreadCall, 1 - param_count, 2);
     AddOpcodePos(sourcePos.stringValue, 3);
     EmitFunction(func, sourcePos);
-    EmitCodepos((const char*)param_count);
+    EmitInteger(param_count);
 }
 
 void __cdecl EmitPostScriptThreadPointer(
@@ -785,7 +785,7 @@ void __cdecl EmitPostScriptThreadPointer(
     else
         EmitOpcode(OP_ScriptThreadCallPointer, -param_count, 2);
     AddOpcodePos(sourcePos.stringValue, 1);
-    EmitCodepos((const char*)param_count);
+    EmitInteger(param_count);
 }
 
 void __cdecl EmitPostScriptThreadCall(
@@ -854,7 +854,7 @@ void __cdecl EmitCall(sval_u func_name, sval_u params, bool bStatement, scr_bloc
         {
             value = Scr_EvalVariable(funcId);
             type = Scr_GetUncacheType(value.type);
-            func = (void(*)())value.u.intValue;
+            func = (void(*)())value.u.pointerValue;
         }
         else
         {
@@ -862,7 +862,7 @@ void __cdecl EmitCall(sval_u func_name, sval_u params, bool bStatement, scr_bloc
             func = Scr_GetFunction(&pName, &type);
             funcId = GetNewVariable(scrCompilePub.builtinFunc, name);
             value.type = Scr_GetCacheType(type);
-            value.u.intValue = (int)func;
+            value.u.pointerValue = (intptr_t)func;
             SetVariableValue(funcId, &value);
         }
     }
@@ -881,7 +881,7 @@ void __cdecl EmitCall(sval_u func_name, sval_u params, bool bStatement, scr_bloc
             {
                 Scr_CompileRemoveRefToString(name);
                 EmitCallBuiltinOpcode(param_count, sourcePos);
-                v4 = AddFunction((int)func, pName);
+                v4 = AddFunction((intptr_t)func, pName);
                 EmitShort(v4);
                 AddExpressionListOpcodePos(params);
                 if (bStatement)
@@ -900,7 +900,11 @@ void __cdecl EmitCall(sval_u func_name, sval_u params, bool bStatement, scr_bloc
     script_function:
         if (scrCompilePub.developer_statement == 3)
         {
-            CompileError(*(unsigned int*)(func_name.type + 8), "unknown builtin function");
+            // LP64: func_name holds the name-subtree pointer; its source
+            // position is slot 2.  The old `*(unsigned int*)(func_name.type
+            // + 8)` spelling hid a truncated base plus an ILP32 4-byte slot
+            // stride.  Evaluate-mode only, ILP32-identical.
+            CompileError(func_name.node[2].sourcePosValue, "unknown builtin function");
         }
         else
         {
@@ -983,7 +987,7 @@ void __cdecl EmitMethod(
         {
             value = Scr_EvalVariable(methId);
             type = Scr_GetUncacheType(value.type);
-            meth = (void(*)(scr_entref_t))value.u.intValue;
+            meth = (void(*)(scr_entref_t))value.u.pointerValue;
         }
         else
         {
@@ -991,7 +995,7 @@ void __cdecl EmitMethod(
             meth = Scr_GetMethod(&pName, &type);
             methId = GetNewVariable(scrCompilePub.builtinMeth, name);
             value.type = Scr_GetCacheType(type);
-            value.u.intValue = (int)meth;
+            value.u.pointerValue = (intptr_t)meth;
             SetVariableValue(methId, &value);
         }
     }
@@ -1011,7 +1015,7 @@ void __cdecl EmitMethod(
             {
                 Scr_CompileRemoveRefToString(name);
                 EmitCallBuiltinMethodOpcode(param_count, sourcePos);
-                v6 = AddFunction((int)meth, pName);
+                v6 = AddFunction((intptr_t)meth, pName);
                 EmitShort(v6);
                 AddOpcodePos(methodSourcePos.stringValue, 0);
                 AddExpressionListOpcodePos(params);
@@ -1032,7 +1036,8 @@ void __cdecl EmitMethod(
     script_method:
         if (scrCompilePub.developer_statement == 3)
         {
-            CompileError(*(unsigned int*)(func_name.type + 8), "unknown builtin method");
+            // LP64: same evaluate-mode rule as above (slot 2 sourcePos).
+            CompileError(func_name.node[2].sourcePosValue, "unknown builtin method");
         }
         else
         {
@@ -1312,7 +1317,7 @@ void __cdecl Scr_CreateVector(VariableCompileValue *constValue, VariableValue *v
         }
     }
     value->type = VAR_VECTOR;
-    value->u.intValue = (int)Scr_AllocVector(vec);
+    value->u.vectorValue = Scr_AllocVector(vec);
 }
 
 void __cdecl Scr_PushValue(VariableCompileValue *constValue)

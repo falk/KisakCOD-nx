@@ -76,7 +76,7 @@ struct fileHandleData_t // sizeof=0x11C
     qfile_us handleFiles;
     int handleSync;
     int fileSize;
-    int zipFilePos;
+    uint32_t zipFilePos;
     iwd_t *zipFile;
     int streamed;
     char name[256];
@@ -100,10 +100,21 @@ int __cdecl FS_LoadStack();
 int __cdecl FS_HashFileName(const char *fname, int hashSize);
 int __cdecl FS_filelength(int f);
 bool __cdecl FS_IsFileInZip(int f);
+#ifdef __SWITCH__
+#ifdef __cplusplus
+extern "C" {
+#endif
 void __cdecl FS_ReplaceSeparators(char *path);
+int __cdecl FS_CreatePath(char *OSPath);
+#ifdef __cplusplus
+}
+#endif
+#else
+void __cdecl FS_ReplaceSeparators(char *path);
+int __cdecl FS_CreatePath(char *OSPath);
+#endif
 void __cdecl FS_BuildOSPath(const char *base, const char *game, const char *qpath, char *ospath);
 void __cdecl FS_BuildOSPathForThread(const char *base, const char *game, const char *qpath, char *ospath, FsThread thread);
-int __cdecl FS_CreatePath(char *OSPath);
 void __cdecl FS_FCloseFile(int h);
 void __cdecl FS_FCloseLogFile(int h);
 int __cdecl FS_FOpenFileWrite(const char *filename);
@@ -129,6 +140,13 @@ int __cdecl FS_FileExists(char *file);
 int __cdecl FS_WriteFile(char *filename, char *buffer, uint32_t size);
 void __cdecl FS_ConvertPath(char *s);
 void __cdecl FS_InitFilesystem();
+void __cdecl FS_InitRetailSource(const char *retailRoot);
+
+// Retail fastfile reader (seam 9): moved to db_retail_fastfile.{cpp,h}
+// under src/database/retail/. com_files keeps only the FS-root and
+// file-open hooks; this include keeps every existing FS_ReadRetailFastfile*
+// call site working unchanged.
+#include "database/retail/db_retail_fastfile.h"
 uint32_t __cdecl FS_FOpenFileByMode(char *qpath, int *f, fsMode_t mode);
 void __cdecl FS_Flush(int f);
 void __cdecl FS_FreeFileList(const char **list);

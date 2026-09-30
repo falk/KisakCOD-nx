@@ -24,14 +24,18 @@ struct GfxModelSkinnedSurface // sizeof=0x18
         int oldSkinnedCachedOffset;
     };
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(GfxModelSkinnedSurface) == 24);
+#endif
 
 struct GfxModelRigidSurface // sizeof=0x38
 {
     GfxModelSkinnedSurface surf;
     GfxScaledPlacement placement;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(GfxModelRigidSurface) == 56);
+#endif
 
 struct SkinXModelCmd // sizeof=0x1C
 {                                       // ...

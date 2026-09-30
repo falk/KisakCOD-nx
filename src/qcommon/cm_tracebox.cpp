@@ -59,7 +59,7 @@ int __cdecl CM_TraceBox(const TraceExtents *extents, float *mins, float *maxs, f
                 if (dist2 > 0.0)
                 {
                     fraca = dist1 * extents->invDelta[t] * sign;
-                    if (fraca <= (double)enterFrac)
+                    if (fraca <= enterFrac)
                         return 1;
                     v6 = fraca - fraction;
                     if (v6 < 0.0)
@@ -74,7 +74,7 @@ int __cdecl CM_TraceBox(const TraceExtents *extents, float *mins, float *maxs, f
                 if (dist2 > 0.0)
                     return 1;
                 frac = dist1 * extents->invDelta[t] * sign;
-                if (fraction <= (double)frac)
+                if (fraction <= frac)
                     return 1;
                 v8 = enterFrac - frac;
                 if (v8 < 0.0)

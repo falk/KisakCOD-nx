@@ -1,5 +1,13 @@
+#include "r_dynres.h"
 #include <universal/q_shared.h>
+#include <cstddef>
+#include <deko9/deko9_native.h>
+#include <port/switch_perf.h>
+#include <qcommon/qcommon.h>
 #include "r_rendercmds.h"
+#include "r_view2d_alpha_skip.h"
+#include "rb_backend.h"
+#include <database/db_retail_frame_evidence.h>
 #include <qcommon/mem_track.h>
 #include <qcommon/threads.h>
 #include "rb_logfile.h"
@@ -105,6 +113,7 @@ void __cdecl R_ShutdownRenderBuffers()
     {
         data = &s_backEndData[dataIndex];
         data->endFence = 0;
+        data->endFrame = 0;
         data->preTessIb = 0;
         R_ShutdownDynamicMesh(&data->codeMesh);
         R_ShutdownDynamicMesh(&data->markMesh);
@@ -116,7 +125,10 @@ void __cdecl R_ShutdownRenderBuffers()
     }
     dx.swapFence = 0;
     for (viewIndexa = 0; viewIndexa < 4; ++viewIndexa)
+    {
         R_ShutdownDynamicMesh(&gfxMeshGlob.fullSceneViewMesh[viewIndexa].meshData);
+        R_ShutdownDynamicMesh(&gfxMeshGlob.fullSceneViewMeshOdd[viewIndexa].meshData);
+    }
     R_ShutdownSpotShadowMeshes();
     R_ShutdownDynamicIndices(&gfxBuf.smodelCache);
 }
@@ -198,6 +210,8 @@ void __cdecl R_InitRenderBuffers()
         h = (float)vidConfig.sceneHeight;
         w = (float)vidConfig.sceneWidth;
         R_SetQuadMesh(&gfxMeshGlob.fullSceneViewMesh[viewIndexa], 0.0, 0.0, w, h, 0.0, 0.0, 1.0, 1.0, 0xFFFFFFFF);
+        R_InitDynamicMesh(&gfxMeshGlob.fullSceneViewMeshOdd[viewIndexa].meshData, 6u, 4u, 0x20u);
+        R_SetQuadMesh(&gfxMeshGlob.fullSceneViewMeshOdd[viewIndexa], 0.0, 0.0, w, h, 0.0, 0.0, 1.0, 1.0, 0xFFFFFFFF);
     }
     R_InitSpotShadowMeshes();
     R_InitDynamicIndices(&gfxBuf.smodelCache, 0x100000);
@@ -239,6 +253,10 @@ void __cdecl R_SyncRenderThread()
                 Sys_FrontEndSleep();
                 r_glob.haveThreadOwnership = 1;
             }
+            // Main owns the renderer again (the back end is idle): its
+            // submits (Deko9_WaitForGpuIdle at shutdown/map change, inline
+            // frames) are the render owner's (deko9_native.h).
+            Deko9_ClaimSubmitThread(dx.device);
         }
     }
 }
@@ -281,21 +299,106 @@ void __cdecl R_IssueRenderCommands(uint32_t type)
         frontEndDataOut->drawType = type;
         if (!R_HandOffToBackend(type))
         {
-            if ((type & 2) != 0)
-                R_PerformanceCounters();
-            if (Sys_IsMainThread())
-                R_WaitFrontendWorkerCmds();
-            R_UpdateSkinCacheUsage();
-            if (R_CheckLostDevice())
-                v1 = g_disableRendering == 0;
-            else
-                v1 = 0;
+            {
+#ifdef __SWITCH__
+                SWITCH_PERF_SCOPE(SWITCH_PERF_ISSUE_PREP);
+#endif
+                if ((type & 2) != 0)
+                    R_PerformanceCounters();
+                if (Sys_IsMainThread())
+                {
+#ifdef __SWITCH__
+                    SWITCH_PERF_SCOPE(SWITCH_PERF_ISSUE_WAITFRONTEND);
+#endif
+                    R_WaitFrontendWorkerCmds();
+                }
+                R_UpdateSkinCacheUsage();
+                if (R_CheckLostDevice())
+                    v1 = g_disableRendering == 0;
+                else
+                    v1 = 0;
+            }
             if (v1)
             {
+#ifdef __SWITCH__
+                const uint32_t issuePerf_before = Sys_Milliseconds();
+                {
+                    SWITCH_PERF_SCOPE(SWITCH_PERF_ISSUE_BEGINFRAME);
+                    RB_BeginFrame(frontEndDataOut);
+                }
+                const uint32_t issuePerf_afterBegin = Sys_Milliseconds();
+                {
+                    SWITCH_PERF_SCOPE(SWITCH_PERF_ISSUE_DRAW3D);
+                    RB_Draw3D();
+                }
+                const uint32_t issuePerf_afterDraw3D = Sys_Milliseconds();
+                {
+                    SWITCH_PERF_SCOPE(SWITCH_PERF_ISSUE_EXEC);
+                    RB_CallExecuteRenderCommands();
+                }
+                const uint32_t issuePerf_afterExec = Sys_Milliseconds();
+                {
+                    SWITCH_PERF_SCOPE(SWITCH_PERF_ISSUE_ENDFRAME);
+                    RB_EndFrame(frontEndDataOut->drawType);
+                }
+#else
                 RB_BeginFrame(frontEndDataOut);
                 RB_Draw3D();
                 RB_CallExecuteRenderCommands();
                 RB_EndFrame(frontEndDataOut->drawType);
+#endif
+#ifdef __SWITCH__
+                // r_gpuSync=0 disables the retail fence path.  Force the
+                // deko3d backend to finish the submitted frame before the
+                // next frontend tick can reuse or replace renderer-owned
+                // assets.
+                if (!dx.gpuSync)
+                {
+                    // the walk evidence must show the retail fence,
+                    // not this forced-idle substitute.
+                    RetailKillhouseFrameEvidenceNoteForcedGpuIdle();
+                    R_SwitchWaitForGpuIdle();
+                }
+                const uint32_t issuePerf_afterEnd = Sys_Milliseconds();
+                const dvar_t *issuePerf_performance = Dvar_FindVar("performance");
+                if (issuePerf_performance && issuePerf_performance->current.enabled)
+                {
+                    // Diagnostic-only breakdown of R_IssueRenderCommands itself,
+                    // one 1-second-averaged line via the same convention as
+                    // cl_scrn.cpp's PERF_RENDER: this is the finer split of
+                    // its "issue" bucket, isolating whether the fixed per-frame
+                    // floor at near-zero surf counts is
+                    // RB_BeginFrame, RB_Draw3D, RB_CallExecuteRenderCommands
+                    // (the deko3d submission itself), or RB_EndFrame.
+                    static uint32_t reportBegin;
+                    static uint32_t frames;
+                    static uint64_t beginFrameSum;
+                    static uint64_t draw3DSum;
+                    static uint64_t execCmdsSum;
+                    static uint64_t endFrameSum;
+                    if (!reportBegin)
+                        reportBegin = issuePerf_before;
+                    ++frames;
+                    beginFrameSum += issuePerf_afterBegin - issuePerf_before;
+                    draw3DSum += issuePerf_afterDraw3D - issuePerf_afterBegin;
+                    execCmdsSum += issuePerf_afterExec - issuePerf_afterDraw3D;
+                    endFrameSum += issuePerf_afterEnd - issuePerf_afterExec;
+                    const uint32_t issuePerf_elapsed = issuePerf_afterEnd - reportBegin;
+                    if (issuePerf_elapsed >= 1000)
+                    {
+                        const double issuePerf_invFrames = 1.0 / (double)frames;
+                        Com_Printf(16,
+                            "PERF_ISSUE beginframe=%.1f draw3d=%.1f execcmds=%.1f endframe=%.1f\n",
+                            (double)beginFrameSum * issuePerf_invFrames,
+                            (double)draw3DSum * issuePerf_invFrames,
+                            (double)execCmdsSum * issuePerf_invFrames,
+                            (double)endFrameSum * issuePerf_invFrames);
+                        reportBegin = issuePerf_afterEnd;
+                        frames = 0;
+                        beginFrameSum = draw3DSum = execCmdsSum = endFrameSum = 0;
+                    }
+                }
+#endif
             }
             R_UnlockSkinnedCache();
             R_ToggleSmpFrame();
@@ -305,7 +408,18 @@ void __cdecl R_IssueRenderCommands(uint32_t type)
     {
         if (Sys_IsMainThread())
             R_WaitFrontendWorkerCmds();
+#ifndef __SWITCH__
+        // Retail's second, main-thread cinematic update per frame (the first
+        // is RB_BeginFrame's, on the thread that draws). Retail tolerates two
+        // callers: a critical section and double-buffered Bink texture sets.
+        // The Switch ffmpeg player (switch_cinematic_ffmpeg.cpp) is one
+        // single-buffered state whose update creates, retires and releases
+        // the textures, so this call raced the back-end thread's (r_smp_backend
+        // 1): main released the cinematic textures the back end had bound
+        // (FAIL:DEKO9_TEXTURE_BIND at cargoship_fade). On Switch the update
+        // runs once per frame from RB_BeginFrame only.
         R_Cinematic_UpdateFrame();
+#endif
         R_UnlockSkinnedCache();
         R_ToggleSmpFrame();
     }
@@ -333,6 +447,9 @@ char __cdecl R_HandOffToBackend(char type)
 {
     bool v2; // [esp+3h] [ebp-1h]
 
+#ifdef __SWITCH__
+    SWITCH_PERF_SCOPE(SWITCH_PERF_ISSUE_HANDOFF);
+#endif
     if (r_smp_backend->current.enabled)
         v2 = sys_smp_allowed->current.enabled && !r_glob.isRenderingRemoteUpdate;
     else
@@ -539,7 +656,8 @@ DebugGlobals *R_ToggleSmpFrame()
     Com_Memset(frontEndDataOut->drawSurfs, 176, 8 * frontEndDataOut->drawSurfCount);
     Com_Memset(frontEndDataOut->surfsBuffer, 176, frontEndDataOut->surfPos);
     Com_Memset(frontEndDataOut->clouds, 176, frontEndDataOut->cloudCount << 6);
-    Com_Memset(&frontEndDataOut->codeMeshes[0].triCount, 176, 0x8000);
+    // LP64: 0x8000 was the ILP32 sizeof(codeMeshes) (2048 x 16); LP64 FxCodeMeshData is 24.
+    Com_Memset(frontEndDataOut->codeMeshes, 176, sizeof(frontEndDataOut->codeMeshes));
     Com_Memset(frontEndDataOut->primDrawSurfsBuf, 176, 4 * frontEndDataOut->primDrawSurfPos);
     Com_Memset(&frontEndDataOut->fogSettings, 176, 20);
     frontEndDataOut->drawSurfCount = 0;
@@ -574,6 +692,39 @@ GfxViewParms *__cdecl R_AllocViewParms()
             frontEndDataOut->viewParmCount,
             28);
     return &frontEndDataOut->viewParms[frontEndDataOut->viewParmCount++];
+}
+
+// r_view2d_alpha_skip.h has the predicate and its reasoning; it duplicates
+// these bit-layout/ABI constants (rather than including r_state.h/d3d9.h) so
+// it stays a dependency-free header the host test can include directly.
+// Static-assert them equal here, where both the real macros (r_state.h,
+// d3d9.h, both pulled in via rb_backend.h above) and the header's local
+// copies are visible, so any future change to either can't drift silently.
+static_assert(r_view2d_alpha_skip::kBlendOpRgbMask == GFXS0_BLENDOP_RGB_MASK, "GFXS0_BLENDOP_RGB_MASK drifted");
+static_assert(r_view2d_alpha_skip::kBlendOpRgbShift == GFXS0_BLENDOP_RGB_SHIFT, "GFXS0_BLENDOP_RGB_SHIFT drifted");
+static_assert(r_view2d_alpha_skip::kBlendOpAlphaMask == GFXS0_BLENDOP_ALPHA_MASK, "GFXS0_BLENDOP_ALPHA_MASK drifted");
+static_assert(r_view2d_alpha_skip::kBlendOpAlphaShift == GFXS0_BLENDOP_ALPHA_SHIFT, "GFXS0_BLENDOP_ALPHA_SHIFT drifted");
+static_assert(r_view2d_alpha_skip::kSrcBlendRgbMask == GFXS0_SRCBLEND_RGB_MASK, "GFXS0_SRCBLEND_RGB_MASK drifted");
+static_assert(r_view2d_alpha_skip::kSrcBlendRgbShift == GFXS0_SRCBLEND_RGB_SHIFT, "GFXS0_SRCBLEND_RGB_SHIFT drifted");
+static_assert(r_view2d_alpha_skip::kDstBlendRgbMask == GFXS0_DSTBLEND_RGB_MASK, "GFXS0_DSTBLEND_RGB_MASK drifted");
+static_assert(r_view2d_alpha_skip::kDstBlendRgbShift == GFXS0_DSTBLEND_RGB_SHIFT, "GFXS0_DSTBLEND_RGB_SHIFT drifted");
+static_assert(r_view2d_alpha_skip::kSrcBlendAlphaMask == GFXS0_SRCBLEND_ALPHA_MASK, "GFXS0_SRCBLEND_ALPHA_MASK drifted");
+static_assert(r_view2d_alpha_skip::kSrcBlendAlphaShift == GFXS0_SRCBLEND_ALPHA_SHIFT, "GFXS0_SRCBLEND_ALPHA_SHIFT drifted");
+static_assert(r_view2d_alpha_skip::kDstBlendAlphaMask == GFXS0_DSTBLEND_ALPHA_MASK, "GFXS0_DSTBLEND_ALPHA_MASK drifted");
+static_assert(r_view2d_alpha_skip::kDstBlendAlphaShift == GFXS0_DSTBLEND_ALPHA_SHIFT, "GFXS0_DSTBLEND_ALPHA_SHIFT drifted");
+static_assert(r_view2d_alpha_skip::kBlendOpAdd == D3DBLENDOP_ADD, "D3DBLENDOP_ADD drifted");
+static_assert(r_view2d_alpha_skip::kBlendOne == D3DBLEND_ONE, "D3DBLEND_ONE drifted");
+static_assert(r_view2d_alpha_skip::kBlendSrcAlpha == D3DBLEND_SRCALPHA, "D3DBLEND_SRCALPHA drifted");
+static_assert(r_view2d_alpha_skip::kBlendInvSrcAlpha == D3DBLEND_INVSRCALPHA, "D3DBLEND_INVSRCALPHA drifted");
+
+bool __cdecl Material_2DZeroAlphaIsNoOp(const Material *material, MaterialTechniqueType techType)
+{
+    if (!material || !material->stateBitsTable)
+        return false;
+    const uint8_t entry = material->stateBitsEntry[techType];
+    if (entry == 0xFF)
+        return false;
+    return r_view2d_alpha_skip::StateBits0AlphaZeroIsNoOp(material->stateBitsTable[entry].loadBits[0]);
 }
 
 void __cdecl R_AddCmdDrawStretchPic(
@@ -621,7 +772,29 @@ void __cdecl R_AddCmdDrawStretchPic(
         actualMaterial = rgp.defaultMaterial;
     }
     iassert( !Material_UsesDepthBuffer( actualMaterial ) );
-    cmd = (GfxCmdStretchPic *)R_GetCommandBuffer(RC_FIRST_NONCRITICAL, 44);
+    if (w < 0.0f)
+    {
+        x += w;
+        w = -w;
+        float tmp = s0;
+        s0 = s1;
+        s1 = tmp;
+    }
+    if (h < 0.0f)
+    {
+        y += h;
+        h = -h;
+        float tmp = t0;
+        t0 = t1;
+        t1 = tmp;
+    }
+    GfxColor packedColor;
+    R_ConvertColorToBytes(color, &packedColor);
+    if (r_view2dAlphaSkip->current.enabled && packedColor.array[3] == 0
+        && Material_2DZeroAlphaIsNoOp(actualMaterial, TECHNIQUE_UNLIT))
+        return; // fully transparent and the material's blend leaves the target unchanged at alpha 0: nothing to draw
+
+    cmd = (GfxCmdStretchPic *)R_GetCommandBuffer(RC_FIRST_NONCRITICAL, sizeof(GfxCmdStretchPic));
     if (cmd)
     {
         cmd->material = actualMaterial;
@@ -633,13 +806,76 @@ void __cdecl R_AddCmdDrawStretchPic(
         cmd->t0 = t0;
         cmd->s1 = s1;
         cmd->t1 = t1;
-        R_ConvertColorToBytes(color, &cmd->color);
+        cmd->color = packedColor;
     }
 }
 
 bool __cdecl Material_HasAnyFogableTechnique(const Material *material)
 {
+    if (!material || !material->techniqueSet)
+        return false;
+    const MaterialTechniqueSet *techSet = Material_GetTechniqueSet(material);
+    if (!techSet)
+        return false;
+    // strstr alone: a name equal to "2d" contains "2d" (the strcmp it replaced was redundant).
+    if (techSet->name && strstr(techSet->name, "2d") != nullptr)
+        return false;
     return Material_GetTechnique(material, TECHNIQUE_LIT_BEGIN) || Material_GetTechnique(material, TECHNIQUE_EMISSIVE);
+}
+
+// the original r_material.h draw-time invariant is that a drawn
+// technique's pass shaders exist and were cooked for r_rendererInUse.  The
+// file-local iasserts around R_SetPixelShader/R_SetVertexShader compile out
+// in this RelWithDebInfo SP build (RELEASE_ASSERTS is undefined), so a shader
+// that was never created -- device creation failed, or a renderer variant was
+// nulled by Load_CreateMaterial*Shader -- would otherwise be drawn with no
+// shader object.  Keep the original pass-0 renderer check and extend it to
+// every pass of the technique, keeping MyAssertHandler fatal on Switch.
+// r_loadForRenderer disabled is the engine's supported dedicated-server path
+// (no D3D allocations at all) and is the only case that skips this check.
+static void Material_CheckDrawnTechnique(const Material *material, const MaterialTechniqueSet *techSet,
+                                         const MaterialTechnique *technique, MaterialTechniqueType techType)
+{
+    if (!technique || !r_loadForRenderer || !r_loadForRenderer->current.enabled)
+        return;
+    const int rendererInUse = r_rendererInUse ? r_rendererInUse->current.integer : -1;
+    for (uint32_t passIndex = 0; passIndex < technique->passCount; ++passIndex)
+    {
+        const MaterialPass *pass = &technique->passArray[passIndex];
+        if (MaterialPassShadersDrawable(pass, rendererInUse))
+            continue;
+        const MaterialPixelShader *ps = pass->pixelShader;
+        const MaterialVertexShader *vs = pass->vertexShader;
+        static int s_logged = 0;
+        if (s_logged < 16)
+        {
+            s_logged++;
+            Com_Printf(0, "KILLHOUSE_SHADER_DRAW_MISMATCH mat='%s' techSet='%s' techType=%d pass=%u "
+                          "ps=%p psProg=%p psLfr=%u vs=%p vsProg=%p vsLfr=%u r_rendererInUse=%d\n",
+                       material && material->info.name ? material->info.name : "null",
+                       techSet && techSet->name ? techSet->name : "null",
+                       techType, passIndex,
+                       (const void *)ps, ps ? (void *)ps->prog.ps : nullptr,
+                       ps ? ps->prog.loadDef.loadForRenderer : 0u,
+                       (const void *)vs, vs ? (void *)vs->prog.vs : nullptr,
+                       vs ? vs->prog.loadDef.loadForRenderer : 0u,
+                       rendererInUse);
+        }
+        MyAssertHandler(
+            "c:\\trees\\cod3\\src\\gfx_d3d\\r_material.h",
+            320,
+            0,
+            "%s\n\tps=%p psProg=%p psLfr=%u vs=%p vsProg=%p vsLfr=%u r_rendererInUse=%d",
+            "pass->pixelShader->prog.ps && pass->vertexShader->prog.vs"
+            " && pass->pixelShader->prog.loadDef.loadForRenderer == r_rendererInUse->current.integer"
+            " && pass->vertexShader->prog.loadDef.loadForRenderer == r_rendererInUse->current.integer",
+            (const void *)ps, ps ? (void *)ps->prog.ps : nullptr,
+            ps ? ps->prog.loadDef.loadForRenderer : 0u,
+            (const void *)vs, vs ? (void *)vs->prog.vs : nullptr,
+            vs ? vs->prog.loadDef.loadForRenderer : 0u,
+            rendererInUse);
+        return;
+    }
 }
 
 const MaterialTechnique *__cdecl Material_GetTechnique(const Material *material, MaterialTechniqueType techType)
@@ -648,34 +884,27 @@ const MaterialTechnique *__cdecl Material_GetTechnique(const Material *material,
     const MaterialTechniqueSet *techSet; // [esp+4h] [ebp-4h]
 
     techSet = Material_GetTechniqueSet(material);
-    iassert( techSet );
+    if (!techSet)
+        return nullptr;
     technique = techSet->techniques[techType];
-    if (technique
-        && technique->passArray[0].pixelShader->prog.loadDef.loadForRenderer != r_rendererInUse->current.integer)
-    {
-        MyAssertHandler(
-            "c:\\trees\\cod3\\src\\gfx_d3d\\r_material.h",
-            320,
-            0,
-            "technique->passArray[0].pixelShader->prog.loadDef.loadForRenderer == r_rendererInUse->current.integer\n\t%i, %i",
-            technique->passArray[0].pixelShader->prog.loadDef.loadForRenderer,
-            r_rendererInUse->current.integer);
-    }
+    Material_CheckDrawnTechnique(material, techSet, technique, techType);
     return technique;
 }
 
 MaterialTechniqueSet *__cdecl Material_GetTechniqueSet(const Material *material)
 {
     iassert( material );
+    if (!material)
+        return nullptr;
+    // a material with no technique set is a decoder tolerance
+    // (RetailWalkLiveLoadMaterial's nested-only null techniqueSet) that must
+    // fail loudly the moment the renderer selects it, not draw nothing.
     if (!material->techniqueSet)
-        MyAssertHandler(
-            "c:\\trees\\cod3\\src\\gfx_d3d\\r_material.h",
-            300,
-            0,
-            "%s\n\t(material->info.name) = %s",
-            "(material->techniqueSet)",
-            material->info.name);
-    return material->techniqueSet->remappedTechniqueSet;
+        Com_Error(ERR_DROP, "material '%s' has no technique set (unresolved nested techniqueSet selected by the renderer)",
+                  material->info.name ? material->info.name : "<unnamed>");
+    if (material->techniqueSet->remappedTechniqueSet)
+        return material->techniqueSet->remappedTechniqueSet;
+    return material->techniqueSet;
 }
 
 void __cdecl R_AddCmdDrawStretchPicFlipST(
@@ -723,7 +952,29 @@ void __cdecl R_AddCmdDrawStretchPicFlipST(
         actualMaterial = rgp.defaultMaterial;
     }
     iassert( !Material_UsesDepthBuffer( actualMaterial ) );
-    cmd = (GfxCmdStretchPic *)R_GetCommandBuffer(RC_STRETCH_PIC_FLIP_ST, 44);
+    if (w < 0.0f)
+    {
+        x += w;
+        w = -w;
+        float tmp = s0;
+        s0 = s1;
+        s1 = tmp;
+    }
+    if (h < 0.0f)
+    {
+        y += h;
+        h = -h;
+        float tmp = t0;
+        t0 = t1;
+        t1 = tmp;
+    }
+    GfxColor packedColor;
+    R_ConvertColorToBytes(color, &packedColor);
+    if (r_view2dAlphaSkip->current.enabled && packedColor.array[3] == 0
+        && Material_2DZeroAlphaIsNoOp(actualMaterial, TECHNIQUE_UNLIT))
+        return; // fully transparent and the material's blend leaves the target unchanged at alpha 0: nothing to draw
+
+    cmd = (GfxCmdStretchPic *)R_GetCommandBuffer(RC_STRETCH_PIC_FLIP_ST, sizeof(GfxCmdStretchPic));
     if (cmd)
     {
         cmd->material = actualMaterial;
@@ -735,7 +986,7 @@ void __cdecl R_AddCmdDrawStretchPicFlipST(
         cmd->t0 = t0;
         cmd->s1 = s1;
         cmd->t1 = t1;
-        R_ConvertColorToBytes(color, (uint32_t *)&cmd->color);
+        cmd->color = packedColor;
     }
 }
 
@@ -755,7 +1006,7 @@ void __cdecl R_AddCmdDrawStretchPicRotateXY(
     Material *defaultMaterial; // [esp+4h] [ebp-8h]
     GfxCmdStretchPicRotateXY *cmd; // [esp+8h] [ebp-4h]
 
-    cmd = (GfxCmdStretchPicRotateXY *)R_GetCommandBuffer(RC_STRETCH_PIC_ROTATE_XY, 48);
+    cmd = (GfxCmdStretchPicRotateXY *)R_GetCommandBuffer(RC_STRETCH_PIC_ROTATE_XY, sizeof(GfxCmdStretchPicRotateXY));
     if (cmd)
     {
         if (material)
@@ -793,7 +1044,7 @@ void __cdecl R_AddCmdDrawStretchPicRotateST(
     Material *defaultMaterial; // [esp+4h] [ebp-8h]
     GfxCmdStretchPicRotateST *cmd; // [esp+8h] [ebp-4h]
 
-    cmd = (GfxCmdStretchPicRotateST *)R_GetCommandBuffer(RC_STRETCH_PIC_ROTATE_ST, 52);
+    cmd = (GfxCmdStretchPicRotateST *)R_GetCommandBuffer(RC_STRETCH_PIC_ROTATE_ST, sizeof(GfxCmdStretchPicRotateST));
     if (cmd)
     {
         if (material)
@@ -854,7 +1105,7 @@ GfxCmdDrawText2D *__cdecl AddBaseDrawTextCmd(
     if (!*text && cursorPos < 0)
         return 0;
     v13 = strlen(text);
-    cmd = (GfxCmdDrawText2D *)R_GetCommandBuffer(RC_DRAW_TEXT_2D, (v13 + 84) & 0xFFFFFFFC);
+    cmd = (GfxCmdDrawText2D *)R_GetCommandBuffer(RC_DRAW_TEXT_2D, (offsetof(GfxCmdDrawText2D, text) + v13 + 1 + 3) & ~3u);
     if (!cmd)
         return 0;
     cmd->x = x;
@@ -1064,7 +1315,7 @@ GfxCmdDrawText2D *__cdecl AddBaseDrawConsoleTextCmd(
     iassert( textPool );
     if (!charCount)
         return 0;
-    cmd = (GfxCmdDrawText2D *)R_GetCommandBuffer(RC_DRAW_TEXT_2D, (charCount + 84) & 0xFFFFFFFC);
+    cmd = (GfxCmdDrawText2D *)R_GetCommandBuffer(RC_DRAW_TEXT_2D, (offsetof(GfxCmdDrawText2D, text) + charCount + 1 + 3) & ~3u);
     if (!cmd)
         return 0;
     cmd->x = x;
@@ -1198,7 +1449,7 @@ void __cdecl R_AddCmdDrawQuadPic(const float (*verts)[2], const float *color, Ma
     int cornerIndex; // [esp+Ch] [ebp-8h]
     GfxCmdDrawQuadPic *cmd; // [esp+10h] [ebp-4h]
 
-    cmd = (GfxCmdDrawQuadPic *)R_GetCommandBuffer(RC_DRAW_QUAD_PIC, 44);
+    cmd = (GfxCmdDrawQuadPic *)R_GetCommandBuffer(RC_DRAW_QUAD_PIC, sizeof(GfxCmdDrawQuadPic));
     if (cmd)
     {
         if (material)
@@ -1238,6 +1489,7 @@ void __cdecl R_BeginFrame()
             R_SortWorldSurfaces();
         }
         CL_FlushDebugClientData();
+        R_DynResBeginFrame();
         v1 = r_skinCache->current.enabled && IsFastFileLoad();
         gfxBuf.skinCache = v1;
         v0 = v1 && r_fastSkin->current.enabled;
@@ -1490,7 +1742,7 @@ void __cdecl R_AddCmdClearScreen(int whichToClear, const float *color, float dep
             whichToClear);
     iassert( color );
     iassert( (depth >= 0.0f && depth <= 1.0f) );
-    cmd = (GfxCmdClearScreen *)R_GetCommandBuffer(RC_CLEAR_SCREEN, 28);
+    cmd = (GfxCmdClearScreen *)R_GetCommandBuffer(RC_CLEAR_SCREEN, sizeof(GfxCmdClearScreen));
     iassert( cmd );
     cmd->whichToClear = whichToClear;
     iassert( cmd->whichToClear == whichToClear );
@@ -1515,7 +1767,7 @@ void __cdecl R_AddCmdSaveScreen(uint32_t screenTimerId)
             screenTimerId,
             0,
             3);
-    cmd = (GfxCmdSaveScreen *)R_GetCommandBuffer(RC_SAVE_SCREEN, 8);
+    cmd = (GfxCmdSaveScreen *)R_GetCommandBuffer(RC_SAVE_SCREEN, sizeof(GfxCmdSaveScreen));
     iassert( cmd );
     cmd->screenTimerId = screenTimerId;
 }
@@ -1538,7 +1790,7 @@ void __cdecl R_AddCmdSaveScreenSection(
             screenTimerId,
             0,
             3);
-    cmd = (GfxCmdSaveScreenSection *)R_GetCommandBuffer(RC_SAVE_SCREEN_SECTION, 24);
+    cmd = (GfxCmdSaveScreenSection *)R_GetCommandBuffer(RC_SAVE_SCREEN_SECTION, sizeof(GfxCmdSaveScreenSection));
     iassert( cmd );
     cmd->s0 = viewX;
     cmd->t0 = viewY;
@@ -1568,7 +1820,7 @@ void __cdecl R_AddCmdBlendSavedScreenShockBlurred(
             3);
     if (fadeMsec > 0)
     {
-        cmd = (GfxCmdBlendSavedScreenBlurred *)R_GetCommandBuffer(RC_BLEND_SAVED_SCREEN_BLURRED, 28);
+        cmd = (GfxCmdBlendSavedScreenBlurred *)R_GetCommandBuffer(RC_BLEND_SAVED_SCREEN_BLURRED, sizeof(GfxCmdBlendSavedScreenBlurred));
         if (cmd)
         {
             cmd->fadeMsec = fadeMsec;
@@ -1591,7 +1843,7 @@ void __cdecl R_AddCmdBlendSavedScreenShockFlashed(
 {
     GfxCmdBlendSavedScreenFlashed *cmd; // [esp+0h] [ebp-4h]
 
-    cmd = (GfxCmdBlendSavedScreenFlashed *)R_GetCommandBuffer(RC_BLEND_SAVED_SCREEN_FLASHED, 28);
+    cmd = (GfxCmdBlendSavedScreenFlashed *)R_GetCommandBuffer(RC_BLEND_SAVED_SCREEN_FLASHED, sizeof(GfxCmdBlendSavedScreenFlashed));
     if (cmd)
     {
         cmd->intensityWhiteout = intensityWhiteout;
@@ -1605,7 +1857,7 @@ void __cdecl R_AddCmdBlendSavedScreenShockFlashed(
 
 void __cdecl R_AddCmdDrawProfile()
 {
-    R_GetCommandBuffer(RC_DRAW_PROFILE, 4);
+    R_GetCommandBuffer(RC_DRAW_PROFILE, sizeof(GfxCmdHeader));
 }
 
 void __cdecl R_AddCmdProjectionSet2D()
@@ -1622,7 +1874,7 @@ void __cdecl R_AddCmdProjectionSet(GfxProjectionTypes projection)
 {
     GfxCmdProjectionSet *cmd; // [esp+0h] [ebp-4h]
 
-    cmd = (GfxCmdProjectionSet *)R_GetCommandBuffer(RC_PROJECTION_SET, 8);
+    cmd = (GfxCmdProjectionSet *)R_GetCommandBuffer(RC_PROJECTION_SET, sizeof(GfxCmdProjectionSet));
     if (cmd)
         cmd->projection = projection;
 }
@@ -1758,21 +2010,17 @@ void __cdecl R_InitTempSkinBuf()
 
 void R_AddCmdSetViewportValues(int x, int y, int width, int height)
 {
-    GfxCmdHeader *cmd; // r30
-
     iassert(width > 0);
     iassert(height > 0);
     
-    cmd = R_GetCommandBuffer(RC_SET_VIEWPORT, 20);
-
-    iassert(cmd);
-
-    _DWORD *writer = (_DWORD *)cmd; // hack
-
-    writer[1] = x;
-    writer[2] = y;
-    writer[3] = width;
-    writer[4] = height;
+    GfxCmdSetViewport *cmd = (GfxCmdSetViewport *)R_GetCommandBuffer(RC_SET_VIEWPORT, sizeof(GfxCmdSetViewport));
+    if (cmd)
+    {
+        cmd->viewport.x = x;
+        cmd->viewport.y = y;
+        cmd->viewport.width = width;
+        cmd->viewport.height = height;
+    }
 }
 
 void __cdecl R_BeginDebugFrame()
@@ -1856,7 +2104,6 @@ void __cdecl R_EndDebugFrame()
 //    dimensions(1) = 8-byte prefix, then verts. A line command of N line-segments
 //    is 8 + 0x20*N bytes (0x20 = two GfxPointVertex per segment).
 // ─────────────────────────────────────────────────────────────────────────────
-#include "rb_backend.h"   // GfxCmdDrawLines
 #include <string.h>       // memcpy
 
 // IDB R_AddMultipleRendercommands @ 0x4fb0d0 — extend the last command in place:
@@ -2194,6 +2441,7 @@ void __cdecl R_AddBeginViewCmd(const GfxSceneDef *sceneDef, const GfxViewParms *
     cmd->sceneDef = *sceneDef;
     cmd->viewParms = viewParms;
 }
+#endif
 
 // Emit RC_SET_MATERIAL_COLOR → RB_SetMaterialColorCmd sets CONST_SRC_CODE_MATERIAL_COLOR.
 // The editor draws the grid via a bare RC_DRAW_LINES outside a full scene render, so the
@@ -2283,6 +2531,7 @@ void __cdecl R_AddCmdDrawFullScreenColoredQuad(
 }
 #endif
 
+#ifdef KISAK_RADIANT
 // IDB R_AddCmdDrawTextAtPosition @ 0x4fbe20 — emit an RC_DRAW_TEXT_3D command for a
 // string positioned in world space. `origin` is the world-space anchor; `xPixelStep`
 // and `yPixelStep` are the per-text-pixel world-space basis vectors (so the glyphs are
@@ -2339,7 +2588,23 @@ void __cdecl R_AddCmdDraw2DImage(
     const float *color, Material *material)
 {
     Material *actualMaterial = material ? (Material *)Material_FromHandle(material) : rgp.defaultMaterial;
-    GfxCmdStretchPic *cmd = (GfxCmdStretchPic *)R_GetCommandBuffer(RC_STRETCH_PIC, 44);
+    if (w < 0.0f)
+    {
+        x += w;
+        w = -w;
+        float tmp = s0;
+        s0 = s1;
+        s1 = tmp;
+    }
+    if (h < 0.0f)
+    {
+        y += h;
+        h = -h;
+        float tmp = t0;
+        t0 = t1;
+        t1 = tmp;
+    }
+    GfxCmdStretchPic *cmd = (GfxCmdStretchPic *)R_GetCommandBuffer(RC_STRETCH_PIC, sizeof(GfxCmdStretchPic));
     if ( cmd )
     {
         cmd->material = actualMaterial;

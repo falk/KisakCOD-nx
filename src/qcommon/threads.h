@@ -1,7 +1,35 @@
 #pragma once
 
+#include <cstdint>
+
+#ifdef __SWITCH__
+using DWORD = uint32_t;
+using HANDLE = void *;
+#ifndef THREAD_CONTEXT_ENUM_DEFINED
+#define THREAD_CONTEXT_ENUM_DEFINED
+enum ThreadContext_t : __int32
+{
+    THREAD_CONTEXT_MAIN = 0,
+    THREAD_CONTEXT_BACKEND = 1,
+    THREAD_CONTEXT_WORKER0 = 2,
+    THREAD_CONTEXT_WORKER1 = 3,
+    THREAD_CONTEXT_WORKER2 = 4,
+    THREAD_CONTEXT_SERVER = 5,
+    THREAD_CONTEXT_TRACE_COUNT = 6,
+    THREAD_CONTEXT_TRACE_LAST = 5,
+    THREAD_CONTEXT_CINEMATIC = 6,
+    THREAD_CONTEXT_TITLE_SERVER = 7,
+    THREAD_CONTEXT_DATABASE = 8,
+    THREAD_CONTEXT_STREAM = 9,
+    THREAD_CONTEXT_SNDSTREAMPACKETCALLBACK = 10,
+    THREAD_CONTEXT_SERVER_DEMO = 11,
+    THREAD_CONTEXT_COUNT = 12,
+};
+#endif
+#else
 #include <Windows.h> // literally just for some of the extern types at the bottom
 #include <gfx_d3d/rb_backend.h> // THREAD_CONTEXT_COUNT
+#endif
 
 enum ThreadOwner : __int32
 {                                       // ...

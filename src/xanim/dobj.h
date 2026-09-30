@@ -135,7 +135,7 @@ int __cdecl DObjGetBoneIndex(const DObj_s *obj, uint32_t name, unsigned __int8 *
 int __cdecl DObjGetModelBoneIndex(const DObj_s *obj, const char *modelName, uint32_t name, unsigned __int8 *index);
 void __cdecl DObjGetBasePoseMatrix(const DObj_s *obj, unsigned __int8 boneIndex, DObjAnimMat *outMat);
 void __cdecl DObjSetHidePartBits(DObj_s *obj, const uint32_t *partBits);
-int DObjGetNumSurfaces(const DObj_s *obj, char *lods);
+int DObjGetNumSurfaces(const DObj_s *obj, const int8_t *lods);
 void DObjClone(const DObj_s *from, DObj_s *obj);
 
 

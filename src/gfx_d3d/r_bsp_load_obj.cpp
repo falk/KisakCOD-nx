@@ -32,6 +32,49 @@
 
 r_globals_load_t rgl;
 
+// LP64 allocation strides for this loader's native arrays.
+//
+// The decompiled loader sized several `Hunk_Alloc` calls with the literal
+// *serialized* (ILP32) record size and then indexed the result as a native
+// array (`array[i]`, `++ptr`). Every type below carries at least one pointer
+// member, so its native LP64 record is wider than the 32-bit reference one
+// and those allocations under-allocated -- a heap overflow, not merely wrong
+// navigation. Each site now sizes with `sizeof(T)`; the asserts below pin the
+// two sizes so a future layout change forces this to be re-examined rather
+// than silently regressing. The serialized sizes stay documented in the
+// comment because the disk lump strides (`Com_GetBspLump`'s element size, the
+// `in += 36` style walks) are legitimately the *wire* numbers and must not be
+// "fixed" to match.
+//
+//   type                native (LP64)   serialized (ILP32 reference)
+//   GfxLightRegion            16                 8
+//   GfxLightRegionHull        88                80
+//   GfxShadowGeometry         24                12
+//   MaterialMemory            16                 8
+//   GfxSurface                56                48
+//   GfxTexture                 8                 4
+//   GfxCell                   88                56
+//   GfxPortal                 96                68
+#if UINTPTR_MAX == UINT32_MAX // serialized sizes hold on the 32-bit reference ABI only
+static_assert(sizeof(GfxLightRegion) == 8);
+static_assert(sizeof(GfxLightRegionHull) == 80);
+static_assert(sizeof(GfxShadowGeometry) == 12);
+static_assert(sizeof(MaterialMemory) == 8);
+static_assert(sizeof(GfxSurface) == 48);
+static_assert(sizeof(GfxTexture) == 4);
+static_assert(sizeof(GfxCell) == 56);
+static_assert(sizeof(GfxPortal) == 68);
+#else
+static_assert(sizeof(GfxLightRegion) == 16);
+static_assert(sizeof(GfxLightRegionHull) == 88);
+static_assert(sizeof(GfxShadowGeometry) == 24);
+static_assert(sizeof(MaterialMemory) == 16);
+static_assert(sizeof(GfxSurface) == 56);
+static_assert(sizeof(GfxTexture) == 8);
+static_assert(sizeof(GfxCell) == 88);
+static_assert(sizeof(GfxPortal) == 96);
+#endif
+
 void __cdecl R_InterpretSunLightParseParamsIntoLights(SunLightParseParams *sunParse, GfxLight *sunLight)
 {
     float scale; // [esp+8h] [ebp-20h]
@@ -320,7 +363,7 @@ void R_LoadSunSettings()
 
     text = Com_GetBspLump(LUMP_ENTITIES, 1u, &size);
     R_ParseSunLight(&s_world.sunParse, (char*)text);
-    s_world.sunLight = (GfxLight*)Hunk_Alloc(0x40u, "R_LoadSunSettings", 20);
+    s_world.sunLight = (GfxLight*)Hunk_Alloc(sizeof(GfxLight), "R_LoadSunSettings", 20); // LP64: was ILP32 0x40
     R_InterpretSunLightParseParamsIntoLights(&s_world.sunParse, s_world.sunLight);
 }
 
@@ -364,14 +407,16 @@ void R_LoadLightRegions()
     const DiskLightRegion *diskRegions; // [esp+34h] [ebp-8h]
     uint32_t regionIter; // [esp+38h] [ebp-4h]
 
-    s_world.lightRegion = (GfxLightRegion*)Hunk_Alloc(8 * s_world.primaryLightCount, "R_LoadLightRegions", 20);
+    s_world.lightRegion = (GfxLightRegion*)Hunk_Alloc(
+        sizeof(GfxLightRegion) * s_world.primaryLightCount, "R_LoadLightRegions", 20);
     diskRegions = (DiskLightRegion*)Com_GetBspLump(LUMP_LIGHTREGIONS, 1u, &regionCount);
     s_world.lightGrid.hasLightRegions = diskRegions != 0;
     if (diskRegions)
     {
         diskHulls = Com_GetBspLump(LUMP_LIGHTREGION_HULLS, 0x4Cu, &hullCount);
         diskAxes = (unsigned char*)Com_GetBspLump(LUMP_LIGHTREGION_AXES, 0x14u, &axisCount);
-        hulls = (GfxLightRegionHull*)Hunk_Alloc(80 * hullCount, "R_LoadLightRegionHulls", 20);
+        hulls = (GfxLightRegionHull*)Hunk_Alloc(
+            sizeof(GfxLightRegionHull) * hullCount, "R_LoadLightRegionHulls", 20);
         axes = Hunk_Alloc(20 * axisCount, "R_LoadLightRegionAxes", 20);
         if (regionCount != s_world.primaryLightCount)
             MyAssertHandler(
@@ -786,13 +831,13 @@ void __cdecl R_CopyLightDefAttenuationImage(GfxLightDef *def, _DWORD *anonymousC
             lerp = 1;
             ++srcPixel;
         } while (srcPixel != &rawImage.pixels[rawImage.width - 1]);
-        if ((int)((int)&dstPixel[-(int)*anonymousConfig] >> 2) != ((int)(anonymousConfig[1] * (def->lmapLookupStart + rawImage.width + 1) - endCount)))
+        if ((int)((int)(intptr_t)&dstPixel[-(int)*anonymousConfig] >> 2) != ((int)(anonymousConfig[1] * (def->lmapLookupStart + rawImage.width + 1) - endCount)))
             MyAssertHandler(
                 ".\\r_light_load_obj.cpp",
                 193,
                 1,
                 "(dstPixel - cfg->dest) / 4u == (def->lmapLookupStart + rawImage.width + 1) * cfg->zoom - endCount\n\t%i, %i",
-                (int)&dstPixel[-(int)*anonymousConfig] >> 2,
+                (int)(intptr_t)&dstPixel[-(int)*anonymousConfig] >> 2,
                 anonymousConfig[1] * (def->lmapLookupStart + rawImage.width + 1) - endCount);
         for (iter = 0; iter < endCount; ++iter)
         {
@@ -860,7 +905,7 @@ void __cdecl R_LoadLightmaps(GfxBspLoad *load)
                     0,
                     "%s",
                     "newLmapIndex == 0 || groupInfo[newLmapIndex].wideCount <= groupInfo[newLmapIndex - 1].wideCount");
-            if (newLmapIndex && groupInfo[newLmapIndex].highCount > (int)(&buf_p)[2 * newLmapIndex])
+            if (newLmapIndex && groupInfo[newLmapIndex].highCount > (int)(intptr_t)(&buf_p)[2 * newLmapIndex])
                 MyAssertHandler(
                     ".\\r_bsp_load_obj.cpp",
                     723,
@@ -926,8 +971,10 @@ void __cdecl R_LoadLightmaps(GfxBspLoad *load)
                 "%s\n\t(s_world.lightmapCount) = %i",
                 "(s_world.lightmapCount <= ((93 * 1024 * 1024) / ((1024 * 1024 * 1 * 1) + (512 * 512 * 4 * 2))))",
                 s_world.lightmapCount);
-        s_world.lightmapPrimaryTextures = (GfxTexture*)Hunk_Alloc(4 * s_world.lightmapCount, "R_LoadLightmaps", 20);
-        s_world.lightmapSecondaryTextures = (GfxTexture*)Hunk_Alloc(4 * s_world.lightmapCount, "R_LoadLightmaps", 20);
+        s_world.lightmapPrimaryTextures = (GfxTexture*)Hunk_Alloc(
+            sizeof(GfxTexture) * s_world.lightmapCount, "R_LoadLightmaps", 20);
+        s_world.lightmapSecondaryTextures = (GfxTexture*)Hunk_Alloc(
+            sizeof(GfxTexture) * s_world.lightmapCount, "R_LoadLightmaps", 20);
     }
     else
     {
@@ -940,7 +987,9 @@ GfxShadowGeometry *R_AllocShadowGeometryHeaderMemory()
     GfxShadowGeometry *result; // eax
 
     iassert( s_world.shadowGeom == NULL );
-    result = (GfxShadowGeometry*)Hunk_Alloc(12 * s_world.primaryLightCount, "R_AllocShadowGeometryHeaderMemory", 20);
+    result = (GfxShadowGeometry*)Hunk_Alloc(
+        sizeof(GfxShadowGeometry) * s_world.primaryLightCount,
+        "R_AllocShadowGeometryHeaderMemory", 20);
     s_world.shadowGeom = result;
     return result;
 }
@@ -1154,7 +1203,6 @@ MaterialUsage *__cdecl R_GetMaterialUsageData(Material *material)
 
 void __cdecl R_MaterialUsage(Material *material, uint32_t firstVertex, int vertexCount, int surfPlusIndexSize)
 {
-    uint32_t *v4; // eax
     VertUsage *vertUsage; // [esp+0h] [ebp-8h]
     MaterialUsage *materialUsage; // [esp+4h] [ebp-4h]
 
@@ -1167,10 +1215,10 @@ void __cdecl R_MaterialUsage(Material *material, uint32_t firstVertex, int verte
             if (firstVertex == vertUsage->index)
                 return;
         }
-        v4 = (uint32_t *)Z_Malloc(8, "R_MaterialUsage", 0);
-        *v4 = firstVertex;
-        v4[1] = (uint32_t)materialUsage->verts;
-        materialUsage->verts = (VertUsage*)v4;
+        vertUsage = (VertUsage *)Z_Malloc(sizeof(VertUsage), "R_MaterialUsage", 0);
+        vertUsage->index = firstVertex;
+        vertUsage->next = materialUsage->verts;
+        materialUsage->verts = vertUsage;
         materialUsage->memory += 44 * vertexCount;
     }
 }
@@ -1294,7 +1342,8 @@ void __cdecl R_CreateMaterialList()
     }
     if (s_world.materialMemoryCount)
     {
-        s_world.materialMemory = (MaterialMemory*)Hunk_Alloc(8 * s_world.materialMemoryCount, "R_CreateMaterialList", 20);
+        s_world.materialMemory = (MaterialMemory*)Hunk_Alloc(
+            sizeof(MaterialMemory) * s_world.materialMemoryCount, "R_CreateMaterialList", 20);
         index = 0;
         for (hashIndexa = 0; hashIndexa < 0x800u; ++hashIndexa)
         {
@@ -1407,7 +1456,8 @@ void __cdecl R_LoadSurfaces(GfxBspLoad *load)
     indices = (const unsigned short*)Com_GetBspLump(lumpType, 2u, &indexCount);
     iassert( (surfCount <= 65536) );
     s_world.surfaceCount = surfCount;
-    s_world.dpvs.surfaces = (GfxSurface*)Hunk_Alloc(48 * surfCount, "R_LoadSurfaces", 20);
+    s_world.dpvs.surfaces = (GfxSurface*)Hunk_Alloc(
+        sizeof(GfxSurface) * surfCount, "R_LoadSurfaces", 20);
     s_world.indexCount = 0;
     for (surfIndex = 0; surfIndex < surfCount; ++surfIndex)
     {
@@ -1665,6 +1715,24 @@ void __cdecl R_LoadAabbTrees(TrisType trisType)
 
     lumpType = trisType != TRIS_TYPE_LAYERED ? LUMP_UNLAYERED_AABBTREES : LUMP_AABBTREES;
     in = (const DiskGfxAabbTree *)Com_GetBspLump(lumpType, 0xCu, &aabbTreeCount);
+    // DELIBERATELY NOT restrided to sizeof(GfxAabbTree) -- see the LP64 note
+    // at the top of this file for the class of fix applied to the other
+    // arrays here. GfxAabbTree is excluded because this file's own
+    // `childrenOffset` handling is already self-contradictory, independent of
+    // LP64: R_SortGfxAabbTree writes a BYTE delta (line ~3267,
+    // `Hunk_AllocAlign(...) - (uint8_t *)tree`) but reads it back as an
+    // ELEMENT delta in the same function (`tree + tree->childrenOffset`), and
+    // R_FinishLoadingAabbTrees_r / R_AabbTreeMove_r are element-based while
+    // R_AddStaticModelToAabbTree_r is byte-based (and additionally hardcodes
+    // the ILP32 field offset 40 for childrenOffset, which is 48 under LP64).
+    // The runtime consumers (R_AddAabbTreeSurfacesInFrustum_r,
+    // r_dpvs_static.cpp:61, four sites in r_marks.cpp) are byte-based, which
+    // is also the semantic the live retail decoder now emits
+    // (db_retail_decode_world.cpp restrides the wire delta by native
+    // sizeof(GfxAabbTree)). Correcting this loader therefore needs a
+    // semantics decision plus a coordinated rewrite of five functions of dead
+    // code, not a stride substitution -- changing only the allocation would
+    // leave it silently inconsistent instead of consistently wrong.
     out = (GfxAabbTree *)Hunk_Alloc(44 * aabbTreeCount, "R_LoadAabbTrees", 22);
     rgl.aabbTrees = out;
     rgl.aabbTreeCount = aabbTreeCount;
@@ -1725,7 +1793,7 @@ void __cdecl R_LoadCells(uint32_t bspVersion, TrisType trisType)
     {
         in = Com_GetBspLump(LUMP_CELLS, 0x34u, &cellCount);
     }
-    out = (GfxCell *)Hunk_Alloc(56 * cellCount, "R_LoadCells", 22);
+    out = (GfxCell *)Hunk_Alloc(sizeof(GfxCell) * cellCount, "R_LoadCells", 22);
     s_world.cells = out;
     s_world.dpvsPlanes.cellCount = cellCount;
     s_world.cellBitsCount = 16 * ((cellCount + 127) >> 7);
@@ -1793,7 +1861,12 @@ uint32_t R_LoadPortals()
     uint32_t portalCount; // [esp+28h] [ebp-4h] BYREF
 
     in = Com_GetBspLump(LUMP_PORTALS, 0x10u, &portalCount);
-    out = (GfxPortal *)Hunk_Alloc(68 * portalCount, "R_LoadPortals", 22);
+    // NB: the `68 * portalIndex` stashed into cell->portals by R_LoadCells and
+    // recovered as `/ 68` at the bottom of this function is NOT a stride --
+    // it is an index scaled by an arbitrary constant that cancels between the
+    // two sites. Both must stay 68 (or change together); only the allocation
+    // below is a real record stride.
+    out = (GfxPortal *)Hunk_Alloc(sizeof(GfxPortal) * portalCount, "R_LoadPortals", 22);
     iassert( s_world.cells );
     iassert( s_world.dpvsPlanes.planes );
     for (portalIndex = 0; ; ++portalIndex)
@@ -1828,7 +1901,7 @@ uint32_t R_LoadPortals()
     for (cellIndex = 0; cellIndex < s_world.dpvsPlanes.cellCount; ++cellIndex)
     {
         if (s_world.cells[cellIndex].portalCount)
-            v1 = &out[(int)s_world.cells[cellIndex].portals / 68];
+            v1 = &out[(int)(intptr_t)s_world.cells[cellIndex].portals / 68];
         else
             v1 = 0;
         s_world.cells[cellIndex].portals = v1;
@@ -2126,7 +2199,7 @@ uint32_t R_SortSurfaces()
         result = 48 * surfIndexb;
         if (!s_world.dpvs.surfaces[surfIndexb].material->techniqueSet)
             break;
-        result = (uint)Material_GetTechnique(s_world.dpvs.surfaces[surfIndexb].material, TECHNIQUE_LIT_BEGIN);
+        result = (uint)(intptr_t)Material_GetTechnique(s_world.dpvs.surfaces[surfIndexb].material, TECHNIQUE_LIT_BEGIN);
         if (!result)
             break;
         result = s_world.dpvs.surfaces[surfIndexb].material->info.sortKey;
@@ -2143,10 +2216,10 @@ uint32_t R_SortSurfaces()
     s_world.dpvs.emissiveSurfsBegin = surfIndexb;
     while (surfIndexb < surfaceCounta)
     {
-        result = (uint)s_world.dpvs.surfaces;
+        result = (uint)(intptr_t)s_world.dpvs.surfaces;
         if (!s_world.dpvs.surfaces[surfIndexb].material->techniqueSet)
             break;
-        result = (uint)Material_GetTechnique(s_world.dpvs.surfaces[surfIndexb].material, TECHNIQUE_EMISSIVE);
+        result = (uint)(intptr_t)Material_GetTechnique(s_world.dpvs.surfaces[surfIndexb].material, TECHNIQUE_EMISSIVE);
         if (!result)
             break;
         result = ++surfIndexb;
@@ -2755,6 +2828,14 @@ void __cdecl R_LoadEntities(uint32_t bspVersion)
         if (!I_stricmp(spawnVars[0][1], "misc_model"))
             ++smodelCount;
     }
+    // DELIBERATELY NOT restrided (GfxStaticModelDrawInst native 80 vs
+    // serialized 76; GfxStaticModelCombinedInst native 112 vs 104 at
+    // R_PostLoadEntities). Correcting the allocations alone would leave
+    // R_PostLoadEntities' forward copy `qmemcpy(&combined[i], &drawInsts[i],
+    // 0x4Cu)` still transferring 76 of the 80 native bytes -- and that same
+    // function already writes the pair back with sizeof(), so the literal and
+    // the sizeof form are mixed for one struct across one function. Static
+    // models have their own decode/activation work; this belongs there, not in an allocation-stride pass.
     s_world.dpvs.smodelDrawInsts = (GfxStaticModelDrawInst*)Hunk_Alloc(76 * smodelCount, "R_LoadEntities", 21);
     s_world.dpvs.smodelInsts = (GfxStaticModelInst*)Hunk_Alloc(28 * smodelCount, "R_LoadEntities", 21);
     s_world.dpvs.smodelCount = 0;
@@ -2917,6 +2998,7 @@ void __cdecl R_AddStaticModelToAabbTree_r(GfxWorld *world, GfxAabbTree *tree, in
         {
             if (childIndexa >= tree->childCount)
             {
+                // GfxAabbTree stride left as-is on purpose; see R_LoadAabbTrees.
                 newChildren = Hunk_AllocAlign(44 * (tree->childCount + 1), 4, "R_AddStaticModelToAabbTree_r", 21);
                 children = (uint8_t *)tree + tree->childrenOffset;
                 memcpy(newChildren, children, 44 * tree->childCount);
@@ -3231,6 +3313,7 @@ void __cdecl R_SortGfxAabbTree(GfxWorld *world, GfxAabbTree *tree)
                     ++count;
                 if (smodelIndexCount)
                     ++count;
+                // GfxAabbTree stride left as-is on purpose; see R_LoadAabbTrees.
                 tree->childrenOffset = Hunk_AllocAlign(44 * count, 4, "R_SortGfxAabbTree", 21) - (unsigned char*)tree;
                 if (tree->surfaceCount)
                 {
@@ -3321,6 +3404,7 @@ void __cdecl R_FixupGfxAabbTrees(GfxCell *cell)
     tree = cell->aabbTree;
     iassert( tree );
     cell->aabbTreeCount = R_AabbTreeChildrenCount_r(tree);
+    // GfxAabbTree stride left as-is on purpose; see R_LoadAabbTrees.
     newTree = (GfxAabbTree*)Hunk_AllocAlign(44 * cell->aabbTreeCount, 4, "R_FixupGfxAabbTrees", 21);
     if (R_AabbTreeMove_r(tree, newTree, newTree + 1) - newTree != cell->aabbTreeCount)
         MyAssertHandler(".\\r_bsp_load_obj.cpp", 3383, 0, "%s", "allocChildren - newTree == cell->aabbTreeCount");
@@ -3339,6 +3423,7 @@ int R_PostLoadEntities()
     uint32_t smodelIndexb; // [esp+520h] [ebp-4h]
 
     iassert( rgl.staticModelReflectionProbesLoaded );
+    // Stride left as-is on purpose; see R_LoadEntities.
     smodelCombinedInsts = (GfxStaticModelCombinedInst*)Z_Malloc(104 * s_world.dpvs.smodelCount, "R_PostLoadEntities", 21);
     for (smodelIndex = 0; smodelIndex < s_world.dpvs.smodelCount; ++smodelIndex)
     {
@@ -3481,7 +3566,7 @@ void __cdecl R_LoadSun(const char *name, sunflare_t *sun)
 
     iassert( name );
     iassert( sun );
-    Com_Memset(sun, 0, 96);
+    Com_Memset(sun, 0, sizeof(*sun)); // LP64: not the retail 96
     firstCharToCopy = name;
     for (nameIter = name; *nameIter; ++nameIter)
     {
@@ -3778,7 +3863,7 @@ uint32_t __cdecl R_OptimalSModelResourceStats(GfxWorld *world, GfxSModelSurfStat
     iassert( world );
     if (!world->dpvs.smodelCount)
         return 0;
-    drawInstArray = (const GfxStaticModelDrawInst **)Hunk_AllocateTempMemory(4 * world->dpvs.smodelCount, "R_AssignSModelCacheResources");
+    drawInstArray = (const GfxStaticModelDrawInst **)Hunk_AllocateTempMemory(sizeof(drawInstArray[0]) * world->dpvs.smodelCount, "R_AssignSModelCacheResources"); // LP64: pointer elements
     for (smodelIter = 0; smodelIter != world->dpvs.smodelCount; ++smodelIter)
         drawInstArray[smodelIter] = &world->dpvs.smodelDrawInsts[smodelIter];
     //std::_Sort<int *, int, bool(__cdecl *)(int, int)>(

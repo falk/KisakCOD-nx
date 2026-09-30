@@ -215,6 +215,18 @@ bool __cdecl Jump_Check(pmove_t *pm, pml_t *pml)
     ps = pm->ps;
     iassert(ps);
 
+#ifdef __SWITCH__
+    {
+        // JUMP_CHECK diag (user report: A does not jump / crashes): name the
+        // gate that rejects a usercmd carrying BUTTON_JUMP.
+        extern const dvar_t *com_diagMarkers;
+        if ((pm->cmd.buttons & 0x400) != 0 && com_diagMarkers && com_diagMarkers->current.enabled)
+            Com_Printf(0, "JUMP_CHECK flags=0x%x dt=%d pm_type=%d stance=%d oldbuttons=0x%x buttons=0x%x\n",
+                       ps->pm_flags, pm->cmd.serverTime - ps->jumpTime, ps->pm_type,
+                       PM_GetEffectiveStance(ps), pm->oldcmd.buttons, pm->cmd.buttons);
+    }
+#endif
+
     if ((ps->pm_flags & PMF_NO_JUMP) != 0)
         return false;
 

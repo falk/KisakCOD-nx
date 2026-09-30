@@ -3,6 +3,7 @@
 #endif
 
 #include <universal/q_shared.h>
+#include <port/switch_perf.h>
 #include "server.h"
 #include "sv_public.h"
 #include <game/savememory.h>
@@ -19,6 +20,11 @@
 #include <client/cl_scrn.h>
 #include <game/savedevice.h>
 #include <qcommon/cmd.h>
+#include <gfx_d3d/r_init.h>
+#include <client/client.h>
+#include <universal/timing.h>
+#include <universal/retail_tsc.h>
+#include "sv_framesmoothing.h"
 
 server_t sv;
 serverStatic_t svs;
@@ -28,6 +34,21 @@ int com_inServerFrame;
 
 const dvar_t *sv_lastSaveGame;
 const dvar_t *sv_smp;
+const dvar_t *sv_smpWorkerHelp;
+
+// Retail's threaded server helps drain renderer worker commands (skinning, FX
+// vertex generation, fences) while it waits. sv_smpWorkerHelp 0 makes it only
+// wait, leaving that work to the main thread and renderer workers.
+static void SV_WaitForServerCondition(int(__cdecl *condition)())
+{
+    if (sv_smpWorkerHelp && !sv_smpWorkerHelp->current.enabled)
+    {
+        while (!condition())
+            NET_Sleep(1);
+        return;
+    }
+    R_ProcessWorkerCmdsWithTimeout(condition, 1);
+}
 const dvar_t *sv_player_damageMultiplier;
 const dvar_t *sv_player_maxhealth;
 const dvar_t *sv_saveOnStartMap;
@@ -213,6 +234,7 @@ int __cdecl SV_ProcessPendingSave(PendingSave *pendingSave)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\server\\sv_main.cpp", 292, 0, "%s", "pendingSave");
     checksum = SV_GetCheckSum();
     result = G_SaveGame(pendingSave, checksum);
+    
     if (!pendingSave)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\server\\sv_main.cpp", 191, 0, "%s", "filename");
     //if (result)
@@ -345,9 +367,10 @@ void __cdecl SV_SaveServerCommands(SaveGame *save)
     clients = svs.clients;
     if (!save)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\server\\sv_main.cpp", 455, 0, "%s", "save");
-    SaveMemory_SaveWrite(&clients->reliableCommands, 12, save);
+    SaveMemory_SaveWrite(&clients->reliableCommands.header, sizeof(clients->reliableCommands.header), save);
     for (i = clients->reliableCommands.header.sent + 1; i <= clients->reliableCommands.header.sequence; ++i)
-        SaveMemory_SaveWrite(&clients->reliableCommands.commands[(unsigned __int8)i], 4, save);
+        SaveMemory_SaveWrite(&clients->reliableCommands.commands[(unsigned __int8)i],
+                             sizeof(clients->reliableCommands.commands[0]), save);
     SaveMemory_SaveWrite(clients->reliableCommands.buf, clients->reliableCommands.header.rover, save);
 }
 
@@ -359,9 +382,10 @@ void __cdecl SV_LoadServerCommands(SaveGame *save)
     clients = svs.clients;
     if (!save)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\server\\sv_main.cpp", 471, 0, "%s", "save");
-    SaveMemory_LoadRead(&clients->reliableCommands, 12, save);
+    SaveMemory_LoadRead(&clients->reliableCommands.header, sizeof(clients->reliableCommands.header), save);
     for (i = clients->reliableCommands.header.sent + 1; i <= clients->reliableCommands.header.sequence; ++i)
-        SaveMemory_LoadRead(&clients->reliableCommands.commands[(unsigned __int8)i], 4, save);
+        SaveMemory_LoadRead(&clients->reliableCommands.commands[(unsigned __int8)i],
+                            sizeof(clients->reliableCommands.commands[0]), save);
     SaveMemory_LoadRead(clients->reliableCommands.buf, clients->reliableCommands.header.rover, save);
     CG_SetServerCommandSequence(clients->reliableCommands.header.sent);
 }
@@ -416,6 +440,85 @@ int __cdecl SV_RunFrame(ServerFrameExtent extent, int timeCap)
     CL_UpdateDebugServerData();
     //Profile_EndInternal(0);
     return v4;
+}
+
+// ---- Retail PC server frame-rate smoothing (sv_framerate_smoothing) -------
+//
+// Retail PC SP runs the server inline on the main thread (no server thread
+// exists in iw3sp.exe).  CG_DrawActiveFrame calls SV_FrameRateSmoothing
+// (0x5c8390) instead of a plain R_SyncGpu(NULL): it starts the next server
+// frame (SV_WakeServer's inline arm) and hands R_SyncGpu a callback
+// (0x5c8370) that runs that frame in time-capped G_RunFrame slices while the
+// main thread would otherwise spin on the GPU fence.  After the sync it may
+// run one more slice sized from the recent frame period.  Whatever is left is
+// finished by SV_WaitServer's SV_RunFrame(SV_FRAME_DO_ALL, 0).
+
+const dvar_t *sv_framerate_smoothing;
+static SvFrameSmoothing sv_frameSmoothing;
+
+// Retail 0x5c8370: the slice ends 1,000,000 retail TSC ticks after the GPU
+// fence poll that returned "still busy" (R_GpuFenceTimeout's gpuSyncEnd).
+// Returns nonzero while the frame still has work, so R_SyncGpu keeps calling;
+// 0 once G_RunFrame reports every sliceable stage done.
+#define SV_FRAME_SMOOTHING_SLICE_RETAIL_TICKS 1000000.0
+static int __cdecl SV_FrameRateSmoothingSlice(unsigned __int64 gpuSyncEnd)
+{
+    static uint64_t sliceTicks;
+    static double sliceTicksFor;
+    if (sliceTicksFor != msecPerRawTimerTick)
+    {
+        sliceTicks = RetailTsc_ToRawTicks(SV_FRAME_SMOOTHING_SLICE_RETAIL_TICKS, msecPerRawTimerTick);
+        sliceTicksFor = msecPerRawTimerTick;
+    }
+#ifdef __SWITCH__
+    SWITCH_PERF_SCOPE(SWITCH_PERF_GAME_SLICE);
+    SwitchPerf_AddEvent(SWITCH_PERF_EV_SV_SLICES, 1);
+#endif
+    const int done = SV_RunFrame(SV_FRAME_DO_SMOOTHING, (int)(uint32_t)(gpuSyncEnd + sliceTicks));
+    return done != 1;
+}
+
+// Retail 0x5c8390.  Returns 1 when it synced the GPU itself, 0 when the
+// caller must R_SyncGpu(NULL) (smoothing off, no local server, demo playback,
+// server debug data pending, paused).
+int __cdecl SV_FrameRateSmoothing()
+{
+    if (!sv_framerate_smoothing || !sv_framerate_smoothing->current.enabled)
+        return 0;
+    if (!com_sv_running->current.enabled || CL_DemoPlaying() || CL_ServerDebugDataRecordedLastFrame()
+        || cl_paused->current.integer)
+        return 0;
+    // Port: retail has no server thread.  With the Xbox-derived threaded
+    // server (sv_smp 1) the frame runs on SV_ServerThread, so slicing it on
+    // the main thread would run G_RunFrame twice at once.
+    if (sv.smp)
+        return 0;
+
+    // SV_WakeServer's inline arm (retail inlines it here).
+    if (!com_inServerFrame)
+    {
+        com_inServerFrame = 1;
+        if (!sv.inFrame)
+        {
+            sv.inFrame = 1;
+            SV_PreFrame();
+        }
+    }
+
+    R_SyncGpu(SV_FrameRateSmoothingSlice);
+
+    const int32_t now = (int32_t)(uint32_t)__rdtsc();
+    const int32_t budget = SV_FrameSmoothing_Budget(&sv_frameSmoothing, now);
+    if (budget > 0)
+    {
+#ifdef __SWITCH__
+        SWITCH_PERF_SCOPE(SWITCH_PERF_GAME_SLICE);
+        SwitchPerf_AddEvent(SWITCH_PERF_EV_SV_SLICES, 1);
+#endif
+        SV_RunFrame(SV_FRAME_DO_SMOOTHING, (int)((uint32_t)now + (uint32_t)budget));
+    }
+    SV_FrameSmoothing_Record(&sv_frameSmoothing, now, budget, (int32_t)(uint32_t)__rdtsc());
+    return 1;
 }
 
 void SV_ProcessPostFrame()
@@ -486,7 +589,7 @@ int __cdecl SV_WaitStartServer()
     int result; // r3
 
     //PIXBeginNamedEvent_Copy_NoVarArgs(0xFFFFFFFF, "wait start server");
-    R_ProcessWorkerCmdsWithTimeout(SV_CheckStartServer, 1);
+    SV_WaitForServerCondition(SV_CheckStartServer);
     //PIXEndNamedEvent();
     if (!sv.restartServerThread)
         return 1;
@@ -508,13 +611,13 @@ void __cdecl  SV_ServerThread(unsigned int threadContext)
 
     iassert(threadContext == THREAD_CONTEXT_SERVER);
     Value = Sys_GetValue(2);
-    if (setjmp((int*)Value))
+    if (setjmp(*(jmp_buf *)Value))
     {
         do
         {
             Profile_Recover(1);
             v2 = Sys_GetValue(2);
-        } while (setjmp((int *)v2));
+        } while (setjmp(*(jmp_buf *)v2));
     }
     Profile_Guard(1);
     Sys_InitServerEvents();
@@ -525,7 +628,7 @@ void __cdecl  SV_ServerThread(unsigned int threadContext)
             Sys_ServerCompleted();
             {
                 PROF_SCOPED("wait start server");
-                R_ProcessWorkerCmdsWithTimeout(SV_CheckStartServer, 1);
+                SV_WaitForServerCondition(SV_CheckStartServer);
             }
             if (!sv.restartServerThread)
                 break;
@@ -534,6 +637,9 @@ void __cdecl  SV_ServerThread(unsigned int threadContext)
             sv.clientMessageTimeout = 0;
         }
         v3 = Sys_Milliseconds();
+#ifdef __SWITCH__
+        const uint64_t perfFrameStart = SwitchPerf_Enabled() ? SwitchPerf_NowTicks() : 0;
+#endif
         {
             PROF_SCOPED("run frame");
             SV_PreFrame();
@@ -547,6 +653,13 @@ void __cdecl  SV_ServerThread(unsigned int threadContext)
         Scr_ProfileUpdate();
         Scr_ProfileBuiltinUpdate();
         CL_UpdateDebugServerData();
+#ifdef __SWITCH__
+        // The flat SWITCH_PERF counters are main-thread only (G_PERF_SCOPE
+        // skips this thread); report this frame's busy time on the atomic
+        // server slot instead.
+        if (perfFrameStart)
+            SwitchPerf_AddServerThreadTicks(SwitchPerf_NowTicks() - perfFrameStart, 1);
+#endif
         Sys_ServerCompleted();
         v4 = SV_CheckAutoSaveHistory(0) != 0;
         v5 = Sys_Milliseconds() - v3;
@@ -557,7 +670,7 @@ void __cdecl  SV_ServerThread(unsigned int threadContext)
             Sys_LeaveCriticalSection(CRITSECT_CLIENT_MESSAGE);
             {
                 PROF_SCOPED("server timeout");
-                R_ProcessWorkerCmdsWithTimeout(Sys_ServerTimeout, 1);
+                SV_WaitForServerCondition(Sys_ServerTimeout);
             }
             Sys_EnterCriticalSection(CRITSECT_CLIENT_MESSAGE);
         }
@@ -567,11 +680,11 @@ void __cdecl  SV_ServerThread(unsigned int threadContext)
         Sys_LeaveCriticalSection(CRITSECT_CLIENT_MESSAGE);
         {
             PROF_SCOPED("wait send msg");
-            R_ProcessWorkerCmdsWithTimeout(Sys_CanSendClientMessages, 1);
+            SV_WaitForServerCondition(Sys_CanSendClientMessages);
         }
         {
             PROF_SCOPED("wait start server");
-            R_ProcessWorkerCmdsWithTimeout(SV_CheckStartServer, 1);
+            SV_WaitForServerCondition(SV_CheckStartServer);
         }
         if (sv.restartServerThread)
         {
@@ -582,6 +695,9 @@ void __cdecl  SV_ServerThread(unsigned int threadContext)
         else
         {
             v6 = Sys_Milliseconds();
+#ifdef __SWITCH__
+            const uint64_t perfPostStart = SwitchPerf_Enabled() ? SwitchPerf_NowTicks() : 0;
+#endif
             {
                 PROF_SCOPED("post frame");
                 Sys_ClearClientMessage();
@@ -593,6 +709,10 @@ void __cdecl  SV_ServerThread(unsigned int threadContext)
                 Scr_UpdateDebugger();
                 SV_UpdateDemo();
             }
+#ifdef __SWITCH__
+            if (perfPostStart)
+                SwitchPerf_AddServerThreadTicks(SwitchPerf_NowTicks() - perfPostStart, 0);
+#endif
             sv.serverExecTime = Sys_Milliseconds() + v5 - v6;
             SV_UpdatePerformanceFrame(sv.serverExecTime);
         }
@@ -706,9 +826,12 @@ void __cdecl SV_InitSnapshot()
     sv.clientMessageTimeout = 0;
     sv.pendingSnapshot = 0;
     SV_SendClientGameState(svs.clients);
+    
     sv.state = SS_GAME;
     CL_FirstSnapshot();
+    
     sv.levelTime = G_GetTime();
+    
 }
 
 void __cdecl SV_WaitSaveGame()
@@ -757,6 +880,9 @@ int __cdecl SV_WaitServerSnapshot()
 
     if (sv.smp)
     {
+        // Main's wait for the threaded server's snapshot: the sv_smp 1
+        // counterpart of the inline arm's svwait below.
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SNAP_SVWAIT);
         v1 = Sys_Milliseconds();
         while (!Sys_WaitServerSnapshot())
         {
@@ -810,13 +936,25 @@ int __cdecl SV_WaitServerSnapshot()
     }
     else
     {
-        SV_WaitServer();
-        if (SV_ProcessPendingSaves())
-            SV_DisplaySaveErrorUI(); // savedevice_xenon
+        {
+            SWITCH_PERF_SCOPE(SWITCH_PERF_SNAP_SVWAIT);
+            SV_WaitServer();
+        }
+        {
+            SWITCH_PERF_SCOPE(SWITCH_PERF_SNAP_SAVES);
+            if (SV_ProcessPendingSaves())
+                SV_DisplaySaveErrorUI(); // savedevice_xenon
+        }
         Scr_UpdateDebugger();
         SV_UpdateDemo();
-        SV_SendClientMessages();
-        CL_CreateNextSnap();
+        {
+            SWITCH_PERF_SCOPE(SWITCH_PERF_SNAP_SEND);
+            SV_SendClientMessages();
+        }
+        {
+            SWITCH_PERF_SCOPE(SWITCH_PERF_SNAP_CREATE);
+            CL_CreateNextSnap();
+        }
         sv.inFrame = 0;
         sv.clientMessageTimeout = 0;
         if (!cl_paused->current.integer)
@@ -1158,7 +1296,28 @@ int __cdecl SV_Frame(int msec)
     int timeResidual; // r11
     int v7; // r11
 
+#ifdef __SWITCH__
+    SWITCH_PERF_SCOPE(SWITCH_PERF_SERVER_TOTAL);
+#endif
     v1 = msec;
+#ifdef __SWITCH__
+    {
+        static int s_svFrameDiag = 0;
+        if ((++s_svFrameDiag % 5) == 1)
+        {
+            extern bool __cdecl UI_IsFullscreen();
+            extern char sv_save_filename[64];
+            extern int sv_map_restart;
+            extern int com_lastFrameTime[];
+            extern float com_codeTimeScale;
+            const dvar_t *timescaleVar = Dvar_FindVar("timescale");
+            const dvar_t *maxFrameTimeVar = Dvar_FindVar("com_maxFrameTime");
+            const dvar_t *maxFpsVar = Dvar_FindVar("com_maxfps");
+            const dvar_t *fixedTimeVar = Dvar_FindVar("fixedtime");
+            
+        }
+    }
+#endif
     Hunk_CheckTempMemoryClear();
     Hunk_CheckTempMemoryHighClear();
     //PIXSetMarker(0xFFFFFFFF, "SV_Frame");
@@ -1172,12 +1331,33 @@ int __cdecl SV_Frame(int msec)
     Hunk_CheckTempMemoryHighClear();
     if (!CL_IsCGameRendering())
     {
+        // Retail PC SV_Frame (0x5c82a0), fullscreen-UI arm: SV_WaitServer
+        // (0x5c7fd0 -- finishes a frame only if one is already in flight,
+        // never starts one), the error/save/debugger bookkeeping, then
+        // `if (!cl_paused) Dvar_SetInt(cl_paused, 1)` (0x588be0).  While a
+        // fullscreen UI owns the screen (the pregame briefing movie and its
+        // "press to continue", the main menu) the world does not advance:
+        // level.time stays where SV_SpawnServer left it until UI_PlayerStart
+        // closes the pregame menu and SV_FrameInternal takes over, so a
+        // level's scripted intro always starts from its beginning however
+        // long the briefing stays up.
+        //
+        // The port used to wake and run a whole inline server frame here
+        // every rendered frame (38a4af99, P5, from before the pregame menu
+        // could close), plus a SV_SendClientMessages/CL_CreateNextSnap pairing
+        // and a clock re-lock (9848d0aa) to paper over what that did:
+        // the level ran ~30-40 s ahead of the player, so where the player
+        // started depended on how long the briefing stayed up.  None of that
+        // exists in retail, for either server mode (sv_smp 1 already
+        // had this body).
         SV_WaitServer();
         Com_CheckError();
         if (SV_ProcessPendingSaves())
             SV_DisplaySaveErrorUI(); // savedevice_xenon
         Scr_UpdateDebugger();
         SV_UpdateDemo();
+        if (!cl_paused->current.integer)
+            Dvar_SetInt(cl_paused, 1);
         goto LABEL_6;
     }
     if (!CL_DemoPlaying() && SV_CheckLoadGame())
@@ -1240,4 +1420,3 @@ bool __cdecl SV_SaveMemory_IsRecentlyLoaded()
     SV_RecordIsRecentlyLoaded(IsRecentlyLoaded);
     return IsRecentlyLoaded;
 }
-

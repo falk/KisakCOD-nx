@@ -1,4 +1,5 @@
 #include <universal/q_shared.h>
+#include <port/switch_perf.h>
 #include "r_bsp.h"
 #include "r_dvars.h"
 #include "r_init.h"
@@ -7,10 +8,130 @@
 #include "r_buffers.h"
 #include "r_add_staticmodel.h"
 #include <universal/profile.h>
+#include <database/db_retail_frame_evidence.h>
 
 void __cdecl R_InitBspDrawSurf(GfxBspDrawSurfData* surfData)
 {
     R_InitDelayedCmdBuf(&surfData->delayedCmdBuf);
+}
+
+#ifdef __SWITCH__
+// switch_perfTrace: how a world pretess batch splits into sub-draws, and how
+// many sub-draws it would issue if firstVertex-only splits were merged by
+// rebasing the copied indices (same lightmap, probe and layer-data offset,
+// merged vertex span within the 16-bit index range).  Mirrors the split rule
+// in the copy loop below; changes nothing.
+static void R_PreTessCountBatch(const uint16_t *list, uint32_t count, bool copied)
+{
+    uint64_t draws = 0, splitVertex = 0, splitLmap = 0, drawsRebased = 0;
+    int baseVertex = 0x7FFFFFFF;
+    uint32_t lmapIndex = 31, reflectionProbeIndex = 255;
+    int runLayer = 0;
+    int64_t runMin = 0, runMax = 0;
+    uint64_t staticDraws = 0, tris = 0;
+    uint32_t nextIndex = 0;
+    for (uint32_t surfIter = 0; surfIter < count; ++surfIter)
+    {
+        const GfxSurface *surf = &rgp.world->dpvs.surfaces[list[surfIter]];
+        const bool sameLight = lmapIndex == surf->lightmapIndex
+            && reflectionProbeIndex == surf->reflectionProbeIndex;
+        if (baseVertex != surf->tris.firstVertex || !sameLight)
+        {
+            if (draws)
+                ++(sameLight ? splitVertex : splitLmap);
+            ++draws;
+        }
+        const int64_t v0 = surf->tris.firstVertex;
+        const int64_t v1 = v0 + surf->tris.vertexCount;
+        const bool rebasable = drawsRebased && sameLight && runLayer == surf->tris.vertexLayerData
+            && (v1 > runMax ? v1 : runMax) - (v0 < runMin ? v0 : runMin) <= 0x10000;
+        if (rebasable)
+        {
+            runMin = v0 < runMin ? v0 : runMin;
+            runMax = v1 > runMax ? v1 : runMax;
+        }
+        else
+        {
+            ++drawsRebased;
+            runMin = v0;
+            runMax = v1;
+            runLayer = surf->tris.vertexLayerData;
+        }
+        // Static world index buffer: a run also ends where this surface's
+        // indices do not follow the previous one's in rgp.world->indices.
+        if (!surfIter || !sameLight || baseVertex != surf->tris.firstVertex
+            || nextIndex != (uint32_t)surf->tris.baseIndex)
+            ++staticDraws;
+        nextIndex = surf->tris.baseIndex + 3u * surf->tris.triCount;
+        tris += surf->tris.triCount;
+        baseVertex = surf->tris.firstVertex;
+        lmapIndex = surf->lightmapIndex;
+        reflectionProbeIndex = surf->reflectionProbeIndex;
+    }
+    if (copied)
+        SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_BYTES, 6 * tris);
+    SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_STATIC_DRAWS, staticDraws);
+    SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_BATCHES, 1);
+    SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_SURFS, count);
+    SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_DRAWS, draws);
+    SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_SPLIT_VERTEX, splitVertex);
+    SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_SPLIT_LMAP, splitLmap);
+    SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_DRAWS_REBASED, drawsRebased);
+}
+#endif
+
+// r_deko9StaticPretess (r_pretess.h): record the batch as runs of the static
+// world index buffer instead of copying its indices. A run ends where the
+// next surface's indices do not follow in rgp.world->indices, and wherever
+// the copying path starts a new entry (firstVertex, lightmap or reflection
+// probe change), so the draw side keeps the copying path's state changes.
+static char R_PreTessBspDrawSurfsStatic(
+    GfxDrawSurf drawSurf,
+    const uint16_t *list,
+    uint32_t count,
+    GfxBspDrawSurfData *surfData)
+{
+    GfxBspPreTessDrawSurf runs[128];
+    iassert(count <= 128);
+    uint32_t runCount = 0;
+    uint32_t nextIndex = 0;
+    int baseVertex = 0x7FFFFFFF;
+    uint32_t lmapIndex = 31;
+    uint32_t reflectionProbeIndex = 255;
+    for (uint32_t surfIter = 0; surfIter < count; ++surfIter)
+    {
+        const uint16_t surfIndex = list[surfIter];
+        bcassert(surfIndex, rgp.world->surfaceCount);
+        const GfxSurface *surf = &rgp.world->dpvs.surfaces[surfIndex];
+        const uint32_t triCount = surf->tris.triCount;
+        if (!runCount || baseVertex != surf->tris.firstVertex || lmapIndex != surf->lightmapIndex
+            || reflectionProbeIndex != surf->reflectionProbeIndex || nextIndex != (uint32_t)surf->tris.baseIndex
+            || runs[runCount - 1].totalTriCount + triCount > 0xFFFF)
+        {
+            baseVertex = surf->tris.firstVertex;
+            lmapIndex = surf->lightmapIndex;
+            reflectionProbeIndex = surf->reflectionProbeIndex;
+            runs[runCount].baseSurfIndex = surfIndex;
+            runs[runCount++].totalTriCount = 0;
+        }
+        runs[runCount - 1].totalTriCount = (uint16_t)(runs[runCount - 1].totalTriCount + triCount);
+        nextIndex = surf->tris.baseIndex + 3u * triCount;
+    }
+#ifdef __SWITCH__
+    if (SwitchPerf_g_enabled)
+    {
+        R_PreTessCountBatch(list, count, false);
+        SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_STATIC_SURFS, count);
+    }
+#endif
+    drawSurf.fields.surfType = SF_TRIANGLES_PRETESS;
+    if (R_AllocDrawSurf(&surfData->delayedCmdBuf, drawSurf, &surfData->drawSurfList, runCount + 2))
+    {
+        R_WritePrimDrawSurfInt(&surfData->delayedCmdBuf, runCount);
+        R_WritePrimDrawSurfInt(&surfData->delayedCmdBuf, R_PRETESS_STATIC_FLAG);
+        R_WritePrimDrawSurfData(&surfData->delayedCmdBuf, (uint8_t *)runs, runCount);
+    }
+    return 1;
 }
 
 char __cdecl R_PreTessBspDrawSurfs(
@@ -19,6 +140,9 @@ char __cdecl R_PreTessBspDrawSurfs(
     uint32_t count,
     GfxBspDrawSurfData *surfData)
 {
+    if (R_StaticPretessWorldIb())
+        return R_PreTessBspDrawSurfsStatic(drawSurf, list, count, surfData);
+
     uint32_t simplifiedCount; // [esp+34h] [ebp-230h]
     uint16_t surfIndex; // [esp+38h] [ebp-22Ch]
     const GfxSurface *tris; // [esp+3Ch] [ebp-228h]
@@ -44,6 +168,10 @@ char __cdecl R_PreTessBspDrawSurfs(
 
     if (!preTessIndices)
         return 0;
+#ifdef __SWITCH__
+    if (SwitchPerf_g_enabled)
+        R_PreTessCountBatch(list, count, true);
+#endif
 
     {
         PROF_SCOPED("R_memcpy");
@@ -104,6 +232,10 @@ void __cdecl R_AddBspDrawSurfs(
     v4 = !dx.deviceLost && r_pretess->current.enabled;
     if (!v4 || !R_PreTessBspDrawSurfs(drawSurf, (const uint16_t *)list, count, surfData))
     {
+#ifdef __SWITCH__
+        if (SwitchPerf_g_enabled)
+            SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_FALLBACK, count);
+#endif
         if (R_AllocDrawSurf(&surfData->delayedCmdBuf, drawSurf, &surfData->drawSurfList, ((count + 1) >> 1) + 1))
         {
             R_WritePrimDrawSurfInt(&surfData->delayedCmdBuf, count);
@@ -233,7 +365,7 @@ void __cdecl R_AddAllBspDrawSurfacesCameraNonlit(
         }
     }
     if (triSurfCount)
-        R_AddBspDrawSurfs(prevDrawSurf, (uint8_t *)triSurfList, triSurfCount, &surfData);
+        R_AddBspDrawSurfs(prevDrawSurf, (uint8_t*)triSurfList, triSurfCount, &surfData);
     R_EndCmdBuf(&surfData.delayedCmdBuf);
     drawSurfCount = surfData.drawSurfList.current - scene.drawSurfs[stage];
     scene.drawSurfCount[stage] = drawSurfCount;
@@ -376,6 +508,9 @@ void __cdecl R_AddAllBspDrawSurfacesSpotShadow(uint32_t spotShadowIndex, uint32_
     int drawSurfCount; // [esp+154h] [ebp-4h]
 
     iassert( rgp.world );
+#ifdef __SWITCH__
+    SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_BSP_SPOTSHADOW);
+#endif
     surfaceMaterials = rgp.world->dpvs.surfaceMaterials;
     stage = 3 * spotShadowIndex + 21;
     R_InitBspDrawSurf(&surfData);
@@ -420,4 +555,3 @@ void __cdecl R_AddAllBspDrawSurfacesSpotShadow(uint32_t spotShadowIndex, uint32_
     drawSurfCount = surfData.drawSurfList.current - drawSurfs;
     scene.drawSurfCount[stage] += drawSurfCount;
 }
-

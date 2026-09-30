@@ -1,12 +1,25 @@
 #include <universal/q_shared.h>
 #include "timing.h"
 
+#if !defined(__SWITCH__)
 #include <Windows.h>
+#endif
 #include <qcommon/threads.h>
 
-long double msecPerRawTimerTick;
+double msecPerRawTimerTick;
 double qpc2msec;
 
+#if defined(__SWITCH__)
+// __rdtsc() (switch_compat.h) uses libnx's supported ARM physical counter.
+// Its frequency comes from the matching libnx helper, so no Windows
+// QueryPerformanceCounter-style calibration against a second clock is needed.
+double __cdecl SecondsPerTick()
+{
+    const uint64_t frequency = armGetSystemTickFreq();
+    qpc2msec = 1000.0 / (double)frequency;
+    return 1.0 / (double)frequency;
+}
+#else
 double __cdecl SecondsPerTick()
 {
     _LARGE_INTEGER tscStop; // [esp+20h] [ebp-30h]
@@ -35,6 +48,7 @@ double __cdecl SecondsPerTick()
     Win_SetThreadLock(THREAD_LOCK_NONE);
     return secPerTick;
 }
+#endif
 
 void __cdecl InitTiming()
 {

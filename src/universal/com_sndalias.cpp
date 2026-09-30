@@ -7,6 +7,8 @@
 #include <qcommon/cmd.h>
 #include <database/database.h>
 #include "q_parse.h"
+#include "name_ptr_cache.h"
+#include <qcommon/threads.h>
 
 SoundAliasGlobals g_sa;
 
@@ -125,7 +127,7 @@ void __cdecl Com_VolumeFalloffCurveGraphEventCallback(const DevGraph *graph, Dev
 
     if (!graph)
         MyAssertHandler(".\\universal\\com_sndalias.cpp", 213, 0, "%s", "graph");
-    data = (int)graph->data;
+    data = (int)(intptr_t)graph->data;
     if (data <= 0 || data >= 16)
         MyAssertHandler(
             ".\\universal\\com_sndalias.cpp",
@@ -277,15 +279,45 @@ snd_alias_list_t *__cdecl Com_FindSoundAliasNoErrors_LoadObj(const char *name)
     return 0;
 }
 
+// Main-thread memo of found (non-default) alias lists. cgame plays every
+// entity loop sound and blended sound by config-string name each frame
+// (CG_AddEntityLoopSound, CG_SoundBlend), each hashing the ~35-character
+// name twice and walking two hash chains (DB_FindXAssetHeader +
+// DB_IsXAssetDefault), a measurable share of DB_HashForName and I_stricmp
+// calls in a PGO profile. The config-string pointers are stable, so the
+// memo hits; NamePtrCache proves
+// every hit by the registry generation and a byte-equal alias name. Misses
+// and missing aliases take the original path (its error print included).
+static NamePtrCache<snd_alias_list_t, 256> s_soundAliasCache;
+
+static const char *Com_SoundAliasListName(snd_alias_list_t *aliasList)
+{
+    XAssetHeader header;
+    header.sound = aliasList;
+    return DB_GetXAssetHeaderName(ASSET_TYPE_SOUND, &header);
+}
+
 snd_alias_list_t *__cdecl Com_FindSoundAlias_FastFile(const char *name)
 {
     snd_alias_list_t *aliasList; // [esp+4h] [ebp-4h]
 
     if (!name)
         MyAssertHandler(".\\universal\\com_sndalias.cpp", 623, 0, "%s", "name");
+    const uint32_t generation = Sys_IsMainThread() ? DB_AssetLookupGeneration() : 0;
+    if (generation)
+    {
+        if (snd_alias_list_t *hit = s_soundAliasCache.Find(name, generation, Com_SoundAliasListName))
+            return hit;
+    }
     aliasList = DB_FindXAssetHeader(ASSET_TYPE_SOUND, name).sound;
     if (!DB_IsXAssetDefault(ASSET_TYPE_SOUND, name))
+    {
+        // Only a result no registry change raced with (the generation is
+        // unchanged across both lookups) is memoized.
+        if (generation && generation == DB_AssetLookupGeneration())
+            s_soundAliasCache.Store(name, generation, aliasList);
         return aliasList;
+    }
     Com_PrintError(CON_CHANNEL_FILES, "Missing soundalias \"%s\".\n", name);
     return 0;
 }
@@ -455,7 +487,7 @@ void __cdecl Com_StreamedSoundList(snd_alias_system_t system)
 
     if (g_sa.initialized[system])
     {
-        aliases = *(snd_alias_t **)(&g_sa.soundFileInfo[-4].count + 3 * system);
+        aliases = g_sa.aliasInfo[system].head;
         for (i = 0; i < g_sa.aliasInfo[system].count; ++i)
         {
             if ((aliases[i].flags & 0xC0) >> 6 == 2)
@@ -489,7 +521,7 @@ void __cdecl Com_LoadedSoundList(snd_alias_system_t system)
     if (g_sa.initialized[system])
     {
         totalMem = 0;
-        aliases = *(snd_alias_t **)(&g_sa.soundFileInfo[-4].count + 3 * system);
+        aliases = g_sa.aliasInfo[system].head;
         for (i = 0; i < g_sa.aliasInfo[system].count; ++i)
         {
             if ((aliases[i].flags & 0xC0) >> 6 == 1)
@@ -659,7 +691,7 @@ void __cdecl Com_UnloadSoundAliasSounds(snd_alias_system_t system)
             "(system == SASYS_UI || system == SASYS_CGAME)",
             system);
     SND_StopSounds(SND_STOP_ALL);
-    aliases = (snd_alias_t *)*(&g_sa.soundFileInfo[-4].count + 3 * system);
+    aliases = g_sa.aliasInfo[system].head;
     for (i = 0; i < g_sa.aliasInfo[system].count; ++i)
     {
         if ((aliases[i].flags & 0xC0) >> 6 == 1)
@@ -705,11 +737,11 @@ void __cdecl Com_UnloadSoundAliases(snd_alias_system_t system)
                 0,
                 "%s",
                 "system != SASYS_GAME || !g_sa.initialized[SASYS_CGAME]");
-        if (*(&g_sa.soundFileInfo[-4].count + 3 * system))
+        if (g_sa.aliasInfo[system].head)
         {
-            *(&g_sa.soundFileInfo[-4].count + 3 * system) = 0;
+            g_sa.aliasInfo[system].head = nullptr;
             g_sa.aliasInfo[system].count = 0;
-            memset((uint8_t *)g_sa.hash, 0, 4 * g_sa.hashSize);
+            memset(g_sa.hash, 0, sizeof(*g_sa.hash) * g_sa.hashSize); // LP64: pointer slots, not ILP32 4 bytes
             g_sa.hashUsed = 0;
         }
         else if (g_sa.aliasInfo[system].count)
@@ -953,8 +985,8 @@ void __cdecl Com_SetStringEdReference(const char *pszReference, char *subtitle)
             token = "\r\nENDMARKER\r\n\r\n\r\n";
             FS_Write((char*)"\r\nENDMARKER\r\n\r\n\r\n", strlen("\r\nENDMARKER\r\n\r\n\r\n"), hOutFile);
             FS_FCloseFile(hOutFile);
-            FS_BuildOSPath((char*)fs_basepath->current.integer, fs_gamedir, (char*)"soundaliases/temp.st", szFromFile);
-            FS_BuildOSPath((char*)fs_basepath->current.integer, fs_gamedir, (char*)"soundaliases/subtitle.st", szToFile);
+            FS_BuildOSPath(fs_basepath->current.string, fs_gamedir, (char*)"soundaliases/temp.st", szFromFile);
+            FS_BuildOSPath(fs_basepath->current.string, fs_gamedir, (char*)"soundaliases/subtitle.st", szToFile);
             FS_CopyFile(szFromFile, szToFile);
             FS_Remove(szFromFile);
         }
@@ -1013,7 +1045,7 @@ void __cdecl Com_ProcessSoundAliasFileLocalization(char *sourceFile, char *loads
 
     filename = "soundaliases/temp.csv";
     Com_sprintf(dest, 0x100u, "soundaliases/%s", sourceFile);
-    FS_BuildOSPath((char*)fs_basepath->current.integer, fs_gamedir, dest, ospath);
+    FS_BuildOSPath(fs_basepath->current.string, fs_gamedir, dest, ospath);
     Com_Printf(CON_CHANNEL_SOUND, "Processing sound alias file %s..\n", ospath);
     stream = fopen(ospath, "r+");
     if (!stream)
@@ -1226,8 +1258,8 @@ void __cdecl Com_ProcessSoundAliasFileLocalization(char *sourceFile, char *loads
     }
     Com_EndParseSession();
     FS_FCloseFile(h);
-    FS_BuildOSPath((char *)fs_basepath->current.integer, fs_gamedir, (char *)filename, fromOSPath);
-    FS_BuildOSPath((char *)fs_basepath->current.integer, fs_gamedir, dest, toOSPath);
+    FS_BuildOSPath(fs_basepath->current.string, fs_gamedir, (char *)filename, fromOSPath);
+    FS_BuildOSPath(fs_basepath->current.string, fs_gamedir, dest, toOSPath);
     if (v37)
         FS_CopyFile(fromOSPath, toOSPath);
     FS_Remove(fromOSPath);
@@ -1238,8 +1270,11 @@ void __cdecl Com_InitSoundAliasHash(uint32_t aliasCount)
 {
     g_sa.hashUsed = 0;
     g_sa.hashSize = (3 * aliasCount + 1) >> 1;
-    g_sa.hash = (snd_alias_list_t**)CM_Hunk_Alloc(4 * ((3 * aliasCount + 1) >> 1), "Com_InitSoundAliasHash", 15);
-    memset(g_sa.hash, 0, 4 * ((3 * aliasCount + 1) >> 1));
+    // LP64: the hash buckets are pointers; the ILP32 4-byte stride
+    // under-allocated (and under-zeroed) the table.
+    const uint32_t hashBytes = static_cast<uint32_t>(sizeof(snd_alias_list_t*)) * g_sa.hashSize;
+    g_sa.hash = (snd_alias_list_t**)CM_Hunk_Alloc(hashBytes, "Com_InitSoundAliasHash", 15);
+    memset(g_sa.hash, 0, hashBytes);
 }
 
 cmd_function_s Com_RefreshSpeakerMaps_f_VAR;

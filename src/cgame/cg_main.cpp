@@ -225,6 +225,14 @@ void CG_RegisterDvars()
         "\t2:\tone way size pulse\n"
         "\t3:\talpha pulse\n"
         "\t4:\tstatic image");
+    {
+        extern const dvar_t *switch_hintDiag;
+        switch_hintDiag = Dvar_RegisterBool(
+            "switch_hintDiag",
+            0,
+            DVAR_NOFLAG,
+            "Log the cursor-hint draw chain (stage, icon, string, final text) and PASS:CURSOR_HINT_DRAWN");
+    }
     cg_weaponHintsCoD1Style = Dvar_RegisterBool(
         "cg_weaponHintsCoD1Style",
         1,
@@ -1032,7 +1040,7 @@ void __cdecl CG_RegisterGraphics(int localClientNum, const char *mapname)
             MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\cgame\\cg_main.cpp", 1026, 0, "%s", "cgs->fxs[i]");
         ++v7;
         ++v6;
-    } while ((int)v7 < (int)&cgsArray[0].holdBreathParams);
+    } while (v6 < static_cast<int>(ARRAY_COUNT(cgsArray[0].fxs)));
     ProfLoad_End();
     ProfLoad_Begin("Register shellshocks");
     for (j = 1; j < 16; ++j)
@@ -1150,7 +1158,7 @@ static void __cdecl CG_SubtitlePrint(int msec, const snd_alias_t *alias)
     const dvar_s *v5; // r10
     const dvar_s *v6; // r11
     int integer; // r31
-    long double v8; // fp2
+    double v8; // fp2
     int v9; // r5
 
     if (!alias)
@@ -1190,7 +1198,7 @@ void __cdecl CG_ScriptNotifySndLengthNotify(int msec, void *lengthNotifyData)
 {
     const char *v2; // r3
 
-    v2 = va("sl %i %i", lengthNotifyData, msec);
+    v2 = va("sl %i %i", static_cast<int>(reinterpret_cast<intptr_t>(lengthNotifyData)), msec);
     CL_AddReliableCommand(0, v2);
 }
 
@@ -1560,7 +1568,6 @@ void __cdecl CG_FreeWeapons(int localClientNum)
     v2 = 1;
     if (BG_GetNumWeapons() > 1)
     {
-        p_tree = &cg_weaponsArray[0][1].tree;
         do
         {
             v4 = CG_WeaponDObjHandle(v2);
@@ -1573,13 +1580,17 @@ void __cdecl CG_FreeWeapons(int localClientNum)
                     "%s\n\t(localClientNum) = %i",
                     "(localClientNum == 0)",
                     localClientNum);
+            // Indexed, not the decompile's `p_tree += 18` (18 ILP32 pointers =
+            // sizeof(weaponInfo_s) 72; LP64 it is 120, so the walk freed
+            // non-tree fields as anim trees and a map restart after mission
+            // failure looped forever in SL_FreeString).
+            p_tree = &cg_weaponsArray[0][v2].tree;
             if (*p_tree)
             {
                 XAnimFreeTree(*p_tree, 0);
                 *p_tree = 0;
             }
             ++v2;
-            p_tree += 18;
         } while (v2 < BG_GetNumWeapons());
     }
     memset(cg_weaponsArray[localClientNum], 0, sizeof(weaponInfo_s[128]));
@@ -1713,4 +1724,3 @@ int __cdecl CG_PlayEntitySoundAliasByName(int localClientNum, SndEntHandle entit
     SND_AddLengthNotify(v9, v7, SndLengthNotify_Subtitle);
     return v9;
 }
-

@@ -124,12 +124,27 @@ uint32_t __cdecl RB_CalcSunSpriteSamples()
             } while (alwaysfails);
         }
     } while (alwaysfails);
+    // Bounded, not the original unconditional spin: this occlusion query is
+    // only ever used for the sun-sprite visibility calibration below, whose
+    // own caller already has a graceful fallback for "couldn't calibrate"
+    // (RB_CalcSunSpriteSamples returning 0 -> "reverting to low-quality sun
+    // visibility test" in R_Init, src/gfx_d3d/r_init.cpp). On real hardware
+    // a GPU always eventually answers an occlusion query, so this bound is
+    // unreachable there. An unconditional wait on GPU query
+    // completion is a latent hang in any environment where a query can go
+    // unanswered, so the wait is bounded.
+    const uint32_t queryDeadlineMs = Sys_Milliseconds() + 250;
     while (1)
     {
         hr = occlusionQuery->GetData(&sampleCount, 4u, 1u);
         if (hr != 1)
             break;
-        Sleep(0);
+        if (Sys_Milliseconds() >= queryDeadlineMs)
+        {
+            hr = 1;
+            break;
+        }
+        NET_Sleep(0);
     }
     if (hr)
         return 256;
@@ -249,7 +264,7 @@ uint32_t __cdecl RB_HW_ReadOcclusionQuery(IDirect3DQuery9 *query)
         hr = query->GetData(&pixelCount, 4u, 1u);
         if (hr != 1)
             break;
-        Sleep(0);
+        NET_Sleep(0);
     }
     if (hr >= 0)
         return pixelCount;

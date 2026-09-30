@@ -179,3 +179,128 @@ void __cdecl R_GenerateOutdoorImage(GfxImage *outdoorImage)
     Image_Generate2D(outdoorImage, outdoorGlob.pic, outdoorMapSize[0], outdoorMapSize[1], D3DFMT_L8);
     Outdoor_TempHunkFreePic();
 }
+// ---------------------------------------------------------------------------
+// r_outdoorDebug (port diagnostic, off by default).  Reads the live `$outdoor`
+// texture back once per world (the texels the shaders sample), reports its
+// histogram, and evaluates the precipitation shaders' outdoor test at the
+// camera once a second:
+//   lookup = (viewOrg + worldOffset) * outdoorLookupMatrix,
+//   visible = saturate((lookup.z - texel) * r_outdoorFeather) > 0.
+// `PASS:OUTDOOR_MAP_BAKED` needs a non-flat 8-bit map; a flat map (every texel
+// equal -- what the loadobj-only generator produced for fastfile levels)
+// fails loudly because it disables indoor culling everywhere.
+#include "r_dvars.h"
+#include "r_init.h"
+#include "rb_backend.h"
+#include "r_bsp.h"
+#include <qcommon/qcommon.h>
+#include <universal/com_memory.h>
+#include <cstring>
+
+namespace
+{
+const GfxWorld *s_outdoorDebugWorld;
+uint8_t *s_outdoorTexels;
+int s_outdoorW;
+int s_outdoorH;
+int s_outdoorLastMs;
+
+bool R_OutdoorDebugReadback(const GfxWorld *world)
+{
+    const GfxImage *image = world->outdoorImage;
+    s_outdoorW = s_outdoorH = 0;
+    if (!image || image->mapType != MAPTYPE_2D || !image->texture.map)
+    {
+        Com_Printf(8, "FAIL:OUTDOOR_MAP_BAKED no live 2D $outdoor texture\n");
+        return false;
+    }
+    D3DSURFACE_DESC desc{};
+    if (image->texture.map->GetLevelDesc(0, &desc) < 0 || desc.Format != D3DFMT_L8)
+    {
+        Com_Printf(8, "FAIL:OUTDOOR_MAP_BAKED $outdoor level 0 is not L8 (format %d)\n", (int)desc.Format);
+        return false;
+    }
+    D3DLOCKED_RECT locked{};
+    if (image->texture.map->LockRect(0, &locked, nullptr, D3DLOCK_READONLY) < 0 || !locked.pBits)
+    {
+        Com_Printf(8, "FAIL:OUTDOOR_MAP_BAKED LockRect($outdoor) failed\n");
+        return false;
+    }
+    const int w = (int)desc.Width;
+    const int h = (int)desc.Height;
+    if (s_outdoorTexels)
+        Z_Free(s_outdoorTexels, 0);
+    s_outdoorTexels = (uint8_t *)Z_Malloc(w * h, "r_outdoorDebug", 0);
+    uint32_t histogram[256] = {};
+    uint32_t fnv = 2166136261u;
+    for (int y = 0; y < h; ++y)
+    {
+        const uint8_t *row = (const uint8_t *)locked.pBits + (size_t)y * locked.Pitch;
+        memcpy(s_outdoorTexels + (size_t)y * w, row, w);
+        for (int x = 0; x < w; ++x)
+        {
+            ++histogram[row[x]];
+            fnv = (fnv ^ row[x]) * 16777619u;
+        }
+    }
+    image->texture.map->UnlockRect(0);
+    s_outdoorW = w;
+    s_outdoorH = h;
+
+    int distinct = 0, lo = 256, hi = -1;
+    for (int v = 0; v < 256; ++v)
+    {
+        if (!histogram[v])
+            continue;
+        ++distinct;
+        lo = v < lo ? v : lo;
+        hi = v > hi ? v : hi;
+    }
+    Com_Printf(8, "OUTDOOR_MAP w=%d h=%d distinct=%d min=%d max=%d fnv=0x%08x zero=%u\n",
+               w, h, distinct, lo, hi, fnv, histogram[0]);
+    if (distinct > 1)
+        Com_Printf(8, "PASS:OUTDOOR_MAP_BAKED distinct=%d fnv=0x%08x\n", distinct, fnv);
+    else
+        Com_Printf(8, "FAIL:OUTDOOR_MAP_BAKED flat map (every texel %d): precipitation is not culled indoors\n", lo);
+    return true;
+}
+} // namespace
+
+void R_OutdoorDebugFrame(const float *viewOrg, const float *viewForward)
+{
+    if (!r_outdoorDebug || !r_outdoorDebug->current.enabled || !rgp.world)
+        return;
+    const GfxWorld *world = rgp.world;
+    if (world != s_outdoorDebugWorld)
+    {
+        s_outdoorDebugWorld = world;
+        s_outdoorLastMs = 0;
+        R_OutdoorDebugReadback(world);
+    }
+    const int now = Sys_Milliseconds();
+    if (!s_outdoorW || now - s_outdoorLastMs < 1000)
+        return;
+    s_outdoorLastMs = now;
+
+    // Same offset R_GenerateWorldOutdoorLookupMatrix adds: -awayBias along the
+    // view direction, then downBias on world z.
+    const float away = r_outdoorAwayBias->current.value;
+    float p[3] = { viewOrg[0] - away * viewForward[0], viewOrg[1] - away * viewForward[1],
+                   viewOrg[2] - away * viewForward[2] + r_outdoorDownBias->current.value };
+    const float(*m)[4] = world->outdoorLookupMatrix;
+    float l[3];
+    for (int c = 0; c < 3; ++c)
+        l[c] = p[0] * m[0][c] + p[1] * m[1][c] + p[2] * m[2][c] + m[3][c];
+    int tx = (int)(l[0] * s_outdoorW);
+    int ty = (int)(l[1] * s_outdoorH);
+    tx = tx < 0 ? 0 : (tx >= s_outdoorW ? s_outdoorW - 1 : tx);
+    ty = ty < 0 ? 0 : (ty >= s_outdoorH ? s_outdoorH - 1 : ty);
+    const float texel = s_outdoorTexels[ty * s_outdoorW + tx] / 255.0f;
+    float alpha = (l[2] - texel) * r_outdoorFeather->current.value;
+    alpha = alpha < 0.0f ? 0.0f : (alpha > 1.0f ? 1.0f : alpha);
+    const float worldTexelZ = m[2][2] != 0.0f ? (texel - m[3][2]) / m[2][2] : 0.0f;
+    Com_Printf(8, "OUTDOOR_PROBE org=%.0f,%.0f,%.0f uvz=%.4f,%.4f,%.4f texel=%d(%d,%d) roof_z=%.0f precip_alpha=%.2f %s\n",
+               viewOrg[0], viewOrg[1], viewOrg[2], l[0], l[1], l[2],
+               s_outdoorTexels[ty * s_outdoorW + tx], tx, ty, worldTexelZ, alpha,
+               alpha > 0.0f ? "outdoor" : "indoor");
+}

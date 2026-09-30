@@ -43,7 +43,8 @@ void __cdecl RB_VirtualToSceneRadius(float radius, float *radiusX, float *radius
 {
     iassert( radiusX );
     iassert( radiusY );
-    *radiusY = (double)vidConfig.sceneHeight * radius / 480.0;
+    // The frame's scene height (r_dynres sizes the scene per frame).
+    *radiusY = (double)gfxRenderTargets[R_RENDERTARGET_SCENE].height * radius / 480.0;
     *radiusX = *radiusY * vidConfig.aspectRatioScenePixel;
 }
 
@@ -184,7 +185,11 @@ int __cdecl RB_PickSymmetricFilterMaterial(int halfTapCount, const Material **ma
             "%s\n\t(halfTapCount) = %i",
             "(halfTapCount > 0 && halfTapCount <= 8)",
             halfTapCount);
-    *material = (const Material *)*((uint32_t *)&rgp.postFxMaterial + halfTapCount);
+    // LP64: index the material array by name; the decompiled form read the
+    // pointer through a 32-bit slot after postFxMaterial and kept only its
+    // low half (hardware crash 01789804169: RB_BlurScreen -> filter
+    // material 0x4f6045d8, real pointer 0x5c4f6045d8).
+    *material = rgp.symmetricFilterMaterial[halfTapCount - 1];
     return halfTapCount;
 }
 

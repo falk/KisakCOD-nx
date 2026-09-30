@@ -28,6 +28,27 @@ struct // sizeof=0x8
 static int s_lightGridRowDelta;
 static int s_lightGridSliceDelta;
 
+// apply probe: see rb_light.h.  One watched destination entry at
+// a time; R_SetStaticModelLighting owns the Begin/End bracket.
+static R_LightGridApplyProbe s_lightGridApplyProbe;
+
+void __cdecl R_LightGridApplyProbeBegin(uint32_t entryIndex)
+{
+    Com_Memset(&s_lightGridApplyProbe, 0, sizeof(s_lightGridApplyProbe));
+    s_lightGridApplyProbe.entryIndex = entryIndex;
+    s_lightGridApplyProbe.active = 1;
+}
+
+void __cdecl R_LightGridApplyProbeEnd(void)
+{
+    s_lightGridApplyProbe.active = 0;
+}
+
+const R_LightGridApplyProbe *__cdecl R_LightGridApplyProbeRead(void)
+{
+    return &s_lightGridApplyProbe;
+}
+
 void __cdecl R_SetLightGridSampleDeltas(int rowStride, int sliceStride)
 {
     s_lightGridRowDelta = rowStride;
@@ -435,6 +456,37 @@ uint8_t __cdecl R_LightGridLookup(
     R_GetLightGridSampleEntryQuad(lightGrid, pos, cornerEntry + 4, defaultGridEntry);
     --pos[lightGrid->rowAxis];
 
+    // the watched call's pre-suppression quad is the world->cell
+    // resolution evidence; the suppression pass below can legitimately null
+    // corners (including corner 0) afterwards, so capture both.
+    if (s_lightGridApplyProbe.active && !s_lightGridApplyProbe.rawCaptured)
+    {
+        R_LightGridApplyProbe &probe = s_lightGridApplyProbe;
+        probe.rawCaptured = 1;
+        probe.rawDefaultGridEntry = *defaultGridEntry;
+        probe.rawPos[0] = pos[0];
+        probe.rawPos[1] = pos[1];
+        probe.rawPos[2] = pos[2];
+        for (cornerIndex = 0; cornerIndex < 8; ++cornerIndex)
+        {
+            const GfxLightGridEntry *raw = cornerEntry[cornerIndex];
+            if (raw)
+            {
+                probe.rawEntryIndex[cornerIndex] = (uint32_t)(raw - lightGrid->entries);
+                probe.rawColors[cornerIndex] = raw->colorsIndex;
+                probe.rawPrimary[cornerIndex] = raw->primaryLightIndex;
+                probe.rawNeedsTrace[cornerIndex] = raw->needsTrace;
+            }
+            else
+            {
+                probe.rawEntryIndex[cornerIndex] = 0xFFFFFFFFu;
+                probe.rawColors[cornerIndex] = 0;
+                probe.rawPrimary[cornerIndex] = 0;
+                probe.rawNeedsTrace[cornerIndex] = 0;
+            }
+        }
+    }
+
     if (r_vc_makelog->current.integer)
         R_UpdateVisHistory(lightGrid, pos);
 
@@ -472,7 +524,12 @@ uint8_t __cdecl R_LightGridLookup(
             honorSuppression = 1;
             bestPrimaryLightWeight = cornerWeight[cornerIndex];
             primaryLightIndex = entry->primaryLightIndex;
-            memset((uint8_t *)cornerEntry, 0, 4 * cornerIndex);
+            // Zero the earlier pointer slots (the original ILP32 code wrote
+            // 4 bytes each).  Scale by the actual element so an LP64 build
+            // zeroes whole pointers; a bare 4*cornerIndex leaves the high
+            // half of each slot intact, i.e. a wild non-null pointer the
+            // sample loop then reads as a light-grid entry.
+            memset((uint8_t *)cornerEntry, 0, sizeof(cornerEntry[0]) * cornerIndex);
             continue;
         }
         v11 = entry->primaryLightIndex;
@@ -888,6 +945,7 @@ uint32_t __cdecl R_GetLightingAtPoint(
     PROF_SCOPED("R_GetStaticLights");
 
     primaryLightIndex = R_LightGridLookup(lightGrid, samplePos, cornerWeight, cornerEntry, &defaultGridEntry);
+    const uint8_t rawLookupPrimary = (uint8_t)primaryLightIndex;
 
     if (primaryLightIndex == 255)
     {
@@ -912,9 +970,19 @@ uint32_t __cdecl R_GetLightingAtPoint(
             }
             else if (!entry->primaryLightIndex || entry->primaryLightIndex == 255 && primaryLightIndex)
             {
-                light = Com_GetPrimaryLight(primaryLightIndex);
-                if (R_CanLightInfluenceLightGridCorner(lightGrid, light, samplePos, cornerIndex))
-                    primaryOccludedWeight = primaryOccludedWeight + cornerWeight[cornerIndex];
+                // Capability boundary: the ComWorld owns the primary-light
+                // table (the bounded first-frame route
+                // runs with the ComWorld deferred). With no table the
+                // non-sun contribution is unknowable, so the corner adds no
+                // primary-occlusion weight instead of dereferencing a null
+                // table. Sun-weighted corners take the branch above and
+                // remain fully computed.
+                if (Com_GetPrimaryLightCount() > primaryLightIndex)
+                {
+                    light = Com_GetPrimaryLight(primaryLightIndex);
+                    if (R_CanLightInfluenceLightGridCorner(lightGrid, light, samplePos, cornerIndex))
+                        primaryOccludedWeight = primaryOccludedWeight + cornerWeight[cornerIndex];
+                }
             }
             maxWeight = maxWeight + cornerWeight[cornerIndex];
             sampleCount = R_AddLightGridSample(
@@ -968,6 +1036,49 @@ uint32_t __cdecl R_GetLightingAtPoint(
     else
     {
         primaryLightIndex = R_ExtrapolateLightingAtPoint(lightGrid, dest, extrapolateBehavior, defaultGridEntry);
+    }
+
+    // record what this call actually resolved when it is the watched
+    // destination entry (the named prop R_SetStaticModelLighting bracketed).
+    if (s_lightGridApplyProbe.active && dest == s_lightGridApplyProbe.entryIndex)
+    {
+        R_LightGridApplyProbe &probe = s_lightGridApplyProbe;
+        probe.recorded = 1;
+        probe.defaultGridEntry = defaultGridEntry;
+        probe.chosenPrimary = rawLookupPrimary;
+        probe.mappedPrimary = primaryLightIndex;
+        probe.visibleMilli = (uint32_t)(primaryVisibleWeight * 1000.0f + 0.5f);
+        probe.occludedMilli = (uint32_t)(primaryOccludedWeight * 1000.0f + 0.5f);
+        probe.sampleCount = sampleCount;
+        probe.hasLightRegions = lightGrid->hasLightRegions ? 1u : 0u;
+        probe.sunPrimaryLightIndex = lightGrid->sunPrimaryLightIndex;
+        if (rgp.world)
+        {
+            probe.worldSunPrimaryLightIndex = rgp.world->sunPrimaryLightIndex;
+            probe.primaryLightCount = rgp.world->primaryLightCount;
+        }
+        probe.comPrimaryLightCount = Com_GetPrimaryLightCount();
+        for (cornerIndex = 0; cornerIndex < 8; ++cornerIndex)
+        {
+            entry = cornerEntry[cornerIndex];
+            if (entry)
+            {
+                probe.cornerEntryIndex[cornerIndex] =
+                    (uint32_t)(entry - lightGrid->entries);
+                probe.cornerColors[cornerIndex] = entry->colorsIndex;
+                probe.cornerPrimary[cornerIndex] = entry->primaryLightIndex;
+                probe.cornerNeedsTrace[cornerIndex] = entry->needsTrace;
+            }
+            else
+            {
+                probe.cornerEntryIndex[cornerIndex] = 0xFFFFFFFFu;
+                probe.cornerColors[cornerIndex] = 0;
+                probe.cornerPrimary[cornerIndex] = 0;
+                probe.cornerNeedsTrace[cornerIndex] = 0;
+            }
+            probe.cornerWeightMilli[cornerIndex] =
+                (uint32_t)(cornerWeight[cornerIndex] * 1000.0f + 0.5f);
+        }
     }
 
     return primaryLightIndex;

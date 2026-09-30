@@ -67,6 +67,7 @@ typedef struct unz_file_info_internal_s
 typedef struct
 {
 	char  *read_buffer;         /* internal buffer for compressed data */
+	unsigned long read_buffer_size; /* allocation size of read_buffer (entry-sized) */
 	z_stream stream;            /* zLib stream structure for inflate */
 
 	unsigned long pos_in_zipfile;       /* position in unsigned char on the zipfile, for fseek*/
@@ -81,6 +82,11 @@ typedef struct
 	unsigned long rest_read_compressed; /* number of unsigned char to be decompressed */
 	unsigned long rest_read_uncompressed;/*number of unsigned char to be obtained after decomp*/
 	ZIP_FILE *file;                 /* io structore of the zipfile */
+	/* Absolute file offset of the next compressed byte, tracked across the
+	 * caller's sequential reads. The original code lseek'd to the same place
+	 * before every read (an HDD-era defensive reposition); on flash that is a
+	 * redundant syscall per chunk. ~0 means "unknown, must seek". */
+	unsigned long read_file_pos;
 	unsigned long compression_method;   /* compression method (0==store) */
 	unsigned long byte_before_the_zipfile;/* unsigned char before the zipfile, (>0 for sfx)*/
 } file_in_zip_read_info_s;

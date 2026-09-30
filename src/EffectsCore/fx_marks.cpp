@@ -19,7 +19,12 @@
 #include <cgame/cg_main.h>
 #endif
 
+#include <universal/critical_section.h>
+#include <universal/fast_critical_section.h>
+#include <qcommon/threads.h>
+#ifndef __SWITCH__
 #include <win32/win_local.h>
+#endif
 
 #include <algorithm>
 #include <aim_assist/aim_assist.h>
@@ -1020,7 +1025,7 @@ static void __cdecl FX_EmitMarkTri(
         index.value[0] = *indices + baseVertex;
         index.value[1] = indices[1] + baseVertex;
         pIndex = (r_double_index_t *)&outSurf->indices[outSurf->indexCount];
-        if (((uint8_t)pIndex & 3) != 0)
+        if ((reinterpret_cast<uintptr_t>(pIndex) & 3u) != 0)
             MyAssertHandler(".\\EffectsCore\\fx_marks.cpp", 1255, 0, "%s", "!((uint)pIndex & 3)");
         *pIndex = index;
         marksSystem->hasCarryIndex = 1;
@@ -1517,13 +1522,16 @@ void __cdecl FX_BeginGeneratingMarkVertsForEntModels(int32_t localClientNum, uin
             "fx_marks->current.enabled && fx_marks_ents->current.enabled");
     PROF_SCOPED("FX_GenMarkVertsEnt");
     R_BeginMarkMeshVerts();
-    if (InterlockedIncrement((LONG*) & g_markThread[localClientNum]) != 1)
-        MyAssertHandler(
-            ".\\EffectsCore\\fx_marks.cpp",
-            1638,
-            0,
-            "%s",
-            "Sys_InterlockedIncrement( &g_markThread[localClientNum] ) == 1");
+    {
+        int value = Sys_InterlockedIncrement(&g_markThread[localClientNum]);
+        if (value != 1)
+            MyAssertHandler(
+                ".\\EffectsCore\\fx_marks.cpp",
+                1638,
+                0,
+                "%s",
+                "Sys_InterlockedIncrement( &g_markThread[localClientNum] ) == 1");
+    }
 
     FxMarksSystem *marksSystem = FX_GetMarksSystem(localClientNum);
     marksSystem->hasCarryIndex = 0;
@@ -1628,7 +1636,18 @@ void __cdecl FX_EndGeneratingMarkVertsForEntModels(int32_t localClientNum)
     FxMarksSystem *marksSystem = FX_GetMarksSystem(localClientNum);
     FX_FinishGeneratingMarkVerts(marksSystem);
 
-    iassert(Sys_InterlockedDecrement(&g_markThread[localClientNum]) == 0);
+    // the original code pairs this decrement with the increment in
+    // FX_BeginGeneratingMarkVertsForEntModels.  fb1b7d3e left the increment
+    // explicit but folded the matching decrement into iassert(), which this
+    // -DNDEBUG build compiles out, so g_markThread never returned to zero and
+    // every later Begin fired fx_marks.cpp:1638 (observed 101x in the P5
+    // movement run).  Keep both halves explicit and fail-loud.
+    {
+        int value = Sys_InterlockedDecrement(&g_markThread[localClientNum]);
+        if (value != 0)
+            MyAssertHandler(".\\EffectsCore\\fx_marks.cpp", __LINE__, 0, "%s",
+                            "Sys_InterlockedDecrement( &g_markThread[localClientNum] ) == 0");
+    }
     R_EndMarkMeshVerts();
 }
 

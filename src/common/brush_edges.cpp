@@ -577,6 +577,19 @@ char __cdecl FindCycleBFS(
     const SimplePlaneIntersection **resultCycle,
     int32_t *resultCycleCount)
 {
+#if UINTPTR_MAX > UINT32_MAX
+    (void)basePlane;
+    (void)pts;
+    (void)ptsCount;
+    (void)start;
+    (void)end;
+    (void)connectingPlane;
+    (void)resultCycle;
+    if (resultCycleCount)
+        *resultCycleCount = 0;
+    Com_Error(ERR_FATAL, "FindCycleBFS: unsupported on LP64 (32-bit stack overlay)");
+    return 0;
+#else
     const SimplePlaneIntersection **v9; // [esp+0h] [ebp-4028h]
     const SimplePlaneIntersection **enda; // [esp+4h] [ebp-4024h]
     const SimplePlaneIntersection *v11; // [esp+8h] [ebp-4020h] BYREF
@@ -660,6 +673,7 @@ LABEL_6:
         *resultCycle = end;
         return 1;
     }
+#endif
 }
 
 int32_t __cdecl RemovePtsWithPlanesThatOccurLessThanTwice(const SimplePlaneIntersection **pts, int32_t ptsCount)
@@ -847,7 +861,7 @@ int32_t __cdecl Remove(const SimplePlaneIntersection **pts, int32_t ptsCount, co
 
 int32_t __cdecl NumberOfUniquePoints(const SimplePlaneIntersection **pts, int32_t ptsCount)
 {
-    uint32_t v3[1025]; // [esp+10h] [ebp-1010h]
+    const SimplePlaneIntersection *v3[1025]; // [esp+10h] [ebp-1010h]
     int32_t v4; // [esp+1014h] [ebp-Ch]
     int32_t j; // [esp+1018h] [ebp-8h]
     int32_t i; // [esp+101Ch] [ebp-4h]
@@ -859,11 +873,10 @@ int32_t __cdecl NumberOfUniquePoints(const SimplePlaneIntersection **pts, int32_
     v4 = 0;
     for (i = 0; i < ptsCount; ++i)
     {
-        for (j = 0; j < v4 && !VecNCompareCustomEpsilon(pts[i]->xyz, (const float*)v3[j], 0.0099999998f, 3); ++j) // KISAKTODO: more sus casts
+        for (j = 0; j < v4 && !VecNCompareCustomEpsilon(pts[i]->xyz, v3[j]->xyz, 0.0099999998f, 3); ++j)
             ;
         if (j == v4)
-            v3[v4++] = (uint32_t)pts[i];
+            v3[v4++] = pts[i];
     }
     return v4;
 }
-

@@ -947,7 +947,7 @@ void __cdecl R_MarkUtil_GetDObjAnimMatAndHideParts(
     const DObjAnimMat **outBoneMtxList,
     uint32_t *outHidePartBits)
 {
-    char zeroLods[32]; // [esp+30h] [ebp-38h] BYREF
+    int8_t zeroLods[32]; // [esp+30h] [ebp-38h] BYREF
     int partBits[4]; // [esp+58h] [ebp-10h] BYREF
 
     PROF_SCOPED("R_MarkUtil_GetDObjAnimMatAndHideParts");
@@ -2063,6 +2063,15 @@ bool __cdecl R_MarkModelCoreCallback_0_(
     FxModelMarkPoint clipPoints[2][9]; // [esp+4Ch] [ebp-1B8h] BYREF
     int vertIndex; // [esp+200h] [ebp-4h]
 
+    // LWSS/LP64: this callback must read MarkModelCoreContext through its
+    // typed fields, not the decompiler's ILP32 byte offsets. On LP64 the seven
+    // pointer fields are 8 bytes, so the old `+12`/`+16`/`+24` reads landed
+    // inside the wrong fields and produced a mangled markDir; Vec3Dot then
+    // dereferenced it (Data Abort at 0) the first time a bullet left a mark on
+    // a dynamic XModel (the car). The sibling R_MarkModelCoreCallback_1_ has
+    // always used the typed fields.
+    const MarkModelCoreContext *context = (const MarkModelCoreContext *)contextAsVoid;
+
     for (vertIndex = 0; vertIndex != 3; ++vertIndex)
     {
         xyz = clipPoints[0][vertIndex].xyz;
@@ -2077,16 +2086,16 @@ bool __cdecl R_MarkModelCoreCallback_0_(
         clipPoints[0][vertIndex].vertWeights[vertIndex] = 1.0;
     }
     return R_MarkFragment_IsTriangleRejected(
-        *(const float**)((uintptr_t)contextAsVoid + 12),
+        context->markDir,
         clipPoints[0][0].xyz,
         clipPoints[0][1].xyz,
         clipPoints[0][2].xyz)
         || R_MarkFragment_DoTriangle_0_(
-            *(MarkInfo**)contextAsVoid,
-            *(const float(**)[4])((uintptr_t)contextAsVoid + 16),
-            *(const GfxMarkContext**)((uintptr_t)contextAsVoid + 4),
+            context->markInfo,
+            context->clipPlanes,
+            context->markContext,
             triVerts1,
-            *(const float(**)[3])((uintptr_t)contextAsVoid + 24),
+            context->transformNormalMatrix,
             clipPoints) != 0;
 }
 
@@ -2177,6 +2186,21 @@ char  R_MarkFragments_AnimatedXModel_VertList(
     visitorContext.markOrigin = markInfo->localOrigin;
     visitorContext.markDir = markDir;
     visitorContext.clipPlanes = clipPlanes;
+    // The VertList callback copies the base-mesh vertices straight through (the
+    // mark is built in model-local space), so the vertex normals are already in
+    // the output space and the transform is identity.  These two fields were
+    // never set: R_MarkFragment_DoTriangle_0_ dereferences transformNormalMatrix,
+    // and the pre-fix ILP32 `+24` read happened to name this same slot, so it
+    // was an uninitialized-pointer read.  Define it instead of trusting the
+    // stack (the crash fix above only got us far enough to reach it).
+    static const float kIdentityTransform[4][3] = {
+        { 1.0f, 0.0f, 0.0f },
+        { 0.0f, 1.0f, 0.0f },
+        { 0.0f, 0.0f, 1.0f },
+        { 0.0f, 0.0f, 0.0f },
+    };
+    visitorContext.transformMatrix = kIdentityTransform;
+    visitorContext.transformNormalMatrix = kIdentityTransform;
 
     Vec3AddScalar(markInfo->localOrigin, -markInfo->radius, aabbMins);
     Vec3AddScalar(markInfo->localOrigin, markInfo->radius, aabbMaxs);

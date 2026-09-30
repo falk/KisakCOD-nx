@@ -1,5 +1,6 @@
 #include <universal/q_shared.h>
 #include "q_shared.h"
+#include "q_stricmp.h"
 
 #include "../qcommon/qcommon.h"
 #include <qcommon/mem_track.h>
@@ -45,7 +46,7 @@ int I_stricmp(const char* s0, const char* s1)
     iassert(s0);
     iassert(s1);
 
-    return I_strnicmp(s0, s1, 0x7FFFFFFF);
+    return qstr::Icmp(s0, s1);
 }
 
 const char *__cdecl I_stristr(const char *s0, const char *substr)
@@ -73,28 +74,7 @@ const char *__cdecl I_stristr(const char *s0, const char *substr)
 
 int I_strnicmp(const char* s0, const char* s1, int n)
 {
-    int c1; // [esp+0h] [ebp-8h]
-    int c0; // [esp+4h] [ebp-4h]
-
-    do
-    {
-        c0 = *(uint8_t*)s0;
-        c1 = *(uint8_t*)s1;
-        ++s0;
-        ++s1;
-        if (!n--)
-            return 0;
-        if (c0 != c1)
-        {
-            if (I_isupper(c0))
-                c0 += 32;
-            if (I_isupper(c1))
-                c1 += 32;
-            if (c0 != c1)
-                return 2 * (c0 >= c1) - 1;
-        }
-    } while (c0);
-    return 0;
+    return qstr::Nicmp(s0, s1, n);
 }
 
 bool I_islower(int c)
@@ -767,24 +747,24 @@ void __cdecl Info_RemoveKey_Big(char *s, const char *key)
 
 bool __cdecl Info_Validate(const char *s)
 {
-    int v1; // eax
-    int v3; // eax
+    const char *v1; // eax
+    const char *v3; // eax
 
-    v1 = (int)strchr(s, 0x22u);
+    v1 = strchr(s, 0x22u);
 
     if (v1)
         return 0;
 
-    v3 = (int)strchr(s, 0x3Bu);
+    v3 = strchr(s, 0x3Bu);
 
     return v3 == 0;
 }
 
 void __cdecl Info_SetValueForKey(char *s, const char *key, const char *value)
 {
-    int v3; // eax
-    int v4; // eax
-    int v5; // eax
+    const char *v3; // eax
+    const char *v4; // eax
+    const char *v5; // eax
     int j; // [esp+54h] [ebp-818h]
     char c; // [esp+5Bh] [ebp-811h]
     char cleanValue[1028]; // [esp+5Ch] [ebp-810h] BYREF
@@ -812,21 +792,21 @@ void __cdecl Info_SetValueForKey(char *s, const char *key, const char *value)
         if (j >= 1024)
             MyAssertHandler(".\\universal\\q_shared.cpp", 1275, 0, "%s", "j < MAX_INFO_STRING");
         cleanValue[j] = 0;
-        v3 = (int)strchr(key, 0x5Cu);
+        v3 = strchr(key, 0x5Cu);
         if (v3)
         {
             Com_Printf(CON_CHANNEL_SYSTEM, "Can't use keys with a \\ key: %s value: %s", key, value);
         }
         else
         {
-            v4 = (int)strchr(key, 0x3Bu);
+            v4 = strchr(key, 0x3Bu);
             if (v4)
             {
                 Com_Printf(CON_CHANNEL_SYSTEM, "Can't use keys with a semicolon. key: %s value: %s", key, value);
             }
             else
             {
-                v5 = (int)strchr(key, 0x22u);
+                v5 = strchr(key, 0x22u);
                 if (v5)
                 {
                     Com_Printf(CON_CHANNEL_SYSTEM, "Can't use keys with a \". key: %s value: %s", key, value);
@@ -1036,13 +1016,13 @@ bool __cdecl ParseConfigStringToStructCustomSize(
 #endif
                     {
                         v9 = FX_Register(src);
-                        *(uint32_t *)&pStruct[v20->iOffset] = (uint32_t)v9;
+                        *reinterpret_cast<uintptr_t *>(&pStruct[v20->iOffset]) = reinterpret_cast<uintptr_t>(v9);
                     }
                     break;
                 case CSPFT_XMODEL:
                     I_strncpyz(dest, src, 0x2000);
                     v22 = R_RegisterModel(dest);
-                    *(uint32_t *)&pStruct[v20->iOffset] = (uint32_t)v22;
+                    *reinterpret_cast<uintptr_t *>(&pStruct[v20->iOffset]) = reinterpret_cast<uintptr_t>(v22);
                     if (!v22)
                         v18 = 1;
                     break;
@@ -1052,12 +1032,12 @@ bool __cdecl ParseConfigStringToStructCustomSize(
 #endif
                     {
                         v10 = Material_RegisterHandle(src, IMAGE_TRACK_MISC);
-                        *(uint32_t *)&pStruct[v20->iOffset] = (uint32_t)v10;
+                        *reinterpret_cast<uintptr_t *>(&pStruct[v20->iOffset]) = reinterpret_cast<uintptr_t>(v10);
                     }
                     break;
                 case CSPFT_SOUND:
                     SoundAlias = Com_FindSoundAlias(src);
-                    *(uint32_t *)&pStruct[v20->iOffset] = (uint32_t)SoundAlias;
+                    *reinterpret_cast<uintptr_t *>(&pStruct[v20->iOffset]) = reinterpret_cast<uintptr_t>(SoundAlias);
                     break;
                 default:
                     if (v20->iFieldType >= CSPFT_STRING)

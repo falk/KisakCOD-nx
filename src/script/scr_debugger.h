@@ -1,4 +1,5 @@
 #pragma once
+#include <cstring>
 #include "scr_variable.h"
 #include "scr_parser.h"
 #include "scr_yacc.h"
@@ -11,7 +12,9 @@ struct debugger_sval_s // sizeof=0x4
 {
     debugger_sval_s *next;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(debugger_sval_s) == 0x4);
+#endif
 
 struct scr_localVar_t // sizeof=0x8
 {                                       // ...
@@ -36,15 +39,33 @@ static_assert(sizeof(scr_block_s) == 0x218);
 
 union sval_u // sizeof=0x4
 {                                       // ...
+    // LP64: this union is 0x4 bytes on the ILP32 reference ABI (every
+    // member, including the pointer ones, fits in 4 bytes there), but
+    // widens to hold real 8-byte pointers (node/codePosValue/
+    // debugString/block) under LP64. Copying only `type` (the first
+    // 4-byte member) copied the *whole* union by accident on ILP32 --
+    // the standard union-aliasing shortcut this codebase's dvar/LP64
+    // fixes already retired elsewhere -- but silently drops the high 4
+    // bytes of any pointer member under LP64, corrupting yacc's parse
+    // stack. Copy every byte instead.
     sval_u& operator=(const sval_u &other)
     {
-        this->type = other.type;
+        std::memcpy(this, &other, sizeof(sval_u));
         return *this;
     }
     sval_u &operator=(sval_u &other)
     {
-        this->type = other.type;
+        std::memcpy(this, &other, sizeof(sval_u));
         return *this;
+    }
+
+    // Node builders take sval_u arguments by value.  The implicit union copy
+    // constructor was another ILP32-era whole-union shortcut; make this path
+    // just as explicit as assignment so every pointer-bearing parse value
+    // retains all LP64 bits while moving through yacc and the compiler.
+    sval_u(const sval_u &other)
+    {
+        std::memcpy(this, &other, sizeof(sval_u));
     }
 
 
@@ -67,7 +88,9 @@ union sval_u // sizeof=0x4
     const char *debugString;
     scr_block_s *block;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(sval_u) == 0x4);
+#endif
 
 struct ScriptExpression_t // sizeof=0xC
 {                                       // ...
@@ -75,7 +98,9 @@ struct ScriptExpression_t // sizeof=0xC
     int breakonExpr;                    // ...
     debugger_sval_s *exprHead;          // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(ScriptExpression_t) == 0xC);
+#endif
 
 struct Scr_SelectedLineInfo // sizeof=0xC
 {                                       // ...
@@ -98,7 +123,9 @@ struct Scr_Breakpoint // sizeof=0x1C
     Scr_Breakpoint *next;               // ...
     Scr_Breakpoint **prev;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(Scr_Breakpoint) == 0x1C);
+#endif
 
 struct Scr_WatchElement_s // sizeof=0x64
 {
@@ -137,28 +164,36 @@ struct Scr_WatchElement_s // sizeof=0x64
     Scr_WatchElement_s *childHead;
     Scr_WatchElement_s *next;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(Scr_WatchElement_s) == 0x64);
+#endif
 
 struct Scr_OpcodeList_s // sizeof=0x8
 {
     char *codePos;
     Scr_OpcodeList_s *next;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(Scr_OpcodeList_s) == 0x8);
+#endif
 
 struct Scr_WatchElementNode_s // sizeof=0x8
 {
     Scr_WatchElement_s *element;
     Scr_WatchElementNode_s *next;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(Scr_WatchElementNode_s) == 0x8);
+#endif
 
 struct Scr_WatchElementDoubleNode_t // sizeof=0x8
 {
     Scr_WatchElementNode_s *list;
     Scr_WatchElementNode_s *removedList;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(Scr_WatchElementDoubleNode_t) == 0x8);
+#endif
 
 struct scrDebuggerGlob_t // sizeof=0x2B8
 {                                       // ...
@@ -220,7 +255,9 @@ struct scrDebuggerGlob_t // sizeof=0x2B8
     int breakpointCount;                // ...
     int gainFocusTime;                  // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(scrDebuggerGlob_t) == 0x2B8);
+#endif
 
 void __cdecl TRACK_scr_debugger();
 void __cdecl Scr_KeyEvent(int key);
@@ -254,7 +291,7 @@ const char *__cdecl Scr_GetElementThreadPos(Scr_WatchElement_s *element);
 void __cdecl Scr_SetElementRefText(Scr_WatchElement_s *element, char *fieldText);
 void __cdecl Scr_ConnectElementChildren(Scr_WatchElement_s *parentElement);
 void __cdecl Scr_SortElementChildren(Scr_WatchElement_s *parentElement);
-int __cdecl CompareThreadElements(int *arg1, int *arg2);
+int __cdecl CompareThreadElements(struct Scr_WatchElement_s **arg1, struct Scr_WatchElement_s **arg2);
 Scr_WatchElement_s *__cdecl Scr_CreateWatchElement(char *text, Scr_WatchElement_s **prevElem, const char *name);
 void __cdecl Scr_Evaluate();
 void __cdecl Scr_CheckBreakonNotify(
@@ -276,6 +313,9 @@ void __cdecl Scr_ShutdownDebuggerMain();
 void __cdecl Scr_InitDebugger();
 void __cdecl Scr_ShutdownDebugger();
 void __cdecl Scr_InitDebuggerSystem();
+// Switch SP skips the debugger UI but still needs the debugger globals that
+// OP_breakpoint reads (scripts built with developer_script=1 emit it).
+void __cdecl Scr_InitDebuggerBootState();
 void Scr_InitBreakpoints();
 void __cdecl Scr_ShutdownDebuggerSystem(int restart);
 void __cdecl Scr_AddAssignmentPos(char *codePos);

@@ -5,6 +5,9 @@
 #include "r_dvars.h"
 #include "rb_backend.h"
 #include "rb_logfile.h"
+#include "r_dynres.h"
+#include "rb_halfres_particles.h"
+#include <deko9/deko9_native.h>
 
 
 //GfxRenderTarget *gfxRenderTargets 85b5db38     gfx_d3d : r_rendertarget.obj
@@ -78,35 +81,44 @@ void R_InitRenderTargets_PC()
         R_InitShadowmapRenderTarget(3, 512, 4u, &gfxRenderTargets[R_RENDERTARGET_SHADOWMAP_SPOT]);
         R_InitShadowCookieRenderTarget(&gfxRenderTargets[R_RENDERTARGET_SHADOWCOOKIE]);
         R_InitShadowCookieBlurRenderTarget(&gfxRenderTargets[R_RENDERTARGET_SHADOWCOOKIE_BLUR]);
+        // The DOF post-effect chain stores the circle of confusion in the
+        // alpha channel of POST_EFFECT_0/1 and PINGPONG_0 (dof_downsample writes
+        // it, dof_near_coc/smallBlur carry it).  The Switch swap chain reports
+        // D3DFMT_X8R8G8B8, which has no sampleable alpha, so creating these with
+        // backBufferFormat dropped the CoC and made postfx_dof blur the whole
+        // frame regardless of depth (the ADS blur bug).  They are intermediate
+        // offscreen targets, so give them a real alpha channel.
+        const _D3DFORMAT dofIntermediateFormat = D3DFMT_A8R8G8B8;
         R_InitFullscreenRenderTargetImage(
             5,
             FULLSCREEN_SCENE,
             2,
-            backBufferFormat,
+            dofIntermediateFormat,
             RENDERTARGET_USAGE_RENDER,
             &gfxRenderTargets[R_RENDERTARGET_POST_EFFECT_0]);
         R_InitFullscreenRenderTargetImage(
             6,
             FULLSCREEN_SCENE,
             2,
-            backBufferFormat,
+            dofIntermediateFormat,
             RENDERTARGET_USAGE_RENDER,
             &gfxRenderTargets[R_RENDERTARGET_POST_EFFECT_1]);
         R_InitFullscreenRenderTargetImage(
             7,
             FULLSCREEN_SCENE,
             2,
-            backBufferFormat,
+            dofIntermediateFormat,
             RENDERTARGET_USAGE_RENDER,
             &gfxRenderTargets[R_RENDERTARGET_PINGPONG_0]);
         R_InitFullscreenRenderTargetImage(
             8,
             FULLSCREEN_SCENE,
             2,
-            backBufferFormat,
+            dofIntermediateFormat,
             RENDERTARGET_USAGE_RENDER,
             &gfxRenderTargets[R_RENDERTARGET_PINGPONG_1]);
     }
+    R_DynResRegisterTargets();
 }
 
 void __cdecl R_ShareRenderTarget(GfxRenderTargetId idFrom, GfxRenderTargetId idTo)
@@ -370,6 +382,9 @@ void __cdecl R_InitShadowmapRenderTarget(
             v4 = R_ErrorDescription(hr);
             Com_Error(ERR_FATAL, "Couldn't create a %i x %i render target surface: %s\n", tileRes, totalHeight, v4);
         }
+        // D3D9 needs this colour target; the pass itself is depth only.
+        if (!Deko9_SetColorless(renderTarget->surface.color))
+            Com_Error(ERR_FATAL, "Shadow colour surface not accepted by Deko9_SetColorless");
     }
 }
 
@@ -480,6 +495,14 @@ void __cdecl R_InitFrameBufferRenderTarget_Win32(GfxRenderTarget *renderTarget)
     iassert( renderTarget );
     renderTarget->width = vidConfig.displayWidth;
     renderTarget->height = vidConfig.displayHeight;
+#ifdef __SWITCH__
+    {
+        char dbuf[160];
+        snprintf(dbuf, sizeof(dbuf),
+                 "R_InitFrameBufferRenderTarget_Win32: vidConfig=%dx%d -> renderTarget=%ux%u\n",
+                 vidConfig.displayWidth, vidConfig.displayHeight, renderTarget->width, renderTarget->height);
+    }
+#endif
     hr = dx.device->GetSwapChain(0, &dx.windows[0].swapChain);
     if (hr < 0)
     {
@@ -522,8 +545,16 @@ void __cdecl R_InitFrameBufferRenderTarget_Win32(GfxRenderTarget *renderTarget)
             depthStencilWidth,
             depthStencilHeight,
             dx.depthStencilFormat,
+#ifdef __SWITCH__
+            // The Switch backbuffer is created single-sample (r_init.cpp:4208);
+            // a multisampled depth cannot attach to it and the scene pass's
+            // depth would be dropped entirely.
+            D3DMULTISAMPLE_NONE,
+            0,
+#else
             dx.multiSampleType,
             dx.multiSampleQuality,
+#endif
             0,
             &renderTarget->surface.depthStencil,
             0);
@@ -547,10 +578,15 @@ _D3DFORMAT __cdecl R_InitFrameBufferRenderTarget()
     _D3DSURFACE_DESC surfaceDesc; // [esp+0h] [ebp-20h] BYREF
 
     R_InitFrameBufferRenderTarget_Win32(&gfxRenderTargets[R_RENDERTARGET_FRAME_BUFFER]);
-    R_ShareRenderTarget(R_RENDERTARGET_FRAME_BUFFER, R_RENDERTARGET_SCENE);
+    gfxRenderTargets[R_RENDERTARGET_FRAME_BUFFER].surface.color->GetDesc(&surfaceDesc);
+    // r_dynres: the scene has its own colour + depth target, sized per
+    // frame, upscaled into the back buffer before the 2D pass (r_dynres.h).
+    if (R_DynResEnabled() && !g_allocateMinimalResources)
+        R_DynResInitSceneTarget(&gfxRenderTargets[R_RENDERTARGET_SCENE], (uint32_t)surfaceDesc.Format);
+    else
+        R_ShareRenderTarget(R_RENDERTARGET_FRAME_BUFFER, R_RENDERTARGET_SCENE);
     v0 = R_DescribeFormat(D3DFMT_A8R8G8B8);
     Com_Printf(CON_CHANNEL_GFX, "Requested frame buffer to be %s\n", v0);
-    gfxRenderTargets[R_RENDERTARGET_FRAME_BUFFER].surface.color->GetDesc(&surfaceDesc);
     iassert( surfaceDesc.Format != D3DFMT_UNKNOWN );
     v1 = R_DescribeFormat(surfaceDesc.Format);
     Com_Printf(CON_CHANNEL_GFX, "DirectX returned a frame buffer that is %s\n", v1);
@@ -580,6 +616,8 @@ void __cdecl R_ShutdownRenderTargets()
     }
     memset(gfxRenderTargets, 0, sizeof(gfxRenderTargets));
     dx.singleSampleDepthStencilSurface = 0;
+    R_DynResShutdownTargets();
+    RB_HrpShutdown();
 }
 
 

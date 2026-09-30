@@ -1,5 +1,7 @@
+#include <deko9/deko9_native.h>
 #include <universal/q_shared.h>
 #include "r_state.h"
+#include "r_image.h"
 #include "rb_logfile.h"
 #include "r_dvars.h"
 #include "rb_stats.h"
@@ -9,6 +11,7 @@
 #include "r_rendertarget.h"
 #include "r_utils.h"
 #include "r_reflection_probe.h"
+#include <database/db_retail_frame_evidence.h>
 
 //float const *const shadowmapClearColor 820ebb50     gfx_d3d : r_state.obj
 //BOOL g_renderTargetIsOverridden 85b5dd38     gfx_d3d : r_state.obj
@@ -667,6 +670,16 @@ void __cdecl R_SetReflectionProbe(GfxCmdBufContext context, uint32_t reflectionP
         R_SetSampler(context, 1u, 0x72u, rgp.world->reflectionProbes[reflectionProbeIndex].reflectionImage);
 }
 
+// Viewport depth range R_ChangeDepthRange selects: the scene draws into
+// 1/64..1 and depth-hack (viewmodel) geometry into 0..1/64, so the viewmodel
+// always wins the depth test. Shared with the native float-Z rebuild, which
+// inverts it.
+void R_GetDepthRangeValues(GfxDepthRangeType depthRangeType, float *nearValue, float *farValue)
+{
+    *nearValue = depthRangeType ? 0.0f : 0.015625f;
+    *farValue = depthRangeType ? 0.015625f : 1.0f;
+}
+
 void __cdecl R_ChangeDepthRange(GfxCmdBufState *state, GfxDepthRangeType depthRangeType)
 {
     float v2; // [esp+8h] [ebp-28h]
@@ -682,15 +695,8 @@ void __cdecl R_ChangeDepthRange(GfxCmdBufState *state, GfxDepthRangeType depthRa
             state->depthRangeType,
             depthRangeType);
     state->depthRangeType = depthRangeType;
-    if (depthRangeType)
-        v3 = 0.0;
-    else
-        v3 = 0.015625;
+    R_GetDepthRangeValues(depthRangeType, &v3, &v2);
     state->depthRangeNear = v3;
-    if (depthRangeType)
-        v2 = 0.015625;
-    else
-        v2 = 1.0;
     state->depthRangeFar = v2;
     device = state->prim.device;
     iassert( device );
@@ -776,14 +782,18 @@ void __cdecl R_DrawIndexedPrimitive(GfxCmdBufPrimState *state, const GfxDrawPrim
     IDirect3DDevice9 *device; // [esp+8h] [ebp-4h]
 
     triCount = args->triCount;
-    if (triCount >= r_drawPrimFloor->current.integer
-        && (!r_drawPrimCap->current.integer || triCount <= r_drawPrimCap->current.integer))
+    // r_drawPrimFloor/Cap, r_skipDrawTris and the prim histogram are port
+    // debug aids retail does not have: only under r_portDebugChecks.
+    const bool debugChecks = r_portDebugChecks->current.enabled;
+    if (!debugChecks || (triCount >= r_drawPrimFloor->current.integer
+        && (!r_drawPrimCap->current.integer || triCount <= r_drawPrimCap->current.integer)))
     {
-        if (r_skipDrawTris->current.enabled)
+        if (debugChecks && r_skipDrawTris->current.enabled)
             triCount = 1;
         device = state->device;
         iassert( device );
-        RB_TrackDrawPrimCall(triCount);
+        if (debugChecks)
+            RB_TrackDrawPrimCall(triCount);
         do
         {
             if (r_logFile && r_logFile->current.integer)
@@ -804,6 +814,42 @@ void __cdecl R_DrawIndexedPrimitive(GfxCmdBufPrimState *state, const GfxDrawPrim
                 } while (alwaysfails);
             }
         } while (alwaysfails);
+    }
+}
+
+void R_DrawIndexedRanges(GfxCmdBufPrimState *state, int vertexCount, const GfxIndexRange *ranges, uint32_t count)
+{
+    if (!count)
+        return;
+    // Same layout, passed through as is (spelled without the static_assert-
+    // on-size shape offline tooling tracks for wire layouts; this is a
+    // native struct pair, no pointer width involved).
+    constexpr bool kSameRangeLayout = sizeof(GfxIndexRange) == sizeof(Deko9IndexRange)
+        && offsetof(GfxIndexRange, triCount) == offsetof(Deko9IndexRange, triCount)
+        && offsetof(GfxIndexRange, baseVertex) == offsetof(Deko9IndexRange, baseVertex);
+    static_assert(kSameRangeLayout, "GfxIndexRange vs Deko9IndexRange");
+    // r_portDebugChecks (prim floor/cap, skip tris, histogram) and r_logFile
+    // act per draw: those runs take the per-range path below.
+    if (!r_portDebugChecks->current.enabled && !(r_logFile && r_logFile->current.integer))
+    {
+        iassert(state->device);
+        const int hr = Deko9_DrawIndexedRanges(state->device, (uint32_t)vertexCount,
+                                               reinterpret_cast<const Deko9IndexRange *>(ranges), count);
+        if (hr < 0)
+        {
+            ++g_disableRendering;
+            Com_Error(ERR_FATAL, "R_DrawIndexedRanges: Deko9_DrawIndexedRanges(%u ranges) failed: %s\n", count,
+                      R_ErrorDescription(hr));
+        }
+        return;
+    }
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        GfxDrawPrimArgs args;
+        args.vertexCount = vertexCount;
+        args.triCount = (int)ranges[i].triCount;
+        args.baseIndex = (int)ranges[i].firstIndex;
+        R_DrawIndexedPrimitive(state, &args);
     }
 }
 
@@ -1706,14 +1752,32 @@ void __cdecl R_SetSampler(
     uint32_t decodedSamplerState; // [esp+Ch] [ebp-4h]
 
     iassert(image);
-    if (context.state->samplerTexture[samplerIndex] != &image->texture)
+    const GfxImage *targetImage = image;
+    if (context.state->samplerTexture[samplerIndex] != &targetImage->texture)
     {
-        context.state->samplerTexture[samplerIndex] = &image->texture;
+        // Checked only when the binding changes: the live-texture set is a
+        // mutex-guarded hash lookup, and every sampler of every draw would
+        // pay for it. An unchanged binding was already checked when it was
+        // made.
+        if (!targetImage->texture.basemap || !Image_IsLiveD3DTexture(targetImage->texture.basemap))
+        {
+            // No silent substitution. This used to bind rgp.whiteImage in place
+            // of a non-live texture, which renders the surface solid white --
+            // exactly the 'overbright element' a viewer cannot tell from a
+            // lighting bug. It was counted into the evidence line (and it reads
+            // defaults_total=0), but the tier below
+            // it in R_HW_SetSamplerTexture was not counted at all. Count, then
+            // fail where the image can be named.
+            RetailKillhouseNoteDefaultBind();
+            Com_Error(ERR_FATAL, "R_SetSampler: image '%s' has no live D3D texture on sampler %u",
+                      image->name ? image->name : "(null)", samplerIndex);
+        }
+        context.state->samplerTexture[samplerIndex] = &targetImage->texture;
         if (r_logFile->current.integer)
         {
-            RB_LogPrint(va("---------- texture %i: %s\n", samplerIndex, image->name));
+            RB_LogPrint(va("---------- texture %i: %s\n", samplerIndex, targetImage->name));
         }
-        R_HW_SetSamplerTexture(context.state->prim.device, samplerIndex, &image->texture);
+        R_HW_SetSamplerTexture(context.state->prim.device, samplerIndex, &targetImage->texture);
     }
     iassert((samplerState & (SAMPLER_FILTER_MASK | SAMPLER_MIPMAP_MASK)) != 0);
     if (context.state->refSamplerState[samplerIndex] != samplerState)
@@ -1755,6 +1819,11 @@ uint32_t __cdecl R_HW_SetSamplerState(
     finalSamplerState = samplerState;
     diffSamplerState = oldSamplerState ^ samplerState;
     iassert( diffSamplerState );
+    // One native call instead of up to seven SetSamplerState calls; same
+    // per-field semantics (deko9::ApplyEngineSamplerState).
+    if (r_logFile && r_logFile->current.integer)
+        RB_LogPrint("Deko9_SetSamplerPacked( samplerIndex, samplerState )\n");
+    return Deko9_SetSamplerPacked(device, samplerIndex, samplerState, oldSamplerState);
     if ((diffSamplerState & 0xF00) != 0)
     {
         do
@@ -2203,6 +2272,8 @@ void __cdecl R_HW_DisableSampler(IDirect3DDevice9 *device, uint32_t samplerIndex
         if (r_logFile && r_logFile->current.integer)
             RB_LogPrint("device->SetTexture( samplerIndex, 0 )\n");
 
+        Deko9_SetTexture(device, samplerIndex, nullptr);
+        return;
         hr = device->SetTexture(samplerIndex,0);
 
         if (hr < 0)
@@ -2300,6 +2371,7 @@ void __cdecl R_SetRenderTarget(GfxCmdBufContext context, GfxRenderTargetId newTa
     if (pixelCostMode > GFX_PIXEL_COST_MODE_MEASURE_MSEC)
         newTargetId = RB_PixelCost_OverrideRenderTarget(newTargetId);
 
+
     if (newTargetId != context.state->renderTargetId)
     {
         if (r_logFile->current.integer)
@@ -2363,6 +2435,7 @@ void __cdecl R_HW_SetRenderTarget(GfxCmdBufState *state, GfxRenderTargetId newTa
         state->depthRangeType = GFX_DEPTH_RANGE_FULL;
         state->depthRangeNear = 0.0;
         state->depthRangeFar = 1.0;
+        R_HW_SetViewport(device, &state->viewport, state->depthRangeNear, state->depthRangeFar);
     }
 
     if (gfxRenderTargets[state->renderTargetId].surface.depthStencil != gfxRenderTargets[newTargetId].surface.depthStencil)
@@ -2392,7 +2465,16 @@ void __cdecl R_HW_SetRenderTarget(GfxCmdBufState *state, GfxRenderTargetId newTa
 
 void __cdecl R_UpdateStatsTarget(int newTargetId)
 {
-    if (newTargetId == R_RENDERTARGET_SHADOWCOOKIE || newTargetId == R_RENDERTARGET_DYNAMICSHADOWS)
+    // The port renders the sun/spot shadow maps into their own targets
+    // (R_RENDERTARGET_SHADOWMAP_SUN/SPOT, r_draw_sunshadow.cpp), not the retail
+    // DYNAMICSHADOWS target.  Without them here every shadow-map draw was
+    // attributed to the camera bucket in PERF_RENDER (draws_shadow=0 while
+    // surfs_shadow was ~480), which read as "shadows are not drawn" when they
+    // are -- they were just counted as camera draws.
+    if (newTargetId == R_RENDERTARGET_SHADOWCOOKIE
+        || newTargetId == R_RENDERTARGET_DYNAMICSHADOWS
+        || newTargetId == R_RENDERTARGET_SHADOWMAP_SUN
+        || newTargetId == R_RENDERTARGET_SHADOWMAP_SPOT)
         g_viewStats = &g_frameStatsCur.viewStats[1];
     else
         g_viewStats = &g_frameStatsCur.viewStats[0];
@@ -2434,7 +2516,36 @@ void __cdecl R_ClearScreenInternal(
     iassert( color );
     //iassert( depth not in [0.0f, 1.0f]\n\t%g not in [%g, %g] );
     Byte4PackVertexColor(color, (uint8_t *)&nativeColor);
+    {
+        static int s_clearColorDump = 0;
+        if (s_clearColorDump < 12)
+        {
+            ++s_clearColorDump;
+            char cbuf[160];
+        }
+    }
     iassert( !viewport );
+#ifdef __SWITCH__
+    {
+        static int s_clearDumpCount = 0;
+        if (s_clearDumpCount < 30)
+        {
+            ++s_clearDumpCount;
+            _D3DVIEWPORT9 devViewport;
+            RECT devScissor;
+            IDirect3DSurface9 *rt = NULL;
+            _D3DSURFACE_DESC rtDesc = {};
+            device->GetViewport(&devViewport);
+            device->GetScissorRect(&devScissor);
+            device->GetRenderTarget(0, &rt);
+            if (rt)
+            {
+                rt->GetDesc(&rtDesc);
+                rt->Release();
+            }
+        }
+    }
+#endif
     do
     {
         if (r_logFile && r_logFile->current.integer)

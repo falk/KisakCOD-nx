@@ -610,7 +610,10 @@ SourceBufferInfo *__cdecl Scr_GetNewSourceBuffer()
         iassert(scrParserPub.sourceBufferLookupLen < scrParserGlob.sourceBufferLookupMaxLen);
 
         newSourceBufferInfo = (char *)Hunk_AllocDebugMem(sizeof(SourceBufferInfo) * scrParserGlob.sourceBufferLookupMaxLen);
-        Com_Memcpy(newSourceBufferInfo, (char *)scrParserPub.sourceBufferLookup, 44 * scrParserPub.sourceBufferLookupLen);
+        // LP64: SourceBufferInfo holds three pointers (56 bytes here, 44 on
+        // ILP32); the decompiled 44-byte stride dropped the tail of every
+        // entry past the first on growth (found via LWSS/KIWI x64 part 05).
+        Com_Memcpy(newSourceBufferInfo, scrParserPub.sourceBufferLookup, sizeof(SourceBufferInfo) * scrParserPub.sourceBufferLookupLen);
         Hunk_FreeDebugMem();
         scrParserPub.sourceBufferLookup = (SourceBufferInfo *)newSourceBufferInfo;
     }
@@ -691,7 +694,7 @@ char *__cdecl Scr_ReadFile(const char *filename, char *extFilename, const char *
 {
     int file; // [esp+24h] [ebp-4h] BYREF
 
-    if (*(_BYTE *)fs_gameDirVar->current.integer)
+    if (fs_gameDirVar->current.string[0])
     {
         if ((FS_FOpenFileRead(extFilename, &file) & 0x80000000) != 0)
         {
@@ -1330,8 +1333,8 @@ char __cdecl Scr_PrintProfileTimes(float minTime)
             maxNameLength = 0;
         for (profileIndexa = 0; profileIndexa < 40; ++profileIndexa)
         {
-            v4 = (int)&profile->profileScriptNames[profileIndexa][1];
-            v5 = (uint32_t)&profile->profileScriptNames[profileIndexa][strlen(profile->profileScriptNames[profileIndexa])
+            v4 = (int)(intptr_t)&profile->profileScriptNames[profileIndexa][1];
+            v5 = (uint32_t)(intptr_t)&profile->profileScriptNames[profileIndexa][strlen(profile->profileScriptNames[profileIndexa])
                 + 1];
             if (v5 - v4 > maxNameLength)
                 maxNameLength = v5 - v4;
@@ -1349,7 +1352,7 @@ char __cdecl Scr_PrintProfileTimes(float minTime)
         Com_Printf(CON_CHANNEL_PARSERSCRIPT, "\n");
         for (profileIndexc = 0; profileIndexc < profileCount; ++profileIndexc)
         {
-            opcodeLookup = (OpcodeLookup *)&sortedOpcodeLookup[24 * profileIndexc];
+            opcodeLookup = &sortedOpcodeLookup[profileIndexc]; // LP64: was byte stride 24 on a typed pointer
             v7 = *((float *)Sys_GetValue(0) + 20782);
             v6 = *((float *)Sys_GetValue(0) + 20782);
             Com_Printf(
@@ -1535,7 +1538,7 @@ void __cdecl RuntimeErrorInternal(int channel, char *codePos, uint32_t index, co
             Com_PrintError(channel, "called from:\n");
             Scr_PrintPrevCodePos(
                 CON_CHANNEL_DONT_FILTER,
-                (char *)scrVmPub.stack[3 * i - 96].u.intValue,
+                const_cast<char *>(scrVmPub.function_frame_start[i].fs.pos),
                 scrVmPub.function_frame_start[i].fs.localId == 0);
         }
         Com_PrintError(channel, "started from:\n");
@@ -1543,4 +1546,3 @@ void __cdecl RuntimeErrorInternal(int channel, char *codePos, uint32_t index, co
     }
     Com_PrintError(channel, "************************************\n");
 }
-

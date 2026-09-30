@@ -4,16 +4,32 @@
 
 #include <universal/q_shared.h>
 #include "cl_input.h"
+#include <universal/assertive.h>
+#include <database/db_retail_decode_material.h>
+#include <platform/switch/switch_diag_dvars.h>
 #include <qcommon/mem_track.h>
 #include <qcommon/cmd.h>
 #include <cgame/cg_main.h>
 #include <game/g_local.h>
+#include <game/g_main.h>
 #include <aim_assist/aim_assist.h>
+#include <universal/critical_section.h>
+#ifdef __SWITCH__
+#include <platform/switch/switch_input_lifecycle.h>
+#include <port/switch_gyro.h>
+#else
 #include <win32/win_local.h>
+#endif
 #include <qcommon/msg.h>
 #include <devgui/devgui.h>
 #include <ui/ui.h>
 #include <gfx_d3d/r_dvars.h>
+#include <gfx_d3d/r_cinematic.h>
+#include <qcommon/sys_event.h>
+#include <ui/keycodes.h>
+#include <bgame/bg_local.h>
+#include <game/bullet.h>
+#include <EffectsCore/fx_system.h>
 
 const dvar_t *cl_stanceHoldTime;
 const dvar_t *cl_analog_attack_threshold;
@@ -971,6 +987,24 @@ void __cdecl CL_KeyMove(usercmd_s *cmd)
 }
 #endif
 
+
+
+#ifdef __SWITCH__
+// switch_input_lifecycle.cpp (IN_Frame): the pad's A/B are usercmd buttons
+// while the player is being driven and no UI key catcher is up; only then
+// are their menu key translations withheld.
+extern "C" int Switch_ClientGameplayActive(void)
+{
+    if (clientUIActives[0].connectionState != CA_ACTIVE)
+        return 0;
+    if (Key_IsCatcherActive(0, 0x3F))
+        return 0;
+    if (cl_paused->current.integer == 1)
+        return 0;
+    return 1;
+}
+#endif
+
 int __cdecl CL_AllowInput()
 {
     int integer; // r11
@@ -995,7 +1029,194 @@ int __cdecl CL_AllowInput()
 
 void __cdecl CL_GamepadMove(usercmd_s *cmd)
 {
-    // KISAKTODO
+#ifdef __SWITCH__
+    // Narrow SP gamepad command builder.  The old
+    // decompiled body below stays disabled; this wires only what SP actually
+    // consumes: left stick -> forward/right, right stick -> yaw/pitch, and
+    // jump/stance/use through the existing usercmd button bits.  Existing
+    // profile dvars (cl_yawspeed/cl_pitchspeed/input_viewSensitivity/
+    // input_invertPitch) carry the sensitivity and invert-look settings.
+    const SwitchInputState *pad = Switch_GetInputState();
+    SwitchGameplayInput gamepad;
+    int forward;
+    int side;
+    float speed;
+    float yaw;
+    float pitch;
+
+    if (pad == NULL || !Switch_InputPadActive())
+        return;
+
+    Switch_InputBuildGameplay(pad, input_invertPitch->current.enabled, &gamepad);
+
+    forward = (int)(gamepad.forward * 127.0f);
+    side = (int)(gamepad.right * 127.0f);
+    cmd->forwardmove = ClampChar(cmd->forwardmove + forward);
+    cmd->rightmove = ClampChar(cmd->rightmove + side);
+    cmd->upmove = ClampChar(cmd->upmove + (int)(gamepad.up * 127.0f));
+
+    speed = 0.001f * (float)cls.frametime;
+    yaw = gamepad.yaw * cl_yawspeed->current.value * speed * input_viewSensitivity->current.value;
+    pitch = gamepad.pitch * cl_pitchspeed->current.value * speed * input_viewSensitivity->current.value;
+    clients[0].viewangles[YAW] -= yaw;
+    clients[0].viewangles[PITCH] -= pitch;
+
+    // ADS is a held request bit server-side (PM_UpdateAimDownSightFlag reads
+    // cmd.buttons & BUTTON_ADS every command), same as +speed held. Read
+    // here (before the button-mapping block below sets BUTTON_ADS in cmd)
+    // so gyro_enable 2 (ADS-only, the default) can gate on the same frame's
+    // ZL state.
+    const bool switchAdsHeld = (gamepad.buttons & SWITCH_INPUT_BUTTON_ZL) != 0;
+
+    // Gyro aiming: a view-angle delta added directly here, not through the
+    // stick's cl_yawspeed/cl_pitchspeed ramped turn-rate curve above, so it
+    // stays frame-rate independent and 1:1 with physical rotation (the same
+    // site mouse-look deltas are added in CL_MouseMove). Switch_GyroFrame
+    // (switch_input_lifecycle.cpp's IN_Frame) already sampled and filtered
+    // the sensor this frame; this is only the gate + apply.
+    if (Switch_GyroEnableMode() != SWITCH_GYRO_ENABLE_OFF)
+    {
+        SwitchGyroConfig gateCfg = {};
+        gateCfg.enable = Switch_GyroEnableMode();
+
+        const int viewFrozen = (clients[0].snap.ps.pm_flags & PMF_FROZEN) != 0;
+        const int playerDead = clients[0].snap.ps.pm_type == PM_DEAD
+            || clients[0].snap.ps.pm_type == PM_DEAD_LINKED;
+        const uint64_t ratchetMask = Switch_GyroRatchetButtonMask();
+        const int ratchetHeld = ratchetMask != 0 && (gamepad.buttons & ratchetMask) != 0;
+
+        if (Switch_GyroShouldApply(&gateCfg, Switch_ClientGameplayActive(), viewFrozen, playerDead,
+                                   switchAdsHeld ? 1 : 0, ratchetHeld))
+        {
+            float gyroYawDeltaDeg = 0.0f;
+            float gyroPitchDeltaDeg = 0.0f;
+            Switch_GyroGetDelta(&gyroYawDeltaDeg, &gyroPitchDeltaDeg);
+            clients[0].viewangles[YAW] -= gyroYawDeltaDeg;
+            clients[0].viewangles[PITCH] -= gyroPitchDeltaDeg;
+        }
+    }
+
+    // Retail console layout (see SWITCH_INPUT_GAMEPLAY_BUTTON_COUNT).
+    if (gamepad.buttons & SWITCH_INPUT_BUTTON_ZR)
+        cmd->buttons |= BUTTON_ATTACK;
+    if (switchAdsHeld)
+        cmd->buttons |= BUTTON_ADS;
+    if (gamepad.buttons & SWITCH_INPUT_BUTTON_A)
+        cmd->buttons |= BUTTON_JUMP;
+    if (gamepad.buttons & SWITCH_INPUT_BUTTON_B)
+    {
+        cmd->buttons |= BUTTON_CROUCH;
+        cmd->buttons |= BUTTON_TEMP_STANCE;
+    }
+    // Console use/reload key.  These two face buttons are bound by *physical
+    // position*, not by the Xbox label the retail bind list uses: the west
+    // button (Switch Y, Xbox X) reloads, the north button (Switch X, Xbox Y)
+    // swaps weapons.  Binding them by label put reload on the north button,
+    // which is not where a console player's thumb expects it.
+    if (gamepad.buttons & SWITCH_INPUT_BUTTON_Y)
+        cmd->buttons |= BUTTON_USE_RELOAD;
+    if (gamepad.buttons & SWITCH_INPUT_BUTTON_R)
+        cmd->buttons |= BUTTON_FRAG;
+    if (gamepad.buttons & SWITCH_INPUT_BUTTON_L)
+        cmd->buttons |= BUTTON_SMOKE;
+    if (gamepad.buttons & SWITCH_INPUT_BUTTON_STICKR)
+        cmd->buttons |= BUTTON_MELEE;
+    if (gamepad.buttons & SWITCH_INPUT_BUTTON_STICKL)
+        cmd->buttons |= BUTTON_SPRINT;
+    {
+        // Buttons retail console binds to *commands* rather than usercmd bits.
+        // Mission scripts gate hints and objectives on notifyOnCommand(...)
+        // (killhouse_code.gsc keyHint() waits, blocking and without a timeout,
+        // on "did_action_<action>"), and that notification only fires when the
+        // command is executed -- a usercmd bit never does. X already fires the
+        // real "weapnext" command (its handler is what switches the weapon);
+        // the rest only need to tell the script layer the player used the
+        // action, so they report the binding on the button's rising edge
+        // instead of executing it (the gameplay effect is the usercmd bit set
+        // above). Names match killhouse_code.gsc's registerActionBinding list.
+        static uint64_t s_prevGamepadButtons;
+        const uint64_t pressedButtons = gamepad.buttons & ~s_prevGamepadButtons;
+        const uint64_t releasedButtons = ~gamepad.buttons & s_prevGamepadButtons;
+        s_prevGamepadButtons = gamepad.buttons;
+        if ((pressedButtons || releasedButtons) && Switch_ClientGameplayActive())
+        {
+            if (pressedButtons & SWITCH_INPUT_BUTTON_X)
+                Cbuf_AddText(0, "weapnext\n");
+            if (pressedButtons & SWITCH_INPUT_BUTTON_ZR)
+                Cmd_NotifyScriptCommand("+attack");
+            if (pressedButtons & SWITCH_INPUT_BUTTON_ZL)
+            {
+                Cmd_NotifyScriptCommand("+toggleads_throw");
+                Cmd_NotifyScriptCommand("toggleads");
+            }
+            if (pressedButtons & SWITCH_INPUT_BUTTON_Y)
+            {
+                Cmd_NotifyScriptCommand("+reload");
+                Cmd_NotifyScriptCommand("+usereload");
+            }
+            if (pressedButtons & SWITCH_INPUT_BUTTON_A)
+            {
+                Cmd_NotifyScriptCommand("+moveup");
+                Cmd_NotifyScriptCommand("+gostand");
+            }
+            if (pressedButtons & SWITCH_INPUT_BUTTON_B)
+            {
+                Cmd_NotifyScriptCommand("+stance");
+                Cmd_NotifyScriptCommand("gocrouch");
+                Cmd_NotifyScriptCommand("togglecrouch");
+            }
+            if (pressedButtons & SWITCH_INPUT_BUTTON_STICKR)
+            {
+                Cmd_NotifyScriptCommand("+melee");
+                Cmd_NotifyScriptCommand("+melee_breath");
+            }
+            if (pressedButtons & SWITCH_INPUT_BUTTON_STICKL)
+            {
+                Cmd_NotifyScriptCommand("+sprint");
+                Cmd_NotifyScriptCommand("+breath_sprint");
+            }
+            if (pressedButtons & SWITCH_INPUT_BUTTON_R)
+            {
+                Cmd_NotifyScriptCommand("+frag");
+                Cmd_NotifyScriptCommand("+throw");
+            }
+            if (pressedButtons & SWITCH_INPUT_BUTTON_L)
+            {
+                Cmd_NotifyScriptCommand("+smoke");
+                Cmd_NotifyScriptCommand("+activate");
+                // killhouse_code.gsc registers "equip_C4" against +actionslot 4.
+                Cmd_NotifyScriptCommand("+actionslot 4");
+            }
+            if (releasedButtons & SWITCH_INPUT_BUTTON_L)
+            {
+                // killhouse_code.gsc:416 waits on player_flash, registered
+                // against the smoke key's *release* command.
+                Cmd_NotifyScriptCommand("-smoke");
+            }
+        }
+    }
+
+    {
+        extern const dvar_t *com_diagMarkers;
+        static uint32_t s_lastInputDiagMs;
+        uint32_t now = Sys_Milliseconds();
+        if (com_diagMarkers && com_diagMarkers->current.enabled &&
+            now - s_lastInputDiagMs >= 250)
+        {
+            s_lastInputDiagMs = now;
+            Com_Printf(0,
+                "INPUT_DIAG rawL=(%.3f,%.3f) rawR=(%.3f,%.3f) stick=(%.3f,%.3f) "
+                "fwd=%d side=%d up=%d yaw=%.4f pitch=%.4f\n",
+                (double)pad->rawLeftStick[0], (double)pad->rawLeftStick[1],
+                (double)pad->rawRightStick[0], (double)pad->rawRightStick[1],
+                (double)gamepad.forward, (double)gamepad.right,
+                forward, side, (int)(gamepad.up * 127.0f),
+                (double)gamepad.yaw, (double)gamepad.pitch);
+        }
+    }
+#else
+    (void)cmd;
+#endif
 #if 0
     double v2; // fp27
     double v3; // fp28
@@ -1132,7 +1353,7 @@ void __cdecl CL_MouseMove(usercmd_s *cmd)
 {
 #if 0
     __int64 oldAngles; // r9
-    long double side; // fp2
+    double side; // fp2
     __int64 forward; // r11
     double up; // fp29
     double v12; // fp30
@@ -1141,9 +1362,9 @@ void __cdecl CL_MouseMove(usercmd_s *cmd)
     double v15; // fp31
     double v16; // r5
     __int64 v17; // r9
-    long double v18; // fp2
+    double v18; // fp2
     int rightmove; // r11
-    long double v28; // fp2
+    double v28; // fp2
     int forwardmove; // r10
     float v30[KEY_FORWARD]; // [sp+50h] [-60h] BYREF
     __int64 v31[6]; // [sp+58h] [-58h] BYREF
@@ -1444,10 +1665,10 @@ int __cdecl CG_HandleLocationSelectionInput(int localClientNum, usercmd_s *cmd)
     double v12; // fp13
     double v13; // fp13
     double v14; // fp1
-    long double v15; // fp2
+    double v15; // fp2
     LocSelInputState locSelInputState; // r11
-    long double v17; // fp2
-    long double v18; // fp2
+    double v17; // fp2
+    double v18; // fp2
 
     if (localClientNum)
         MyAssertHandler(
@@ -1604,9 +1825,10 @@ void __cdecl CL_CreateCmd(usercmd_s *result)
         CL_CmdButtons(result);
         CL_KeyMove(result);
         CL_MouseMove(result);
-        // KISAKTODO
-        //if (GPad_IsActive(CL_ControllerIndexFromClientNum(0)))
-        //    CL_GamepadMove(result);
+#ifdef __SWITCH__
+        if (Switch_InputPadActive() && cl_paused->current.integer != 1)
+            CL_GamepadMove(result);
+#endif
         if (clients[0].viewangles[0] - oldAngles <= 90.0)
         {
             if (oldAngles - clients[0].viewangles[0] > 90.0)
@@ -1642,6 +1864,9 @@ void CL_CreateNewCommands()
     Sys_EnterCriticalSection(CRITSECT_CLIENT_CMD);
     memcpy(&clients[0].cmds[++clients[0].cmdNumber & 0x3F], v1, sizeof(clients[0].cmds[++clients[0].cmdNumber & 0x3F]));
     Sys_LeaveCriticalSection(CRITSECT_CLIENT_CMD);
+    {
+        static int s_cncDiag;
+    }
 }
 
 void __cdecl CL_WritePacket()
@@ -1689,6 +1914,9 @@ void __cdecl CL_WritePacket()
         Com_Printf(CON_CHANNEL_CLIENT, "MAX_PACKET_USERCMDS\n");
     }
     Sys_LeaveCriticalSection(CRITSECT_CLIENT_CMD);
+    {
+        static int s_cwpDiag;
+    }
     if (v4 > 0)
     {
         v5 = v4;

@@ -202,7 +202,9 @@ struct GfxWorld // sizeof=0x2DC
     GfxWorldDpvsStatic dpvs;            // ...
     GfxWorldDpvsDynamic dpvsDyn;        // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(GfxWorld) == 0x2DC);
+#endif
 
 // r_bsp
 void __cdecl R_ReloadWorld();
@@ -239,6 +241,12 @@ void __cdecl R_AddShadowSurfaceToPrimaryLight(
     GfxWorld *world,
     uint32_t primaryLightIndex,
     uint32_t sortedSurfIndex);
+// R_InitShadowGeometryArrays' two passes (r_bsp_load_obj.cpp). The live retail
+// GfxWorld loader restores the per-light shadow-geometry spans the original
+// R_LoadWorld builds; both callbacks operate on the committed s_world.
+void __cdecl R_ForEachShadowCastingSurfaceOnEachLight(
+    void(__cdecl *Callback)(GfxWorld *, uint32_t, uint32_t));
+void __cdecl R_IncrementShadowGeometryCount(GfxWorld *world, uint32_t primaryLightIndex, uint32_t idk);
 void __cdecl R_ForEachPrimaryLightAffectingSurface(
     GfxWorld *world,
     const GfxSurface *surface,
@@ -289,3 +297,7 @@ int __cdecl R_AllocDrawSurf(
     uint32_t size);
 void __cdecl R_WritePrimDrawSurfInt(GfxDelayedCmdBuf *delayedCmdBuf, uint32_t value);
 void __cdecl R_WritePrimDrawSurfData(GfxDelayedCmdBuf *delayedCmdBuf, uint8_t *data, uint32_t count);
+// LP64 fix (see PRIM_DRAW_SURF_PTR_WORDS, r_gfx.h): writes a full-width
+// pointer as PRIM_DRAW_SURF_PTR_WORDS consecutive words instead of
+// truncating it into one uint32_t.
+void __cdecl R_WritePrimDrawSurfPtr(GfxDelayedCmdBuf *delayedCmdBuf, const void *value);

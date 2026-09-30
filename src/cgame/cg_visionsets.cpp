@@ -262,6 +262,19 @@ char __cdecl CG_VisionSetStartLerp_To(
 
     cgameGlob = CG_GetLocalClientGlobals(localClientNum);
 
+    // the vision set the level asks for (from
+    // script VisionSetNaked / the map's config string), logged so the
+    // applied film/glow values below can be compared against it.
+    {
+        static uint32_t s_killhouseVisionRequestLines = 0;
+        if (s_killhouseVisionRequestLines < 16)
+        {
+            ++s_killhouseVisionRequestLines;
+            Com_Printf(0, "KILLHOUSE_VISION_REQUEST mode=%d style=%d name=%s duration=%d\n",
+                       (int)mode, (int)style, nameTo ? nameTo : "(null)", duration);
+        }
+    }
+
     if (duration <= 0 || cgameGlob->visionSetLerpData[mode].style == VISIONSETLERP_UNDEFINED)
         return VisionSetCurrent(localClientNum, mode, nameTo);
 
@@ -326,10 +339,38 @@ char __cdecl LoadVisionFile(const char *name, visionSetVars_t *resultSettings)
     iassert(resultSettings);
     fileBuf = RawBufferOpen(name, "vision/%s.vision");
     if (!fileBuf)
+    {
+        static uint32_t s_killhouseVisionFileMissLines = 0;
+        if (s_killhouseVisionFileMissLines < 16)
+        {
+            ++s_killhouseVisionFileMissLines;
+            Com_Printf(0, "KILLHOUSE_VISION_FILE name=%s ok=0\n", name ? name : "(null)");
+        }
         return 0;
+    }
     Com_sprintf(fullPath, 0x40u, "vision/%s.vision", name);
     success = LoadVisionSettingsFromBuffer(fileBuf, fullPath, resultSettings);
     Com_UnloadRawTextFile(fileBuf);
+    // the level's own vision values (the parsed
+    // vision file) so the applied refdef film/glow can be compared to them.
+    {
+        static uint32_t s_killhouseVisionFileLines = 0;
+        if (s_killhouseVisionFileLines < 16)
+        {
+            ++s_killhouseVisionFileLines;
+            Com_Printf(0,
+                       "KILLHOUSE_VISION_FILE name=%s ok=%d film_enable=%d contrast=%g "
+                       "brightness=%g desat=%g invert=%d light_tint=%g,%g,%g "
+                       "dark_tint=%g,%g,%g glow=%d\n",
+                       name ? name : "(null)", success ? 1 : 0,
+                       resultSettings->filmEnable ? 1 : 0, resultSettings->filmContrast,
+                       resultSettings->filmBrightness, resultSettings->filmDesaturation,
+                       resultSettings->filmInvert ? 1 : 0, resultSettings->filmLightTint[0],
+                       resultSettings->filmLightTint[1], resultSettings->filmLightTint[2],
+                       resultSettings->filmDarkTint[0], resultSettings->filmDarkTint[1],
+                       resultSettings->filmDarkTint[2], resultSettings->glowEnable ? 1 : 0);
+        }
+    }
     return success;
 }
 
@@ -673,6 +714,51 @@ void __cdecl CG_VisionSetApplyToRefdef(int32_t localClientNum)
     {
         film->enabled = 0;
         glow->enabled = 0;
+    }
+    // the film/glow values actually applied to the
+    // refdef this frame (change-logged, bounded), for comparison with the
+    // level's own vision file values above.  This is the value the renderer
+    // receives -- a stage marker is not evidence.
+    {
+        static uint32_t s_killhouseVisionAppliedLines = 0;
+        static bool s_haveLast = false;
+        static int s_lastStyle = -1;
+        static int s_lastFilmEnable = -1;
+        static int s_lastInvert = -1;
+        static float s_lastBrightness = 0.0f;
+        static float s_lastContrast = 0.0f;
+        static float s_lastDesat = 0.0f;
+        static int s_lastLogTime = -100000;
+        const int style = (int)cgameGlob->visionSetLerpData[visionChannel].style;
+        const int filmEnable = film->enabled ? 1 : 0;
+        const int invert = film->invert ? 1 : 0;
+        if (s_killhouseVisionAppliedLines < 32 &&
+            (!s_haveLast || style != s_lastStyle || filmEnable != s_lastFilmEnable ||
+             invert != s_lastInvert || film->brightness != s_lastBrightness ||
+             film->contrast != s_lastContrast || film->desaturation != s_lastDesat ||
+             cgameGlob->time - s_lastLogTime > 5000))
+        {
+            s_haveLast = true;
+            s_lastLogTime = cgameGlob->time;
+            s_lastStyle = style;
+            s_lastFilmEnable = filmEnable;
+            s_lastInvert = invert;
+            s_lastBrightness = film->brightness;
+            s_lastContrast = film->contrast;
+            s_lastDesat = film->desaturation;
+            ++s_killhouseVisionAppliedLines;
+            Com_Printf(0,
+                       "KILLHOUSE_VISION_APPLIED style=%d channel=%d film_enable=%d "
+                       "brightness=%g contrast=%g desat=%g invert=%d light_tint=%g,%g,%g "
+                       "dark_tint=%g,%g,%g glow=%d cutoff=%g bloom_desat=%g bloom=%g "
+                       "radius=%g time=%d\n",
+                       style, (int)visionChannel, filmEnable, film->brightness, film->contrast,
+                       film->desaturation, invert, film->tintLight[0], film->tintLight[1],
+                       film->tintLight[2], film->tintDark[0], film->tintDark[1],
+                       film->tintDark[2], glow->enabled ? 1 : 0, glow->bloomCutoff,
+                       glow->bloomDesaturation, glow->bloomIntensity, glow->radius,
+                       cgameGlob->time);
+        }
     }
 }
 

@@ -4,20 +4,14 @@
 #include <format>
 
 #include "../universal/q_shared.h"
+#include "com_error.h"
+#include "sys_event.h"
 
 #ifdef KISAK_SP
 static const int PHYS_WORLD_CLIPMASK = 0x280E491;
 #elif KISAK_MP
 static const int PHYS_WORLD_CLIPMASK = 0x2806C91;
 #endif
-
-typedef enum
-{
-    SE_NONE = 0x0,
-    SE_KEY = 0x1,
-    SE_CHAR = 0x2,
-    SE_CONSOLE = 0x3,
-} sysEventType_t;
 
 enum SphereEdgeTraceResult : __int32
 {                                       // ...
@@ -160,18 +154,6 @@ extern const dvar_t *com_authPort;
 #endif
 
 
-enum errorParm_t : __int32
-{                                       // ...
-    ERR_FATAL = 0x0,
-    ERR_DROP = 0x1,
-    ERR_SERVERDISCONNECT = 0x2,
-    ERR_DISCONNECT = 0x3,
-    ERR_SCRIPT = 0x4,
-    ERR_SCRIPT_DROP = 0x5,
-    ERR_LOCALIZATION = 0x6,
-    ERR_MAPLOADERRORSUMMARY = 0x7,
-};
-
 enum $6ABDC6367E3229B6421BFD1B2626A094 : __int32 // (SP/MP same)
 {
     CON_CHANNEL_DONT_FILTER = 0x0,
@@ -208,7 +190,6 @@ inline bool Con_IsNotifyChannel(int channel)
 }
 
 void QDECL Com_Printf(int channel, const char* fmt, ...);
-void QDECL Com_Error(errorParm_t code, const char* fmt, ...);
 
 void QDECL RefreshQuitOnErrorCondition();
 
@@ -242,6 +223,7 @@ void __cdecl Com_Quit_f();
 void Com_ClearTempMemory();
 void __cdecl Com_ParseCommandLine(char* commandLine);
 int __cdecl Com_SafeMode();
+bool Com_StartupFlagSet(const char *name);
 void __cdecl Com_ForceSafeMode();
 void __cdecl Com_StartupVariable(const char* match);
 void __cdecl Info_Print(const char* s);
@@ -1164,7 +1146,11 @@ struct SpawnVar // sizeof=0xA0C
     int32_t numSpawnVarChars;
     char spawnVarChars[2048];
 };
+#ifndef KISAK_RETAIL_FS_STANDALONE
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(SpawnVar) == 0xA0C);
+#endif
+#endif
 
 void __cdecl CM_LoadMapData_LoadObj(const char *name);
 struct cplane_s *__cdecl CM_GetPlanes();
@@ -1590,8 +1576,14 @@ inline T Buf_Read(unsigned char **pos)
     return value;
 }
 
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
 #include <xmmintrin.h>  // SSE
+#ifdef _MSC_VER
 #include <intrin.h>
+#endif
+#else
+#include <math.h>
+#endif
 
 // (https://github.com/SwagSoftware/KisakCOD/issues/52)
 // 
@@ -1613,7 +1605,11 @@ inline int SnapFloatToInt(float x)
     return i;
 #endif
 
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
     int retval = _mm_cvtss_si32(_mm_set_ss(x));
+#else
+    int retval = static_cast<int>(lrintf(x));
+#endif
 
 #if defined(_DEBUG) && defined(_WIN32)
     const float input = x;

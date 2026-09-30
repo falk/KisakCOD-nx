@@ -631,10 +631,9 @@ SndCurve *__cdecl Com_RegisterSoundAliasVolumeFalloffCurve(const char *filename,
         MyAssertHandler(".\\universal\\com_sndalias.cpp", 1173, 0, "%s", "filename");
     for (i = 0; i < 16; ++i)
     {
-        // KISAKTODO: PSYCHO NEGA-ARRAY
-        if (*(_DWORD *)&g_sa.volumeFalloffCurveNames[-18][72 * i] && !I_stricmp(filename, *(const char**)&g_sa.volumeFalloffCurveNames[-18][72 * i]))
+        if (g_sa.volumeFalloffCurves[i].filename && !I_stricmp(filename, g_sa.volumeFalloffCurves[i].filename))
         {
-            return (SndCurve *)&g_sa.volumeFalloffCurveNames[-18][72 * i];
+            return &g_sa.volumeFalloffCurves[i];
         }
     }
     Com_Error(ERR_DROP, "Sound alias file %s: Volume Falloff Curve %s not found.", sourceFile, filename);
@@ -872,7 +871,7 @@ void __cdecl Com_AddBuildSoundAlias(snd_alias_build_s *build)
 {
     snd_alias_build_s *alias; // [esp+8h] [ebp-4h]
 
-    alias = (snd_alias_build_s*)Com_AllocateTempSoundMemory(412, "Com_AddBuildSoundAlias");
+    alias = (snd_alias_build_s*)Com_AllocateTempSoundMemory(sizeof(snd_alias_build_s), "Com_AddBuildSoundAlias");
     qmemcpy(alias, build, sizeof(snd_alias_build_s));
     alias->pNext = saLoadObjGlob.tempAliases;
     saLoadObjGlob.tempAliases = alias;
@@ -933,7 +932,7 @@ void __cdecl Com_LoadSoundAliasFile(const char *loadspec, const char *loadspecCu
                                 loadspecCurGame,
                                 sourceFile,
                                 (char *)token,
-                                (snd_alias_members_t)(int)ptr[i + 1],
+                                (snd_alias_members_t)(int)(intptr_t)ptr[i + 1],
                                 isFieldSet,
                                 &alias);
                         if (++i == iColCount)
@@ -1014,8 +1013,8 @@ void __cdecl Com_LoadSoundAliasFile(const char *loadspec, const char *loadspecCu
 bool __cdecl Com_ParseSndCurveFile(const char *buffer, const char *fileName, SndCurve *curve)
 {
     int v3; // eax
-    long double v5; // st7
-    long double v6; // st7
+    double v5; // st7
+    double v6; // st7
     int knotCountIndex; // [esp+8h] [ebp-8h]
     int knotCountIndexa; // [esp+8h] [ebp-8h]
     parseInfo_t *tokenb; // [esp+Ch] [ebp-4h]
@@ -1413,7 +1412,9 @@ void __cdecl Com_AddLoadedSoundFile(SoundFile *soundFile, char *fileName)
     else
     {
         soundFile->exists = 0;
-        soundFile->u.loadSnd = (LoadedSound*)CM_Hunk_Alloc(0x2Cu, "_loaded", 15);
+        // LP64: LoadedSound carries real pointers, so the ILP32 0x2C literal
+        // under-allocated it.
+        soundFile->u.loadSnd = (LoadedSound*)CM_Hunk_Alloc(sizeof(LoadedSound), "_loaded", 15);
         soundFile->u.loadSnd->name = fileName;
     }
 }
@@ -1538,7 +1539,10 @@ void __cdecl Com_MakeSoundAliasesPermanent(snd_alias_list_t *aliasInfo, SoundFil
                             stringBytesCount += strlen(builda->subtitleText) + 1;
                     }
                     Com_InitSoundAliasHash(aliasCount);
-                    aliasInfo->head = (snd_alias_t*)CM_Hunk_Alloc(92 * saLoadObjGlob.tempAliasCount, "_aliases", 15);
+                    // LP64: 92 was the ILP32 sizeof(snd_alias_t); its five
+                    // name/soundFile/curve/speakerMap pointers widen here, so
+                    // the whole alias array overran the hunk on every load.
+                    aliasInfo->head = (snd_alias_t*)CM_Hunk_Alloc(sizeof(snd_alias_t) * saLoadObjGlob.tempAliasCount, "_aliases", 15);
                     soundFileInfo->files = (SoundFile*)CM_Hunk_Alloc(sizeof(SoundFile) * soundCount, "_sound files", 15);
                     strings = (char*)CM_Hunk_Alloc(stringBytesCount, "_strings", 15);
                     currentNameb = 0;
@@ -1578,7 +1582,9 @@ void __cdecl Com_MakeSoundAliasesPermanent(snd_alias_list_t *aliasInfo, SoundFil
                         alias = &aliasInfo->head[aliasInfo->count];
                         if (!aliasList || I_stricmp(aliasList->head->aliasName, currentNameb))
                         {
-                            aliasList = (snd_alias_list_t*)CM_Hunk_Alloc(0xCu, "_alias list", 15);
+                            // LP64: snd_alias_list_t's aliasName/head pointers
+                            // widen, so the ILP32 0xC literal under-allocated.
+                            aliasList = (snd_alias_list_t*)CM_Hunk_Alloc(sizeof(snd_alias_list_t), "_alias list", 15);
                             if (!Com_AddAliasList(currentNameb, aliasList))
                             {
                                 aliasList = 0;
@@ -1765,12 +1771,12 @@ void Com_InitSoundDevGuiGraphs_LoadObj()
         MyAssertHandler(".\\universal\\com_sndalias.cpp", 240, 0, "%s", "g_sa.curvesInitialized");
     for (i = 1; i < 16; ++i)
     {
-        if (*(_DWORD *)&g_sa.volumeFalloffCurveNames[-18][72 * i])
+        if (g_sa.volumeFalloffCurves[i].filename)
         {
 #ifndef ARRAYSIZE
 #define ARRAYSIZE(x) (sizeof(x) / sizeof(x[0]))
 #endif
-            snprintf(devguiPath, ARRAYSIZE(devguiPath), "Main/Snd:6/Volume Falloff Curves/%s:%d", *(const char**)&g_sa.volumeFalloffCurveNames[-18][72 * i], i);
+            snprintf(devguiPath, ARRAYSIZE(devguiPath), "Main/Snd:6/Volume Falloff Curves/%s:%d", g_sa.volumeFalloffCurves[i].filename, i);
             g_sa.curveDevGraphs[i].knotCountMax = 8;
             g_sa.curveDevGraphs[i].knots = g_sa.volumeFalloffCurves[i].knots;
             g_sa.curveDevGraphs[i].knotCount = &g_sa.volumeFalloffCurves[i].knotCount;

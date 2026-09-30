@@ -3,6 +3,7 @@
 
 #include <database/database.h>
 #include <universal/profile.h>
+#include <universal/com_files.h>
 
 #ifdef KISAK_MP
 #include <client_mp/client_mp.h>
@@ -90,6 +91,33 @@ void __cdecl UI_DrawLoadBar(
     else
         v10 = UI_LoadBarProgress_LoadObj;
     percentDone = v10();
+#if defined(KISAK_SP) && defined(__SWITCH__)
+    // switch_loadBarDiag 1: one LOADBAR line whenever the drawn fraction
+    // moves by >= 1% (or goes backwards) and at least every 500 ms, with the
+    // walk's raw counters, so a log shows what the bar did over the load.
+    {
+        static const dvar_t *loadBarDiag;
+        if (!loadBarDiag)
+            loadBarDiag = Dvar_FindVar("switch_loadBarDiag");
+        if (loadBarDiag && loadBarDiag->current.enabled)
+        {
+            static float lastLogged = -1.0f;
+            static int lastLoggedMs;
+            const int now = Sys_Milliseconds();
+            if (percentDone < lastLogged || percentDone - lastLogged >= 0.01f || now - lastLoggedMs >= 500)
+            {
+                uint64_t readBytes = 0, fileBytes = 0;
+                uint32_t externalBytes = 0;
+                const bool sized = FS_GetRetailLoadProgress(&readBytes, &fileBytes, &externalBytes);
+                Com_Printf(CON_CHANNEL_UI, "LOADBAR t=%d frac=%.4f sized=%d read=%llu file=%llu external=%u\n", now,
+                           percentDone, sized, (unsigned long long)readBytes, (unsigned long long)fileBytes,
+                           externalBytes);
+                lastLogged = percentDone;
+                lastLoggedMs = now;
+            }
+        }
+    }
+#endif
     v9 = w * percentDone;
     CL_DrawStretchPic(scrPlace, x, y, v9, h, horzAlign, vertAlign, 0.0, 0.0, percentDone, 1.0, color, material);
 }

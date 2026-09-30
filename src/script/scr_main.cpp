@@ -18,7 +18,12 @@ bool Scr_IsInOpcodeMemory(char const* pos)
 {
     iassert(scrVarPub.programBuffer);
     iassert(pos);
-    return pos - scrVarPub.programBuffer < scrCompilePub.programLen;
+    // LP64: without the lower bound a garbage or truncated code position that
+    // sits *before* the program buffer subtracts to a huge negative value and
+    // still compares `< programLen`, so corrupt reference resolvers were
+    // accepted as valid. Require membership in [programBuffer, +programLen).
+    return pos >= scrVarPub.programBuffer
+        && pos - scrVarPub.programBuffer < scrCompilePub.programLen;
 }
 
 bool Scr_IsIdentifier(char const* token)
@@ -135,7 +140,7 @@ void __cdecl Scr_BeginLoadScripts()
         scrVarPub.programHunkUser = Hunk_UserCreate(0x100000, "Scr_BeginLoadScripts", 1, 0, 7);
         TempMemoryReset(scrVarPub.programHunkUser);
         scrVarPub.programBuffer = TempMalloc(0);
-        if (((int)scrVarPub.programBuffer & 0x1F) != 0)
+        if (((int)(intptr_t)scrVarPub.programBuffer & 0x1F) != 0)
             MyAssertHandler(
                 ".\\script\\scr_main.cpp",
                 209,
@@ -164,8 +169,12 @@ void __cdecl Scr_EndLoadScripts()
         Scr_EndLoadEvaluate();
         KISAK_NULLSUB();
         SL_ShutdownSystem(2);
+        // Diagnostic markers scoping which script phase runs.
+        Com_Printf(0, "SCRIPT_PROBE shutdown2 done\n");
     }
     Scr_InitDebugger();
+    // Diagnostic markers scoping which script phase runs.
+    Com_Printf(0, "SCRIPT_PROBE endloadscripts done\n");
     scrCompilePub.script_loading = 0;
     if (!scrCompilePub.loadedscripts)
         MyAssertHandler(".\\script\\scr_main.cpp", 415, 0, "%s", "scrCompilePub.loadedscripts");

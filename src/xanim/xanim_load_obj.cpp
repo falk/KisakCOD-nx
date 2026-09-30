@@ -251,7 +251,7 @@ XModelPieces *__cdecl XModelPiecesLoadFile(const char *name, void *(__cdecl *All
 
     if (version == 1)
     {
-        xmodelPieces = (XModelPieces *)Alloc(12);
+        xmodelPieces = (XModelPieces *)Alloc(sizeof(XModelPieces));
         iassert(xmodelPieces);
         xmodelPieces->numpieces = Buf_Read<unsigned short>(&pos);
         xmodelPieces->pieces = (XModelPiece *)Alloc(sizeof(XModelPiece) * xmodelPieces->numpieces);
@@ -476,7 +476,7 @@ unsigned __int8 *__cdecl GetDeltaQuaternions(
         if (numQuatIndices == 1)
         {
             ConsumeQuat2(&pos, quat);
-            deltaPart->quat = (XAnimDeltaPartQuat *)Alloc(8);
+            deltaPart->quat = (XAnimDeltaPartQuat *)Alloc(sizeof(XAnimDeltaPartQuat));
             deltaPart->quat->size = 0;
             deltaPart->quat->u.frame0[0] = quat[0];
             deltaPart->quat->u.frame0[1] = quat[1];
@@ -565,7 +565,7 @@ unsigned __int8 *__cdecl GetDeltaTranslations(
             mins[1] = Buf_Read<float>(&pos);
             mins[2] = Buf_Read<float>(&pos);
 
-            deltaPart->trans = (XAnimPartTrans*)Alloc(16);
+            deltaPart->trans = (XAnimPartTrans*)Alloc(sizeof(XAnimPartTrans));
             deltaPart->trans->size = 0;
             p_u = &deltaPart->trans->u;
             p_u->frames.mins[0] = mins[0];
@@ -649,7 +649,7 @@ unsigned __int8 *__cdecl GetQuaternions(
                     quat[0] = -quat[0];
                     quat[1] = -quat[1];
                 }
-                part->quat = (XAnimPartQuat*)XAnimTempAlloc(8);
+                part->quat = (XAnimPartQuat*)XAnimTempAlloc(sizeof(XAnimPartQuat));
                 part->quat->u.frame0[0] = quat[0];
                 part->quat->u.frame0[1] = quat[1];
             }
@@ -663,7 +663,7 @@ unsigned __int8 *__cdecl GetQuaternions(
                     quat[2] = -quat[2];
                     quat[3] = -quat[3];
                 }
-                part->quat = (XAnimPartQuat *)XAnimTempAlloc(0xCu);
+                part->quat = (XAnimPartQuat *)XAnimTempAlloc(sizeof(XAnimPartQuat));
                 //part->quat->u = *(XAnimPartQuatData*)quat;
                 part->quat->u.frame0[0] = quat[0];
                 part->quat->u.frame0[1] = quat[1];
@@ -801,7 +801,7 @@ unsigned __int8 *__cdecl GetTranslations(
             mins[1] = Buf_Read<float>(&pos);
             mins[2] = Buf_Read<float>(&pos);
 
-            part->trans = (XAnimPartTrans*)XAnimTempAlloc(0x10u);
+            part->trans = (XAnimPartTrans*)XAnimTempAlloc(sizeof(XAnimPartTrans));
             part->trans->size = 0;
             p_u = &part->trans->u;
             p_u->frames.mins[0] = mins[0];
@@ -1046,7 +1046,7 @@ XAnimParts *__cdecl XAnimLoadFile(char *name, void *(__cdecl *Alloc)(int))
 
     if (parts->bDelta)
     {
-        parts->deltaPart = (XAnimDeltaPart *)Alloc(8);
+        parts->deltaPart = (XAnimDeltaPart *)Alloc(sizeof(XAnimDeltaPart));
         pos = GetDeltaQuaternions(parts->deltaPart, Alloc, pos, numLoopFrames, useSmallIndices);
         pos = GetDeltaTranslations(parts->deltaPart, Alloc, pos, numLoopFrames, useSmallIndices);
     }
@@ -1115,7 +1115,7 @@ XAnimParts *__cdecl XAnimLoadFile(char *name, void *(__cdecl *Alloc)(int))
             v73[animPartIndex].partIndex = i;
             v6 = *(_DWORD *)&part[animPartIndex].partIndex;
             v7 = i;
-            v71[2 * i] = (DWORD)part[animPartIndex].quat;
+            v71[2 * i] = (DWORD)(intptr_t)part[animPartIndex].quat;
             v71[2 * v7 + 1] = v6;
             parts->names[i] = v68[animPartIndex];
             PartQuatType = XAnimGetPartQuatType(animPartIndex);
@@ -1211,7 +1211,7 @@ XAnimParts *__cdecl XAnimLoadFile(char *name, void *(__cdecl *Alloc)(int))
             animPartIndex = boneIndexes[i];
             v8 = *(_DWORD *)&v73[animPartIndex].partIndex;
             v9 = i;
-            *(_DWORD *)&dest[8 * i + 64] = (DWORD)v73[animPartIndex].trans;
+            *(_DWORD *)&dest[8 * i + 64] = (DWORD)(intptr_t)v73[animPartIndex].trans;
             *(_DWORD *)&dest[8 * v9 + 68] = v8;
             PartQuatType = XAnimGetPartTransType(animPartIndex);
             v51[PartQuatType] = i + 1;

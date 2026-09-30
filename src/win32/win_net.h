@@ -20,7 +20,11 @@ void		NET_Restart(void);
 void		NET_Config(bool enableNetworking);
 void		NET_SendPacket(netsrc_t sock, int length, const void* data, netadr_t to);
 const char* NET_ErrorString(void);
+// Horizon owns the cooperative sleep through the libnx scheduler seam
+// (switch_compat.h); the Win32 prototype would collide with that macro.
+#ifndef __SWITCH__
 void		NET_Sleep(int msec);
+#endif
 
 uint32_t __cdecl NET_TCPIPSocket(const char *net_interface, int port, int type);
 

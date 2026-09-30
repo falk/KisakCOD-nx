@@ -191,6 +191,7 @@ DObj_s *__cdecl Com_ServerDObjCreate(
     iassert(handle < SERVER_DOBJ_HANDLE_MAX);
     iassert(!Com_GetServerDObj(handle));
 
+    iassert((unsigned)handle < SERVER_DOBJ_HANDLE_MAX);
     index = Com_GetFreeDObjIndex();
 
     iassert((unsigned)handle < SERVER_DOBJ_HANDLE_MAX);

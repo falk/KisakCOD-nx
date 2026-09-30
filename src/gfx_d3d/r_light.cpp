@@ -105,6 +105,11 @@ void __cdecl R_InitLightDefs()
 {
     iassert( lightGlob.defCount == 0 );
     rgp.dlightDef = R_RegisterLightDef("light_dynamic");
+    if (rgp.dlightDef && (!rgp.dlightDef->attenuation.image || !rgp.dlightDef->attenuation.image->texture.basemap))
+    {
+        if (rgp.whiteImage)
+            rgp.dlightDef->attenuation.image = rgp.whiteImage;
+    }
 }
 
 void __cdecl R_ShutdownLightDefs()
@@ -261,7 +266,7 @@ void __cdecl R_GetBspLightSurfs(const GfxLight **visibleLights, int visibleCount
     }
 }
 
-BOOL __cdecl R_SortBspShadowReceiverSurfaces(GfxSurface *surface0, GfxSurface *surface1)
+static BOOL __cdecl R_LightSortBspShadowReceiverSurfaces(GfxSurface *surface0, GfxSurface *surface1)
 {
     return surface0 < surface1;
 }
@@ -313,8 +318,8 @@ void __cdecl R_GetBspOmniLightSurfs(const GfxLight *light, int lightIndex, GfxBs
         //    (const GfxStaticModelDrawInst **)surfaces[0],
         //    (const GfxStaticModelDrawInst **)&surfaces[0][visLightDrawSurfCount],
         //    (int)(4 * visLightDrawSurfCount) >> 2,
-        //    (bool(__cdecl *)(const GfxStaticModelDrawInst *, const GfxStaticModelDrawInst *))R_SortBspShadowReceiverSurfaces);
-        std::sort(&surfaces[0][0], &surfaces[0][visLightDrawSurfCount], R_SortBspShadowReceiverSurfaces);
+        //    (bool(__cdecl *)(const GfxStaticModelDrawInst *, const GfxStaticModelDrawInst *))R_LightSortBspShadowReceiverSurfaces);
+        std::sort(&surfaces[0][0], &surfaces[0][visLightDrawSurfCount], R_LightSortBspShadowReceiverSurfaces);
         for (listSurfIndex = 0; listSurfIndex < visLightDrawSurfCount; ++listSurfIndex)
         {
             if (listSurfIndex >= rgp.world->surfaceCount)
@@ -341,9 +346,16 @@ void __cdecl R_GetBspOmniLightSurfs(const GfxLight *light, int lightIndex, GfxBs
 
 int __cdecl R_AllowBspOmniLight(int surfIndex, void *bspLightCallbackAsVoid)
 {
-    return *(_BYTE *)(*(uint32_t *)bspLightCallbackAsVoid + surfIndex)
-        && *((float *)bspLightCallbackAsVoid + 4) >= PointToBoxDistSq(
-            (const float *)bspLightCallbackAsVoid + 1,
+    // LP64: every access here was ABI-dependent. surfaceVisData was read
+    // through a uint32_t* (losing the pointer's high half), radiusSq was taken
+    // as float index 4 (offset 16, correct only while the leading pointer is
+    // 4 bytes; it is 20 on LP64) and position as float index 1 (offset 4,
+    // now 8). Go through the struct so the layout is the compiler's problem.
+    const BspOmniLightCallback *cb = (const BspOmniLightCallback *)bspLightCallbackAsVoid;
+
+    return cb->surfaceVisData[surfIndex]
+        && cb->radiusSq >= PointToBoxDistSq(
+            cb->position,
             rgp.world->dpvs.surfaces[surfIndex].bounds[0],
             rgp.world->dpvs.surfaces[surfIndex].bounds[1]);
 }
@@ -391,8 +403,8 @@ void __cdecl R_GetBspSpotLightSurfs(const GfxLight *light, int lightIndex, GfxBs
         //    (const GfxStaticModelDrawInst **)surfaces[0],
         //    (const GfxStaticModelDrawInst **)&surfaces[0][surfCounts[0]],
         //    (signed int)(4 * surfCounts[0]) >> 2,
-        //    (bool(__cdecl *)(const GfxStaticModelDrawInst *, const GfxStaticModelDrawInst *))R_SortBspShadowReceiverSurfaces);
-        std::sort(&surfaces[0][0], &surfaces[0][surfCounts[0]], R_SortBspShadowReceiverSurfaces);
+        //    (bool(__cdecl *)(const GfxStaticModelDrawInst *, const GfxStaticModelDrawInst *))R_LightSortBspShadowReceiverSurfaces);
+        std::sort(&surfaces[0][0], &surfaces[0][surfCounts[0]], R_LightSortBspShadowReceiverSurfaces);
         for (listSurfIndex = 0; listSurfIndex < surfCounts[0]; ++listSurfIndex)
         {
             if (listSurfIndex >= rgp.world->surfaceCount)
@@ -424,8 +436,8 @@ void __cdecl R_GetBspSpotLightSurfs(const GfxLight *light, int lightIndex, GfxBs
         //    (const GfxStaticModelDrawInst **)surfaces[1],
         //    (const GfxStaticModelDrawInst **)&surfaces[1][surfCounts[1]],
         //    (signed int)(4 * surfCounts[1]) >> 2,
-        //    (bool(__cdecl *)(const GfxStaticModelDrawInst *, const GfxStaticModelDrawInst *))R_SortBspShadowReceiverSurfaces);
-        std::sort(&surfaces[1][0], &surfaces[1][surfCounts[1]], R_SortBspShadowReceiverSurfaces);
+        //    (bool(__cdecl *)(const GfxStaticModelDrawInst *, const GfxStaticModelDrawInst *))R_LightSortBspShadowReceiverSurfaces);
+        std::sort(&surfaces[1][0], &surfaces[1][surfCounts[1]], R_LightSortBspShadowReceiverSurfaces);
         for (listSurfIndex = 0; listSurfIndex < surfCounts[1]; ++listSurfIndex)
         {
             if (listSurfIndex >= rgp.world->surfaceCount)
@@ -454,7 +466,7 @@ int __cdecl R_AllowBspSpotLightShadows(int surfIndex, void *bspLightCallbackAsVo
 {
     if (r_spotLightShadows->current.enabled)
         return R_BoxInPlanes(
-            (const float (*)[4])((uint32_t)bspLightCallbackAsVoid + 4),
+            ((const BspSpotLightCallback *)bspLightCallbackAsVoid)->planes,
             rgp.world->dpvs.surfaces[surfIndex].bounds[0],
             rgp.world->dpvs.surfaces[surfIndex].bounds[1]);
     else
@@ -549,9 +561,13 @@ int __cdecl R_BoxInPlanes(const float (*planes)[4], const float *mins, const flo
 
 int __cdecl R_AllowBspSpotLight(int surfIndex, void *bspLightCallbackAsVoid)
 {
-    if (*(_BYTE *)(*(uint32_t *)bspLightCallbackAsVoid + surfIndex))
+    // LP64: as above, plus the planes address was built by truncating the
+    // callback pointer itself to 32 bits and adding 4.
+    const BspSpotLightCallback *cb = (const BspSpotLightCallback *)bspLightCallbackAsVoid;
+
+    if (cb->surfaceVisData[surfIndex])
         return R_BoxInPlanes(
-            (const float (*)[4])((uint32_t)bspLightCallbackAsVoid + 4),
+            cb->planes,
             rgp.world->dpvs.surfaces[surfIndex].bounds[0],
             rgp.world->dpvs.surfaces[surfIndex].bounds[1]);
     else
@@ -707,6 +723,12 @@ void __cdecl R_GetStaticModelLightSurfs(const GfxLight **visibleLights, int visi
         {
             smodelIndex = smodels[index];
             smodelDrawInst = &rgp.world->dpvs.smodelDrawInsts[smodelIndex];
+            // A wire model slot that decoded null binds null; the
+            // instance has no geometry to light (the original engine never
+            // holds null models here, but retail wire data carries a
+            // shared null slot). Skip instead of dereferencing null.
+            if (!smodelDrawInst->model)
+                continue;
             lod = (lodData[smodelIndex >> 4] >> (2 * (smodelIndex & 0xF))) & 3;
             surfaceCount = XModelGetSurfaces(smodelDrawInst->model, &surfaces, lod);
             iassert( surfaceCount );
@@ -726,12 +748,12 @@ void __cdecl R_GetStaticModelLightSurfs(const GfxLight **visibleLights, int visi
                     drawSurf = material->info.drawSurf;
                     //HIDWORD(drawSurf.packed) = ((staticModelId.surfType & 0xF) << 18) | HIDWORD(drawSurf.packed) & 0xFFC3FFFF;
                     drawSurf.fields.surfType = staticModelId.surfType;
-                    if (!R_AllocDrawSurf(&surfData.delayedCmdBuf, drawSurf, &surfData.drawSurfList, 3u))
+                    if (!R_AllocDrawSurf(&surfData.delayedCmdBuf, drawSurf, &surfData.drawSurfList, R_StaticModelDrawSurfWordCount(1)))
                         break;
                     R_AddDelayedStaticModelDrawSurf(&surfData.delayedCmdBuf, &surfaces[surfaceIndex], (uint8_t*)list, 1u);
                     if (light->type == GFX_LIGHT_TYPE_SPOT && r_spotLightShadows->current.enabled && r_spotLightSModelShadows->current.enabled)
                     {
-                        if (!R_AllocDrawSurf(&shadowSurfData.delayedCmdBuf, drawSurf, &shadowSurfData.drawSurfList, 3u))
+                        if (!R_AllocDrawSurf(&shadowSurfData.delayedCmdBuf, drawSurf, &shadowSurfData.drawSurfList, R_StaticModelDrawSurfWordCount(1)))
                             break;
                         R_AddDelayedStaticModelDrawSurf(
                             &shadowSurfData.delayedCmdBuf,
@@ -1406,7 +1428,10 @@ int __cdecl R_EmitPointLightPartitionSurfs(
         drawSurfCount = frontEndDataOut->drawSurfCount - firstDrawSurf;
         if (drawSurfCount)
         {
-            memcpy(partition, light, 0x40u);
+            // Native GfxLight layout; the ILP32 0x40 stride left `def` (and
+            // any later field) uncopied, so point-light partitions drew with a
+            // null LightDef.
+            memcpy(partition, light, sizeof(GfxLight));
             partition->info.drawSurfs = &frontEndDataOut->drawSurfs[firstDrawSurf];
             partitions[partitionCount++].info.drawSurfCount = drawSurfCount;
         }

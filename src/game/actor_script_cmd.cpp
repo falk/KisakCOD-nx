@@ -1822,8 +1822,8 @@ void __cdecl ActorCmd_GetMotionAngle(scr_entref_t entref)
     actor_s *v1; // r31
     double v2; // fp1
     double v3; // fp31
-    long double v4; // fp2
-    long double v5; // fp2
+    double v4; // fp2
+    double v5; // fp2
     double v6; // fp1
     double v7; // fp1
 
@@ -1857,7 +1857,8 @@ void __cdecl ActorCmd_GetAnglesToLikelyEnemyPath(scr_entref_t entref)
     actor_s *v1; // r31
 
     v1 = Actor_Get(entref);
-    if ((unsigned __int8)Actor_GetAnglesToLikelyEnemyPath(v1))
+    // LP64: test the returned path node pointer, not its low byte.
+    if (Actor_GetAnglesToLikelyEnemyPath(v1))
         Scr_AddVector(v1->anglesToLikelyEnemyPath);
 }
 

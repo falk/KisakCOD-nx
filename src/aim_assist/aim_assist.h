@@ -108,7 +108,9 @@ struct AimInput // sizeof=0x30
     int32_t localClientNum;                 // ...
     const struct playerState_s *ps;            // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(AimInput) == 0x30);
+#endif
 
 struct AimOutput // sizeof=0x10
 {                                       // ...

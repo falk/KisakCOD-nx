@@ -998,7 +998,7 @@ void __cdecl Ragdoll_Init()
     {
         if (ragdoll_enable->current.enabled && ragdoll_max_simulating->current.integer < 8)
             Dvar_SetInt((dvar_s *)ragdoll_max_simulating, 8);
-        memset((uint8_t *)ragdollBodies, 0, 0x13A80u);
+        memset((uint8_t *)ragdollBodies, 0, sizeof(ragdollBodies)); // LP64: was the ILP32 array size
         for (i = 0; i < 2; ++i)
         {
             ragdollDefs[i].bound = 0;

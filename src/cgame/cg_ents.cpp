@@ -9,7 +9,10 @@
 #include "cg_actors.h"
 #include <xanim/dobj_utils.h>
 #include <EffectsCore/fx_system.h>
+#include <universal/critical_section.h>
+#ifndef __SWITCH__
 #include <win32/win_local.h>
+#endif
 #include <physics/phys_local.h>
 #include <game/savememory.h>
 #include <ragdoll/ragdoll.h>
@@ -22,6 +25,8 @@
 #include "cg_compassfriendlies.h"
 
 #include <bgame/bg_local.h>
+
+#include <port/switch_perf.h>
 
 void __cdecl LocalConvertQuatToMat(const DObjAnimMat *mat, float (*axis)[3])
 {
@@ -273,7 +278,9 @@ void __cdecl CG_mg42_PreControllers(int localClientNum, const DObj_s *obj, centi
     if (v5)
     {
         cent->pose.cullIn = 0;
-        cent->pose.actor.proneType = (int)cgArray[0].refdefViewAngles;
+        // The turret controller consumes the live view-angle pointer; the
+        // decompiled assignment targeted the overlapping actor union field.
+        cent->pose.turret.viewAngles = cgArray[0].refdefViewAngles;
     }
     else
     {
@@ -575,7 +582,7 @@ void __cdecl CG_UpdateBModelWorldBounds(unsigned int localClientNum, centity_s *
     float maxs[3]; // [esp-Ch] [ebp-1ECh] BYREF
     float v6; // [esp+0h] [ebp-1E0h]
     float mins[3]; // [esp+4h] [ebp-1DCh] BYREF
-    float v8[8]; // [esp+10h] [ebp-1D0h]
+    float v8[8]; // [esp+10h] [ebp-1D0h] (LP64: dropped dead v8[3..7] stores of a truncated &rotatedBounds address)
     float v9; // [esp+30h] [ebp-1B0h]
     float v10; // [esp+34h] [ebp-1ACh]
     float v11; // [esp+38h] [ebp-1A8h]
@@ -803,19 +810,14 @@ void __cdecl CG_UpdateBModelWorldBounds(unsigned int localClientNum, centity_s *
     v10 = *((float *)&v14 + 1) * v64 + v10;
     v11 = *(float *)&v15 * v65 + v11;
     rotatedBounds[0].v[0] = *(float *)&v16 * v66 + rotatedBounds[0].v[0];
-    LODWORD(v8[7]) = (uintptr_t)&rotatedBounds[0].v[1];
     rotatedBounds[0].v[1] = *(float *)&v39 * v73 + v59;
     rotatedBounds[0].v[2] = *((float *)&v39 + 1) * v74 + v60;
     rotatedBounds[0].v[3] = *(float *)&v40 * v75 + v61;
     rotatedBounds[1].v[0] = *(float *)&v41 * v76 + v62;
-    LODWORD(v8[6]) = (uintptr_t)&rotatedBounds[0].v[1];
-    LODWORD(v8[5]) = (uintptr_t)&rotatedBounds[0].v[1];
     rotatedBounds[0].v[1] = *(float *)&v25 * v68 + rotatedBounds[0].v[1];
     rotatedBounds[0].v[2] = *((float *)&v25 + 1) * v69 + rotatedBounds[0].v[2];
     rotatedBounds[0].v[3] = *(float *)&v26 * v70 + rotatedBounds[0].v[3];
     rotatedBounds[1].v[0] = *(float *)&v27 * v71 + rotatedBounds[1].v[0];
-    LODWORD(v8[4]) = (uintptr_t)&rotatedBounds[0].v[1];
-    LODWORD(v8[3]) = (uintptr_t)&rotatedBounds[0].v[1];
     rotatedBounds[0].v[1] = rotatedBounds[1].v[1] * v63 + rotatedBounds[0].v[1];
     rotatedBounds[0].v[2] = rotatedBounds[1].v[2] * v64 + rotatedBounds[0].v[2];
     rotatedBounds[0].v[3] = rotatedBounds[1].v[3] * v65 + rotatedBounds[0].v[3];
@@ -1195,7 +1197,50 @@ FxEffect *__cdecl CG_StartFx(int localClientNum, centity_s *cent, int startAtTim
             localClientNum);
     v7 = cgsArray[0].fxs[scale];
     if (!v7)
+    {
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\cgame\\cg_ents.cpp", 946, 0, "%s", "fxDef");
+        // The original asserts and then faults in FX_SpawnEffect on the null
+        // def; name the effect slot instead so a registration gap is
+        // attributable.
+        Com_Error(ERR_DROP, "CG_StartFx: entity %d fx slot %d ('%s') has no registered effect",
+                  cent->nextState.number, scale,
+                  CL_GetConfigString(localClientNum, scale + CS_EFFECT_NAMES));
+    }
+    if (!v7->elemDefs && (v7->elemDefCountLooping + v7->elemDefCountOneShot + v7->elemDefCountEmission) > 0)
+    {
+        // Same shape as above: FX_EffectAffectsGameplay walks def->elemDefs
+        // unconditionally, so a widened effect with counts but no element
+        // array faults at address 0.
+        Com_Error(ERR_DROP, "CG_StartFx: entity %d fx slot %d ('%s' def '%s') has %d elemDefs but a null elemDefs array",
+                  cent->nextState.number, scale,
+                  CL_GetConfigString(localClientNum, scale + CS_EFFECT_NAMES),
+                  v7->name ? v7->name : "(null)",
+                  v7->elemDefCountLooping + v7->elemDefCountOneShot + v7->elemDefCountEmission);
+    }
+    {
+        // FX_DEF_DIAG: dump the effect the spawn is about to walk (once per
+        // slot) so a fault inside FX_EffectAffectsGameplay's pointer chase
+        // is attributable to a specific widened element/handle.
+        extern const dvar_t *com_diagMarkers;
+        static unsigned char s_fxDefDumped[128];
+        if (com_diagMarkers && com_diagMarkers->current.enabled && scale < 128 && !s_fxDefDumped[scale])
+        {
+            int count = v7->elemDefCountLooping + v7->elemDefCountOneShot + v7->elemDefCountEmission;
+            s_fxDefDumped[scale] = 1;
+            Com_Printf(0, "FX_DEF_DIAG slot=%d cs='%s' def=%p name='%s' flags=0x%x counts=%d/%d/%d elemDefs=%p\n",
+                       scale, CL_GetConfigString(localClientNum, scale + CS_EFFECT_NAMES), (const void *)v7,
+                       v7->name ? v7->name : "(null)", v7->flags, v7->elemDefCountLooping,
+                       v7->elemDefCountOneShot, v7->elemDefCountEmission, (const void *)v7->elemDefs);
+            for (int i = 0; v7->elemDefs && i < count; ++i)
+            {
+                const FxElemDef *e = &v7->elemDefs[i];
+                Com_Printf(0, "FX_DEF_DIAG   elem[%d] flags=0x%x type=%d visualCount=%d visuals=%p onImpact=%p onDeath=%p emitted=%p\n",
+                           i, e->flags, e->elemType, e->visualCount, (const void *)e->visuals.array,
+                           (const void *)e->effectOnImpact.handle, (const void *)e->effectOnDeath.handle,
+                           (const void *)e->effectEmitted.handle);
+            }
+        }
+    }
     return FX_SpawnOrientedEffect(localClientNum, v7, startAtTime, cent->pose.origin, v9, 0x87Fu);
 }
 
@@ -1333,7 +1378,11 @@ void CG_PrimaryLight(int localClientNum, centity_s *cent) {
     LerpEntityState *p_currentState = &cent->currentState;
     LerpEntityState *p_lerp = &cent->nextState.lerp;
 
-    GfxLight *light = (GfxLight *)((char *)cgArray[0].refdef.primaryLights + __ROL4__(lightIndex, 6));
+    // Native GfxLight array indexing: the decompiled __ROL4__(lightIndex, 6)
+    // encodes the ILP32 64-byte stride; on LP64 GfxLight is 72 bytes, so that
+    // arithmetic wrote color/dir into neighbouring lights and zeroed their
+    // type/def (the lit pass then drew a disabled light).
+    GfxLight *light = &cgArray[0].refdef.primaryLights[lightIndex];
     const ComPrimaryLight *primaryLight = Com_GetPrimaryLight(lightIndex);
     float frameInterp = cgArray[0].frameInterpolation;
 
@@ -1519,11 +1568,11 @@ void __cdecl CG_CreatePhysicsObject(int localClientNum, centity_s *cent)
 
 void __cdecl CG_UpdatePhysicsPose(centity_s *cent)
 {
-    int physObjId; // r11
+    uintptr_t physObjId; // r11 (a dxBody pointer; an int copy truncates on LP64)
     float v3[4]; // [sp+50h] [-20h] BYREF
 
     physObjId = cent->pose.physObjId;
-    if (!physObjId || physObjId == -1)
+    if (!physObjId || physObjId == (uintptr_t)-1)
         MyAssertHandler(
             "c:\\trees\\cod3\\cod3src\\src\\cgame\\cg_ents.cpp",
             1195,
@@ -1590,7 +1639,7 @@ void __cdecl CG_CalcEntityPhysicsPositions(int localClientNum, centity_s *cent)
 void __cdecl CG_SaveEntityPhysics(centity_s *cent, SaveGame *save)
 {
     const DObj_s *obj; // r28
-    int physObjId; // r11
+    uintptr_t physObjId; // r11 (a dxBody pointer; an int copy truncates on LP64)
     char v6; // r11
     bool v7; // zf
     const char *modelName; // r29
@@ -1600,7 +1649,7 @@ void __cdecl CG_SaveEntityPhysics(centity_s *cent, SaveGame *save)
     iassert(save);
 
     obj = Com_GetClientDObj(cent->nextState.number, 0);
-    if (!obj || (physObjId = cent->pose.physObjId) == 0 || (v7 = physObjId != -1, v6 = 1, !v7))
+    if (!obj || (physObjId = cent->pose.physObjId) == 0 || (v7 = physObjId != (uintptr_t)-1, v6 = 1, !v7))
         v6 = 0;
     v11 = v6;
     SaveMemory_SaveWrite(&v11, 1, save);
@@ -1787,8 +1836,11 @@ void __cdecl CG_ClearUnion(int localClientNum, centity_s *cent)
         cent->pose.fx.effect = 0;
         break;
     case 0xAu:
+        // LP64: the original zeroed the union's first four words; on LP64
+        // fx.effect no longer overlays words 1-2, so clear the actor view.
         cent->pose.actor.proneType = 0;
-        *(_QWORD *)&cent->pose.fx.effect = 0;
+        cent->pose.actor.pitch = 0.0;
+        cent->pose.actor.roll = 0.0;
         cent->pose.actor.height = 0.0;
         break;
     case 0xBu:
@@ -1804,8 +1856,11 @@ void __cdecl CG_ClearUnion(int localClientNum, centity_s *cent)
         break;
     case 0xEu:
     case 0x10u:
+        // LP64: the original zeroed the union's first four words; on LP64
+        // fx.effect no longer overlays words 1-2, so clear the actor view.
         cent->pose.actor.proneType = 0;
-        *(_QWORD *)&cent->pose.fx.effect = 0;
+        cent->pose.actor.pitch = 0.0;
+        cent->pose.actor.roll = 0.0;
         cent->pose.actor.height = 0.0;
         break;
     default:
@@ -1862,55 +1917,97 @@ void __cdecl CG_UpdatePoseUnion(int localClientNum, centity_s *cent)
 void __cdecl CG_ProcessEntity(int localClientNum, centity_s *cent)
 {
     if (cent->nextState.loopSound)
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_LOOPSOUND);
         CG_AddEntityLoopSound(localClientNum, cent);
+    }
     if (cent->nextState.eType != cent->pose.eTypeUnion)
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_POSEUNION);
         CG_UpdatePoseUnion(localClientNum, cent);
+    }
 
     CG_DrawEntEqDebug(cent);
 
     switch (cent->nextState.eType)
     {
     case ET_GENERAL:
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_GENERAL);
         CG_General(localClientNum, cent);
         break;
+    }
     case ET_PLAYER:
     case ET_INVISIBLE:
         return;
     case ET_ITEM:
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_ITEM);
         CG_Item(cent);
         break;
+    }
     case ET_MISSILE:
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_MISSILE);
         CG_Missile(localClientNum, cent);
         break;
+    }
     case ET_SCRIPTMOVER:
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_MOVER);
         CG_ScriptMover(localClientNum, cent);
         break;
+    }
     case ET_SOUND_BLEND:
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_OTHER);
         CG_SoundBlend(localClientNum, cent);
         break;
+    }
     case ET_FX:
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_FX);
         CG_Fx(localClientNum, cent);
         break;
+    }
     case ET_LOOP_FX:
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_FX);
         CG_LoopFx(localClientNum, cent);
         break;
+    }
     case ET_PRIMARY_LIGHT:
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_LIGHT);
         CG_PrimaryLight(localClientNum, cent);
         break;
+    }
     case ET_MG42:
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_MG42);
         CG_mg42(localClientNum, cent);
         break;
+    }
     case ET_VEHICLE:
     case ET_VEHICLE_CORPSE:
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_VEHICLE);
         CG_Vehicle(localClientNum, cent);
         break;
+    }
     case ET_ACTOR:
     case ET_ACTOR_CORPSE:
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_ACTOR);
         CG_Actor(localClientNum, cent);
         break;
+    }
     case ET_ACTOR_SPAWNER:
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_OTHER);
         CG_ActorSpawner(cent);
         break;
+    }
     default:
         Com_Error(ERR_DROP, "Bad entity type %i", cent->nextState.eType);
         break;
@@ -2108,6 +2205,10 @@ void __cdecl CG_PredictiveSkinCEntity(GfxSceneEntity *sceneEnt)
 
     iassert(sceneEnt);
 
+#ifdef __SWITCH__
+    SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_PREDICT);
+#endif
+
     if (!cl_freemove->current.integer)
     {
         v2.pose = sceneEnt->info.pose;
@@ -2157,7 +2258,10 @@ void __cdecl CG_AddPacketEntity(unsigned int localClientNum, unsigned int entnum
     v12 = Entity->pose.angles[2];
     if (Entity->nextState.eType == ET_SCRIPTMOVER && Entity->nextState.solid == 0xFFFFFF)
     {
-        CG_CalcEntityLerpPositions(localClientNum, Entity);
+        {
+            SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_LERP);
+            CG_CalcEntityLerpPositions(localClientNum, Entity);
+        }
         if (*origin != v9
             || origin[1] != v10
             || origin[2] != v11
@@ -2169,11 +2273,17 @@ void __cdecl CG_AddPacketEntity(unsigned int localClientNum, unsigned int entnum
         }
         v14 = v13;
         if (v13)
+        {
+            SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_LINK);
             CG_UpdateBModelWorldBounds(localClientNum, v5, 0);
+        }
     }
     else
     {
-        CG_CalcEntityLerpPositions(localClientNum, Entity);
+        {
+            SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_LERP);
+            CG_CalcEntityLerpPositions(localClientNum, Entity);
+        }
         if (*origin != v9
             || origin[1] != v10
             || origin[2] != v11
@@ -2196,6 +2306,7 @@ void __cdecl CG_AddPacketEntity(unsigned int localClientNum, unsigned int entnum
             ClientDObj = Com_GetClientDObj(entnum, localClientNum);
             if (ClientDObj)
             {
+                SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_LINK);
                 Radius = DObjGetRadius(ClientDObj);
                 R_LinkDObjEntity(localClientNum, entnum, origin, (float)((float)Radius + (float)16.0));
             }
@@ -2203,17 +2314,21 @@ void __cdecl CG_AddPacketEntity(unsigned int localClientNum, unsigned int entnum
     }
     if (v5->pose.physObjId == -1)
     {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_LINK);
         if (CG_IsEntityLinked(localClientNum, entnum))
             CG_UnlinkEntity(localClientNum, entnum);
     }
     else
     {
-        if (CG_IsEntityLinked(localClientNum, entnum))
-            v21 = v14;
-        else
-            v21 = CG_EntityNeedsLinked(localClientNum, entnum);
-        if (v21)
-            CG_LinkEntity(localClientNum, entnum);
+        {
+            SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_LINK);
+            if (CG_IsEntityLinked(localClientNum, entnum))
+                v21 = v14;
+            else
+                v21 = CG_EntityNeedsLinked(localClientNum, entnum);
+            if (v21)
+                CG_LinkEntity(localClientNum, entnum);
+        }
         CG_ProcessEntity(localClientNum, v5);
     }
 }
@@ -2369,4 +2484,3 @@ int __cdecl CG_DObjGetWorldTagPos(const cpose_t *pose, DObj_s *obj, unsigned int
 
     return 1;
 }
-

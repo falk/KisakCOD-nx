@@ -601,6 +601,9 @@ struct clientDebugStringInfo_t;
 struct clientDebugLineInfo_t;
 
 void CL_RecordServerDebugData();
+// Retail PC SV_FrameRateSmoothing (0x5c8390) skips smoothing while the server
+// sent debug draw data last frame (cls.debug.prevFromServer).
+bool CL_ServerDebugDataRecordedLastFrame();
 void __cdecl CL_AddDebugString(
     const float *xyz,
     const float *color,

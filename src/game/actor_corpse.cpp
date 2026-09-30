@@ -38,12 +38,12 @@ int __cdecl G_GetActorCorpseIndex(gentity_s *ent)
 
     number = ent->s.number;
     result = 0;
-    p_entnum = &g_scr_data.actorCorpseInfo[0].entnum;
-    while (*p_entnum != number)
+    // LP64: index corpseInfo_t by struct (the decompiled loop stepped an
+    // int pointer by the ILP32 stride of 8 words; it is 10 here).
+    while (g_scr_data.actorCorpseInfo[result].entnum != number)
     {
-        p_entnum += 8;
         ++result;
-        if ((int)p_entnum >= (int)&g_scr_data.actorBackup)
+        if (result >= (int)ARRAY_COUNT(g_scr_data.actorCorpseInfo))
         {
             if (!alwaysfails)
                 MyAssertHandler(
@@ -206,16 +206,15 @@ void __cdecl G_RemoveActorCorpses(unsigned int allowedCorpseCount)
     actorCorpseCount = level.actorCorpseCount;
     if ((int)allowedCorpseCount < level.actorCorpseCount)
     {
-        p_entnum = &g_scr_data.actorCorpseInfo[allowedCorpseCount].entnum;
         do
         {
-            if (*p_entnum >= 0)
+            const int corpseEntnum = g_scr_data.actorCorpseInfo[v2].entnum; // LP64: struct index
+            if (corpseEntnum >= 0)
             {
-                G_FreeEntity(&level.gentities[*p_entnum]);
+                G_FreeEntity(&level.gentities[corpseEntnum]);
                 actorCorpseCount = level.actorCorpseCount;
             }
             ++v2;
-            p_entnum += 8;
         } while (v2 < actorCorpseCount);
     }
     level.actorCorpseCount = allowedCorpseCount;
@@ -325,18 +324,16 @@ void __cdecl G_PruneLoadedCorpses()
     v2 = 0;
     v3 = 0;
     v4 = (unsigned int*)corpseIndices;
-    p_entnum = &g_scr_data.actorCorpseInfo[0].entnum;
     do
     {
-        if (*p_entnum >= 0)
+        if (g_scr_data.actorCorpseInfo[v3].entnum >= 0) // LP64: struct index
         {
             *v4 = v3;
             ++v2;
             ++v4;
         }
-        p_entnum += 8;
         ++v3;
-    } while ((int)p_entnum < (int)&g_scr_data.actorBackup);
+    } while (v3 < (int)ARRAY_COUNT(g_scr_data.actorCorpseInfo));
     if (v2 > 6)
     {
         ent = G_Find(0, offsetof(gentity_s, classname), scr_const.player);

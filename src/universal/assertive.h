@@ -6,6 +6,11 @@
 
 void MyAssertHandler(const char* filename, int line, int type, const char* fmt, ...);
 
+// Every assertion that the non-fatal Switch handler reports is counted
+// so a checkpoint can refuse to pass through it.  Zero means no assertion has
+// fired since process start.
+int Assert_GetCount(void);
+
 #ifdef USE_ASSERTS
 #define iassert(expression) (void)(                                                       \
             (!!(expression)) ||                                                          \

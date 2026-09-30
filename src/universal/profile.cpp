@@ -836,7 +836,7 @@ void __cdecl Profile_EndScript(int profileIndex)
 #endif
 }
 
-int __cdecl Profile_EndInternal(long double *duration)
+int __cdecl Profile_EndInternal(double *duration)
 {
     // KISAKTODO: Profiler
     return 0;
@@ -844,7 +844,7 @@ int __cdecl Profile_EndInternal(long double *duration)
     LARGE_INTEGER qpc;
 
     ProfileAtom end;
-    QueryPerformanceCounter(&qpc);
+    qpc.QuadPart = __rdtsc();
     end.value[0] = qpc.QuadPart;
 
     ProfileStack* prof_stack = (ProfileStack*)Sys_GetValue(0);
@@ -947,7 +947,7 @@ void __cdecl Profile_Begin(int index)
 
     *++prof_stack->prof_ppStack = p;
 
-    QueryPerformanceCounter(&qpc);
+    qpc.QuadPart = __rdtsc();
     p->write.start[p->write.nesting].value[0] = qpc.QuadPart;
 }
 

@@ -4,7 +4,9 @@
 #include <universal/assertive.h>
 #include <qcommon/qcommon.h>
 
+#ifndef __SWITCH__
 #include <Windows.h>
+#endif
 #include "threads.h"
 #include <xanim/xanim.h>
 #include <mutex>
@@ -781,12 +783,14 @@ void __cdecl track_addbasicmeminfo(meminfo_t* sum, meminfo_t* in)
 #endif
 }
 
-static int __cdecl mem_track_compare(uint32_t *elem1, uint32_t *elem2)
+// LP64: compare through the struct; the decompiled form used the ILP32
+// offsets (+16 type, [2] size) of the 20-byte mem_track_t.
+static int __cdecl mem_track_compare(const mem_track_t *elem1, const mem_track_t *elem2)
 {
-    if (*((uint8_t *)elem1 + 16) < (int)*((uint8_t *)elem2 + 16))
+    if (elem1->type < elem2->type)
         return -1;
-    if (*((uint8_t *)elem1 + 16) <= (int)*((uint8_t *)elem2 + 16))
-        return elem1[2] - elem2[2];
+    if (elem1->type <= elem2->type)
+        return elem1->size - elem2->size;
     return 1;
 }
 
@@ -834,15 +838,15 @@ void __cdecl track_PrintInfo()
         ++nodeCount;
     nodeCount += g_physicalMemInfoCount;
     len2 += nodeCount;
-    sorted_mem_track = (mem_track_t*)malloc(20 * len2);
+    sorted_mem_track = (mem_track_t*)malloc(sizeof(mem_track_t) * len2);
     if (sorted_mem_track)
     {
         len = 0;
-        Com_Memcpy((char*)sorted_mem_track, (char*)g_mem_track, 20 * g_mem_track_count);
+        Com_Memcpy((char*)sorted_mem_track, (char*)g_mem_track, sizeof(mem_track_t) * g_mem_track_count);
         len += g_mem_track_count;
-        Com_Memcpy((char*)&sorted_mem_track[len], (char*)g_hunk_track, 20 * g_hunk_track_count);
+        Com_Memcpy((char*)&sorted_mem_track[len], (char*)g_hunk_track, sizeof(mem_track_t) * g_hunk_track_count);
         len += g_hunk_track_count;
-        Com_Memcpy((char*)&sorted_mem_track[len], (char*)g_hunklow_track, 20 * g_hunklow_track_count);
+        Com_Memcpy((char*)&sorted_mem_track[len], (char*)g_hunklow_track, sizeof(mem_track_t) * g_hunklow_track_count);
         len += g_hunklow_track_count;
         if (minSpecImageMemory)
         {
@@ -950,7 +954,7 @@ void __cdecl track_PrintInfo()
             if (v8)
                 info.nonSwapMinSpecTotal += mem_trackb->size;
         }
-        qsort(sorted_mem_track, len, 0x14u, (int(__cdecl*)(const void*, const void*))mem_track_compare);
+        qsort(sorted_mem_track, len, sizeof(mem_track_t), (int(__cdecl*)(const void*, const void*))mem_track_compare);
         info.typeTotal[23] = info.typeTotal[19]
             + info.typeTotal[22]
             + info.typeTotal[21]

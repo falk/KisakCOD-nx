@@ -75,7 +75,9 @@ struct FxEffectDef // sizeof=0x20
     int elemDefCountEmission;
     const FxElemDef *elemDefs;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(FxEffectDef) == 32);
+#endif
 
 struct FxEffect // sizeof=0x80
 {                                       // ...
@@ -95,6 +97,11 @@ struct FxEffect // sizeof=0x80
     FxSpatialFrame frameNow;
     FxSpatialFrame framePrev;
     float distanceTraveled;
+
+    // Handle encoding unit (bytes per handle step); the LP64 struct is wider
+    // than the ILP32 0x80 reference size, so handle validation must derive
+    // its modulus from sizeof(FxEffect) instead of the old 0x20 literal.
+    static constexpr size_t HANDLE_SCALE = 4;
 };
 
 template<typename T>
@@ -142,7 +149,7 @@ struct FxElem // sizeof=0x28
     //$A58BA6DA60295001BBA5E9F807131CF1 ___u8;
     union
     {
-        int physObjId;
+        uintptr_t physObjId;
         float origin[3];
     };
     //FxElem::<unnamed_type_u> u;
@@ -302,7 +309,7 @@ struct FxUpdateElem // sizeof=0x7C
     // padding byte
     // padding byte
     // padding byte
-    int physObjId;                      // ...
+    uintptr_t physObjId;                // live physics handle; widened on LP64
 };
 struct FxCmd // sizeof=0xC
 {                                       // ...
@@ -358,7 +365,7 @@ struct FxElemVisualState // sizeof=0x18
     float size[2];                      // ...
     float scale;
 };
-const struct FxElemVisStateSample // sizeof=0x30
+struct FxElemVisStateSample // sizeof=0x30
 {
     FxElemVisualState base;
     FxElemVisualState amplitude;
@@ -378,7 +385,7 @@ struct FxElemVelStateInFrame // sizeof=0x30
     FxElemVec3Range velocity;
     FxElemVec3Range totalDelta;
 };
-const struct FxElemVelStateSample // sizeof=0x60
+struct FxElemVelStateSample // sizeof=0x60
 {
     FxElemVelStateInFrame local;
     FxElemVelStateInFrame world;
@@ -426,7 +433,7 @@ struct FxTrailDef // sizeof=0x1C
     int indCount;
     uint16_t *inds;
 };
-const struct FxElemDef // sizeof=0xFC
+struct FxElemDef // sizeof=0xFC
 {
     int flags;
     FxSpawnDef spawn;
@@ -477,7 +484,9 @@ struct FxImpactTable // sizeof=0x8
     const char *name;
     FxImpactEntry *table;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(FxImpactTable) == 8);
+#endif
 
 struct FxSystemBuffers // sizeof=0x47480
 {                                       // ...

@@ -16,23 +16,37 @@
 #include "turret.h"
 #include "g_vehicle_path.h"
 
+// LP64 debt:
+// these `ofs` values were originally literal byte offsets copied from the
+// ILP32 reference binary's gentity_s layout. On LP64 several earlier
+// members (client/actor/sentient/scr_vehicle/pTurretInfo, all pointers)
+// are 8 bytes instead of 4, shifting every later field -- so the literals
+// no longer matched this build's real gentity_s layout at all. Confirmed
+// live: G_ParseEntityField's F_STRING case wrote a spawned entity's
+// classname string handle at the old literal 284, which under the real
+// LP64 layout lands squarely inside scr_vehicle's own 8-byte span
+// (offsetof 280-287) -- corrupting it into a garbage non-null pointer
+// that then faulted inside G_UpdateVehicleTags/XModelGetBoneIndex.
+// offsetof() lets the compiler compute the real offset for whichever
+// layout is actually in effect, matching the pattern already used by
+// g_save.cpp's own field-offset table.
 const ent_field_t fields_1[16] =
 {
-  { "classname", 284, F_STRING, &Scr_ReadOnlyField },
-  { "origin", 224, F_VECTOR, &Scr_SetOrigin },
-  { "model", 280, F_MODEL, &Scr_ReadOnlyField },
-  { "spawnflags", 300, F_INT, &Scr_ReadOnlyField },
-  { "target", 290, F_STRING, NULL },
-  { "targetname", 292, F_STRING, NULL },
-  { "count", 340, F_INT, NULL },
-  { "health", 324, F_INT, &Scr_SetHealth },
-  { "dmg", 336, F_INT, NULL },
-  { "angles", 236, F_VECTOR, &Scr_SetAngles },
-  { "script_linkname", 286, F_STRING, NULL },
-  { "script_noteworthy", 288, F_STRING, NULL },
-  { "maxhealth", 328, F_INT, NULL },
-  { "anglelerprate", 616, F_FLOAT, NULL },
-  { "activator", 348, F_ENTITY, &Scr_ReadOnlyField },
+  { "classname", offsetof(gentity_s, classname), F_STRING, &Scr_ReadOnlyField },
+  { "origin", offsetof(gentity_s, r.currentOrigin), F_VECTOR, &Scr_SetOrigin },
+  { "model", offsetof(gentity_s, model), F_MODEL, &Scr_ReadOnlyField },
+  { "spawnflags", offsetof(gentity_s, spawnflags), F_INT, &Scr_ReadOnlyField },
+  { "target", offsetof(gentity_s, target), F_STRING, NULL },
+  { "targetname", offsetof(gentity_s, targetname), F_STRING, NULL },
+  { "count", offsetof(gentity_s, count), F_INT, NULL },
+  { "health", offsetof(gentity_s, health), F_INT, &Scr_SetHealth },
+  { "dmg", offsetof(gentity_s, damage), F_INT, NULL },
+  { "angles", offsetof(gentity_s, r.currentAngles), F_VECTOR, &Scr_SetAngles },
+  { "script_linkname", offsetof(gentity_s, script_linkName), F_STRING, NULL },
+  { "script_noteworthy", offsetof(gentity_s, script_noteworthy), F_STRING, NULL },
+  { "maxhealth", offsetof(gentity_s, maxHealth), F_INT, NULL },
+  { "anglelerprate", offsetof(gentity_s, angleLerpRate), F_FLOAT, NULL },
+  { "activator", offsetof(gentity_s, activator), F_ENTITY, &Scr_ReadOnlyField },
   { NULL, 0, F_INT, NULL }
 };
 
@@ -97,7 +111,7 @@ int __cdecl G_LevelSpawnString(const char *key, const char *defaultString, const
 int __cdecl G_SpawnFloat(const char *key, const char *defaultString, float *out)
 {
     int v4; // r30
-    long double v5; // fp2
+    double v5; // fp2
     int result; // r3
     const char *v7; // [sp+50h] [-20h] BYREF
 
@@ -671,6 +685,7 @@ void __cdecl Scr_GetGenericEntArray(unsigned int offset, unsigned int name)
     Scr_MakeArray();
     v5 = 0;
     v6 = g_entities;
+    int matchCount = 0;
     for (i = level.num_entities; v5 < i; ++v6)
     {
         if (v6->r.inuse && *(_WORD *)((char *)v6 + v4->ofs) && *(unsigned __int16 *)((char *)v6 + v4->ofs) == name)
@@ -678,8 +693,24 @@ void __cdecl Scr_GetGenericEntArray(unsigned int offset, unsigned int name)
             Scr_AddEntity(v6);
             Scr_AddArray();
             i = level.num_entities;
+            ++matchCount;
         }
         ++v5;
+    }
+    // getTargetDummies("rifle") in killhouse_code.gsc resolves through here
+    // (getEntArray(group + "_target_dummy", "script_noteworthy")) with no
+    // laneID filter, so its count is however many entities this loop
+    // matches; an unexpectedly large count can stall flag_when_lowered's
+    // `targets_hit < numRaised` gate. Filtered to *_target_dummy names,
+    // capped; read-only probe.
+    {
+        const char *nameStr = SL_ConvertToString(name);
+        static uint32_t s_targetDummyArrayLog = 0;
+        if (nameStr && strstr(nameStr, "target_dummy") && s_targetDummyArrayLog < 64)
+        {
+            ++s_targetDummyArrayLog;
+            Com_Printf(0, "KISAK_TARGETDUMMY_ARRAY value=%s count=%d\n", nameStr, matchCount);
+        }
     }
 }
 
@@ -1419,4 +1450,3 @@ void __cdecl Scr_GetObjectField(unsigned int classnum, unsigned int entnum, unsi
         break;
     }
 }
-

@@ -1,6 +1,10 @@
 // win_local.h: Win32-specific Quake3 header file
 #pragma once // addition
 
+#if !defined(_WIN32)
+#include <mutex>
+#endif
+
 #if defined (_MSC_VER) && (_MSC_VER >= 1200)
 #pragma warning(disable : 4201)
 #pragma warning( push )
@@ -11,7 +15,11 @@
 #pragma warning( pop )
 #endif
 
-#ifndef _XBOX
+// DirectInput and Winsock are Win32 shell dependencies.  Horizon has its own
+// controller and network seams, so including these headers from a shared
+// declaration header would make otherwise portable database/UI owners fail
+// before they reach their Switch implementation.
+#if defined(_WIN32) && !defined(_XBOX)
 #define DIRECTINPUT_VERSION 0x0800  //[ 0x0300 | 0x0500 | 0x0700 | 0x0800 ]
 #include <dinput.h>
 //#include <dsound.h>
@@ -19,6 +27,8 @@
 #include <wsipx.h>
 #endif
 #include <qcommon/qcommon.h>
+#include <qcommon/sys_event.h>
+#include <universal/critical_section.h>
 #ifdef KISAK_MP
 #include <qcommon/net_chan_mp.h>
 #elif KISAK_SP
@@ -108,12 +118,21 @@ void __cdecl IN_ShowSystemCursor(BOOL show);
 void	IN_DeactivateWin32Mouse( void);
 
 void	IN_Activate (qboolean active);
+// Real implementation is switch_input_lifecycle.cpp, a C-linkage (extern "C")
+// TU; match that linkage here too, or C++ callers that only see this
+// declaration look for a mangled symbol that never exists.
+#if defined(__SWITCH__) && defined(__cplusplus)
+extern "C" {
+#endif
 void	IN_Frame (void);
+#if defined(__SWITCH__) && defined(__cplusplus)
+}
+#endif
 
 bool IN_IsTalkKeyHeld();
 
-// window procedure
-#ifndef _XBOX
+// window procedure: a real Win32 message loop, never reached on Horizon.
+#if defined(_WIN32) && !defined(_XBOX)
 LRESULT WINAPI MainWndProc (
     HWND    hWnd,
     UINT    uMsg,
@@ -124,11 +143,11 @@ LRESULT WINAPI MainWndProc (
 void Conbuf_AppendText( const char *msg );
 void Conbuf_AppendTextInMainThread(const char* msg);
 
-#ifndef _XBOX
+#if defined(_WIN32) && !defined(_XBOX)
 // LWSS: Accurate to cod4
 typedef struct
 {
-	HINSTANCE		reflib_library;		// Handle to refresh DLL 
+	HINSTANCE		reflib_library;		// Handle to refresh DLL
 	qboolean		reflib_active;
 
 	HWND			hWnd;
@@ -149,8 +168,8 @@ extern WinVars_t	g_wv;
 
 struct __declspec(align(8)) SysInfo // sizeof=0x260
 {                                       // ...
-	long double cpuGHz;                 // ...
-	long double configureGHz;           // ...
+	double cpuGHz;                 // ...
+	double configureGHz;           // ...
 	int logicalCpuCount;                // ...
 	int physicalCpuCount;               // ...
 	int sysMB;                          // ...
@@ -179,146 +198,9 @@ extern std::mutex s_criticalSections[];
 extern int client_state; // LWSS ADD. This looks similar to signonstate
 extern HWND g_splashWnd;
 
-#if defined(KISAK_RADIANT)
-// Radiant tools build: use SP-compatible critical section layout
-enum CriticalSection : __int32
-{
-	CRITSECT_CONSOLE = 0x0,
-	CRITSECT_DEBUG_SOCKET = 0x1,
-	CRITSECT_COM_ERROR = 0x2,
-	CRITSECT_STATMON = 0x3,
-	CRITSECT_SOUND_ALLOC = 0x4,
-	CRITSECT_MEM_ALLOC0 = 0x5,
-	CRITSECT_MEM_ALLOC1 = 0x6,
-	CRITSECT_DEBUG_LINE = 0x7,
-	CRITSECT_ALLOC_MARK = 0x8,
-	CRITSECT_STREAMED_SOUND = 0x9,
-	CRITSECT_FAKELAG = 0xA,
-	CRITSECT_CLIENT_MESSAGE = 0xB,
-	CRITSECT_CLIENT_CMD = 0xC,
-	CRITSECT_DOBJ_ALLOC = 0xD,
-	CRITSECT_START_SERVER = 0xE,
-	CRITSECT_XANIM_ALLOC = 0xF,
-	CRITSECT_KEY_BINDINGS = 0x10,
-	CRITSECT_FX_VIS = 0x11,
-	CRITSECT_SERVER_MESSAGE = 0x12,
-	CRITSECT_SCRIPT_STRING = 0x13,
-	CRITSECT_MEMORY_TREE = 0x14,
-	CRITSECT_ASSERT = 0x15,
-	CRITSECT_SCRIPT_DEBUGGER_ALLOC = 0x16,
-	CRITSECT_MISSING_ASSET = 0x17,
-	CRITSECT_PHYSICS = 0x18,
-	CRITSECT_LIVE = 0x19,
-	CRITSECT_AUDIO_PHYSICS = 0x1A,
-	CRITSECT_CINEMATIC = 0x1B,
-	CRITSECT_CINEMATIC_TARGET_CHANGE = 0x1C,
-	CRITSECT_FX_ALLOC = 0x1D,
-	CRITSECT_NETTHREAD_OVERRIDE = 0x1E,
-	CRITSECT_CBUF = 0x1F,
-	CRITSECT_SYS_EVENT_QUEUE,
-	CRITSECT_FATAL_ERROR,
-	CRITSECT_GPU_FENCE,
-	CRITSECT_COUNT,
-};
-#elif defined(KISAK_MP)
-enum CriticalSection : int
-{
-	CRITSECT_CONSOLE = 0x0,
-	CRITSECT_DEBUG_SOCKET = 0x1,
-	CRITSECT_COM_ERROR = 0x2,
-	CRITSECT_STATMON = 0x3,
-	CRITSECT_DEBUG_LINE = 0x4,
-	CRITSECT_ALLOC_MARK = 0x5,
-	CRITSECT_SCRIPT_STRING = 0x6,
-	CRITSECT_MEMORY_TREE = 0x7,
-	CRITSECT_ASSERT = 0x8,
-	CRITSECT_RD_BUFFER = 0x9,
-	CRITSECT_SYS_EVENT_QUEUE = 0xA,
-	CRITSECT_GPU_FENCE = 0xB,
-	CRITSECT_FATAL_ERROR = 0xC,
-	CRITSECT_SCRIPT_DEBUGGER_ALLOC = 0xD,
-	CRITSECT_MISSING_ASSET = 0xE,
-	CRITSECT_PHYSICS = 0xF,
-	CRITSECT_LIVE = 0x10,
-	CRITSECT_AUDIO_PHYSICS = 0x11,
-	CRITSECT_CINEMATIC = 0x12,
-	CRITSECT_CINEMATIC_TARGET_CHANGE = 0x13,
-	CRITSECT_FX_ALLOC = 0x14,
-	CRITSECT_CBUF = 0x15,
-
-	CRITSECT_COUNT = 0x16,
-};
-#elif KISAK_SP
-enum CriticalSection : __int32
-{
-	CRITSECT_CONSOLE = 0x0,
-	CRITSECT_DEBUG_SOCKET = 0x1,
-	CRITSECT_COM_ERROR = 0x2,
-	CRITSECT_STATMON = 0x3,
-	CRITSECT_SOUND_ALLOC = 0x4,
-	CRITSECT_MEM_ALLOC0 = 0x5,
-	CRITSECT_MEM_ALLOC1 = 0x6,
-	CRITSECT_DEBUG_LINE = 0x7,
-	CRITSECT_ALLOC_MARK = 0x8,
-	CRITSECT_STREAMED_SOUND = 0x9,
-	CRITSECT_FAKELAG = 0xA,
-	CRITSECT_CLIENT_MESSAGE = 0xB,
-	CRITSECT_CLIENT_CMD = 0xC,
-	CRITSECT_DOBJ_ALLOC = 0xD,
-	CRITSECT_START_SERVER = 0xE,
-	CRITSECT_XANIM_ALLOC = 0xF,
-	CRITSECT_KEY_BINDINGS = 0x10,
-	CRITSECT_FX_VIS = 0x11,
-	CRITSECT_SERVER_MESSAGE = 0x12,
-	CRITSECT_SCRIPT_STRING = 0x13,
-	CRITSECT_MEMORY_TREE = 0x14,
-	CRITSECT_ASSERT = 0x15,
-	CRITSECT_SCRIPT_DEBUGGER_ALLOC = 0x16,
-	CRITSECT_MISSING_ASSET = 0x17,
-	CRITSECT_PHYSICS = 0x18,
-	CRITSECT_LIVE = 0x19,
-	CRITSECT_AUDIO_PHYSICS = 0x1A,
-	CRITSECT_CINEMATIC = 0x1B,
-	CRITSECT_CINEMATIC_TARGET_CHANGE = 0x1C,
-	CRITSECT_FX_ALLOC = 0x1D,
-	CRITSECT_NETTHREAD_OVERRIDE = 0x1E,
-	CRITSECT_CBUF = 0x1F,
-
-	// LWSS ADD
-	CRITSECT_SYS_EVENT_QUEUE,
-	CRITSECT_FATAL_ERROR,
-	CRITSECT_GPU_FENCE,
-	// LWSS END
-
-	CRITSECT_COUNT,
-};
-
-#endif
-
-struct sysEvent_t // sizeof=0x18
-{                                       // ...
-	int evTime;                         // ...
-	sysEventType_t evType;              // ...
-	int evValue;                        // ...
-	int evValue2;                       // ...
-	int evPtrLength;                    // ...
-	void *evPtr;                        // ...
-};
-
-struct FastCriticalSection
-{
-	volatile uint32_t readCount;
-	volatile uint32_t writeCount;
-};
-
-void Sys_InitializeCriticalSections();
-void Sys_EnterCriticalSection(int critSect);
-void Sys_LeaveCriticalSection(int critSect);
-void Sys_LockWrite(FastCriticalSection* critSect);
-void Sys_UnlockWrite(FastCriticalSection* critSect);
-
-int Sys_InterlockedIncrement(uint *addend);
-int Sys_InterlockedDecrement(uint *addend);
+// Fast reader/writer lock moved to a platform-neutral header so the database
+// and dvar closures can use it without the Win32 shell.
+#include <universal/fast_critical_section.h>
 
 void Sys_SetErrorText(const char* buf);
 void Sys_Error(const char *error, ...);
@@ -327,13 +209,20 @@ void __cdecl Sys_NormalExit();
 
 void __cdecl Sys_OpenURL(const char *url, int doexit);
 void __cdecl  Sys_Quit();
+// Real implementation is switch_platform.c's Sys_Print, a C-linkage TU;
+// match that linkage here too for the same reason as Sys_Milliseconds in
+// q_shared.h.
+#if defined(__SWITCH__) && defined(__cplusplus)
+extern "C" {
+#endif
 void __cdecl Sys_Print(const char *msg);
+#if defined(__SWITCH__) && defined(__cplusplus)
+}
+#endif
 char *__cdecl Sys_GetClipboardData();
 int __cdecl Sys_SetClipboardData(const char *text);
-void __cdecl Sys_QueEvent(uint32_t time, sysEventType_t type, int value, int value2, int ptrLength, void *ptr);
 void Sys_ShutdownEvents();
 void __cdecl Sys_LoadingKeepAlive();
-sysEvent_t *__cdecl Sys_GetEvent(sysEvent_t *result);
 void __cdecl Sys_Init();
 
 void Sys_In_Restart_f();

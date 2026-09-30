@@ -4047,7 +4047,7 @@ void G_UpdateVehicleTags(gentity_s *ent)
     {
         BoneIndex = SV_DObjGetBoneIndex(ent, **v4++);
         *flash++ = BoneIndex;
-    } while ((int)v4 < (int)&s_flashTags[5]);
+    } while (v4 < &s_flashTags[5]);
 
     wheel = veh->boneIndex.wheel;
     v7 = s_wheelTags;
@@ -4055,7 +4055,7 @@ void G_UpdateVehicleTags(gentity_s *ent)
     {
         v8 = SV_DObjGetBoneIndex(ent, **v7++);
         *wheel++ = v8;
-    } while ((int)v7 < (int)&s_wheelTags[6]);
+    } while (v7 < &s_wheelTags[6]);
 }
 
 #endif

@@ -1,7 +1,9 @@
 #include <universal/q_shared.h>
+#include <port/switch_perf.h>
 #include "r_dpvs.h"
 #include "r_dvars.h"
 #include <cgame/cg_local.h>
+
 
 void __cdecl R_AddAabbTreeSurfacesInFrustum_r(const GfxAabbTree *tree, const DpvsClipPlaneSet *clipSet)
 {
@@ -281,6 +283,9 @@ void __cdecl R_AddCellStaticSurfacesInFrustumCmd(DpvsStaticCellCmd *data)
 {
     uint32_t viewIndex; // [esp+4h] [ebp-4h]
 
+#ifdef __SWITCH__
+    SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_CELLSTATIC);
+#endif
     viewIndex = data->viewIndex;
     g_smodelVisData = rgp.world->dpvs.smodelVisData[viewIndex];
     g_surfaceVisData = rgp.world->dpvs.surfaceVisData[viewIndex];

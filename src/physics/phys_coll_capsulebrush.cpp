@@ -453,7 +453,6 @@ bool __cdecl Phys_CapsuleSeparatingAxisTest(
     Vec3Sub(tri0, capsule->center, p0);
     Vec3Sub(tri1, capsule->center, p1);
     Vec3Sub(tri2, capsule->center, p2);
-    LODWORD(v15[51]) = (uint32)capsule->axis;
     Vec3Sub(tri0, cp0, diff);
     Vec3Cross(diff, capsule->axis, cross);
     Vec3Cross(cross, capsule->axis, testAxis);

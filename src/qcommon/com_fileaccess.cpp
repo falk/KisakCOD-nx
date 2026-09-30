@@ -136,7 +136,7 @@ int __cdecl FileWrapper_GetFileSize(FILE *h)
     return fileSize;
 }
 
-#ifdef KISAK_SP
+#if defined(KISAK_SP) && !defined(__SWITCH__)
 #include <Windows.h>
 #include <fileapi.h>
 uint32_t FS_FileTell(FILE *file)
@@ -150,5 +150,16 @@ uint32_t FS_FileTell(FILE *file)
     SetFilePointerEx(0, move, &v2, 1u);
     ProfLoad_EndTrackedValue(MAP_PROFILE_FILE_SEEK);
     return v2.LowPart;
+}
+#elif defined(KISAK_SP) && defined(__SWITCH__)
+// Real portable equivalent of the Windows SetFilePointerEx(..., FILE_CURRENT)
+// query above: ftell already reports the current stream position with no
+// platform-specific API needed.
+uint32_t FS_FileTell(FILE *file)
+{
+    ProfLoad_BeginTrackedValue(MAP_PROFILE_FILE_SEEK);
+    const long position = ftell(file);
+    ProfLoad_EndTrackedValue(MAP_PROFILE_FILE_SEEK);
+    return position >= 0 ? static_cast<uint32_t>(position) : 0;
 }
 #endif

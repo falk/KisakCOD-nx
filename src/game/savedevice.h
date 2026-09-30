@@ -8,6 +8,9 @@
 static const char *CONSOLE_DEFAULT_SAVE_NAME = "savegame.svg";
 #endif
 
+// MSVC elaborated-type parameter; GCC needs the underlying type up front.
+enum SaveType : int;
+
 void __cdecl Memcard_InitializeSystem(void);
 void __cdecl SaveDevice_Init(void);
 void __cdecl SV_DisplaySaveErrorUI(void);

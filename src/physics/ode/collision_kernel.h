@@ -224,7 +224,9 @@ struct dxSimpleSpace : public dxSpace {
 };
 
 struct dxUserGeom : public dxGeom {
-    char user_data[16]; // MOD
+    // MOD. LP64: the brush classes store a BrushInfo (pointer + float[3]),
+    // 24 bytes here vs 16 on ILP32; keep pointer alignment for it.
+    alignas(void *) char user_data[sizeof(void *) == 8 ? 24 : 16];
 
     dxUserGeom(int class_num = dFirstUserClass, dxSpace *space = nullptr, dxBody *body = nullptr); // MOD
 

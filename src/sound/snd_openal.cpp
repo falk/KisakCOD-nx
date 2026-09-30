@@ -10,6 +10,8 @@
 #include <qcommon/qcommon.h>
 #include <universal/com_memory.h>
 #include <math.h>
+#include "snd_stream_openal.h"
+#include "snd_al_dispatch.h"
 
 // alGlob is declared extern in snd_local.h; its one definition lives in snd_driver.cpp
 // (KISAK_SOUND branch), matching where milesGlob's Miles-side definition already lives.
@@ -50,6 +52,11 @@ char __cdecl MSS_Init()
         16,
         snd_outputConfigurationStrings[snd_outputConfiguration->current.integer]);
 
+#ifdef __SWITCH__
+    // The audio DSP mixes; no OpenAL device/context.
+    if (!SND_AudrenOpen())
+        return 0;
+#else
     alGlob.device = alcOpenDevice(NULL);
     if (!alGlob.device)
     {
@@ -69,6 +76,7 @@ char __cdecl MSS_Init()
         alGlob.context = NULL;
         return 0;
     }
+#endif
 
     // Distance falloff is computed entirely by SND_Attenuate's curve and baked directly
     // into AL_GAIN (see the Phase 4 playback functions); disable OpenAL's own automatic
@@ -126,6 +134,10 @@ void MSS_InitChannels()
     alGenFilters(totalChannels, alGlob.sendFilter);
     for (int i = 0; i < totalChannels; ++i)
         alFilteri(alGlob.sendFilter[i], AL_FILTER_TYPE, AL_FILTER_LOWPASS);
+    // Dedicated cinematic (Bink movie) audio source; see SND_StartCinematicStream.
+    alGenSources(1, &alGlob.cinematicSource);
+    if (!alGlob.cinematicSource)
+        Com_Error(ERR_DROP, "OpenAL cinematic source allocation failed");
 
     g_snd.ambient_track = SND_TRACK_AMBIENT_PRIMARY_0;
 }
@@ -162,11 +174,15 @@ void MSS_InitEq()
 // open-then-close sanity probe here instead - the real device open happens in MSS_Init.
 bool __cdecl MSS_Startup()
 {
+#ifdef __SWITCH__
+    return true; // the renderer is opened (and can fail loudly) in MSS_Init
+#else
     ALCdevice *probe = alcOpenDevice(NULL);
     if (!probe)
         return false;
     alcCloseDevice(probe);
     return true;
+#endif
 }
 
 // Mirrors MSS_ShutdownCleanup. Also frees the sources/filters MSS_InitChannels allocated
@@ -174,22 +190,44 @@ bool __cdecl MSS_Startup()
 // unnoticed since nothing previously exercised a full init-then-shutdown cycle.
 void MSS_ShutdownCleanup()
 {
-    if (alGlob.context)
+#ifdef __SWITCH__
+    bool audrenOpen = SndAr_Attached();
+#else
+    bool audrenOpen = false;
+#endif
+    if (alGlob.context || audrenOpen)
     {
+        // The stream thread issues AL calls on stream sources: join it first.
+        SND_StreamShutdown();
         int totalChannels = g_snd.max_2D_channels + g_snd.max_3D_channels + g_snd.max_stream_channels;
         if (totalChannels > 0)
         {
             alDeleteSources(totalChannels, alGlob.source);
             alDeleteFilters(totalChannels, alGlob.sendFilter);
         }
+        SND_StopCinematicStream();
+        if (alGlob.cinematicSource)
+        {
+            alDeleteSources(1, &alGlob.cinematicSource);
+            alGlob.cinematicSource = 0;
+        }
+        SND_FreeLoadedSoundBuffers(); // sources are gone: nothing is attached
         alDeleteAuxiliaryEffectSlots(1, &alGlob.auxSlot);
         alDeleteEffects(1, &alGlob.reverbEffect);
 
+#ifndef __SWITCH__
+        // Switch has no ALC context (alc* is not routed to audren).
         alcMakeContextCurrent(NULL);
         alcDestroyContext(alGlob.context);
+#endif
     }
+#ifdef __SWITCH__
+    if (audrenOpen)
+        SND_AudrenClose();
+#else
     if (alGlob.device)
         alcCloseDevice(alGlob.device);
+#endif
     memset(&alGlob, 0, sizeof(alGlob));
 }
 
@@ -304,8 +342,11 @@ int __cdecl MSS_DigitalFormatType(int waveFormat, int bits, int channels)
 
 uint8_t *__cdecl MSS_Alloc(uint32_t bytes, uint32_t rate)
 {
+    // LP64: the decompiled form called MSS_Alloc_FastFile through an
+    // int-returning function pointer, truncating the heap pointer to 32
+    // bits (faulted on the first retained LoadedSound).
     if (IsFastFileLoad())
-        return (uint8_t *)((int(__cdecl *)(uint32_t, uint32_t))MSS_Alloc_FastFile)(bytes, rate);
+        return (uint8_t *)MSS_Alloc_FastFile(bytes);
     else
         return MSS_Alloc_LoadObj(bytes, rate);
 }

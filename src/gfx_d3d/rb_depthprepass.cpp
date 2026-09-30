@@ -7,6 +7,16 @@
 #include "r_meshdata.h"
 
 
+// r_deko9NativeFloatZ 1 (rb_floatz_native.h): the view needs float-Z but
+// it is rebuilt from the depth buffer, so a scene depth prepass
+// (r_depthPrepass) stays a depth prepass instead of re-rendering float-Z.
+static bool s_floatZFromDepth;
+
+void R_DepthPrepassFloatZFromDepth(bool fromDepth)
+{
+    s_floatZFromDepth = fromDepth;
+}
+
 void R_DepthPrepassCallback(const void *userData, GfxCmdBufContext context, GfxCmdBufContext prepassContext)
 {
     int height; // [esp+10h] [ebp-54h]
@@ -29,7 +39,7 @@ void R_DepthPrepassCallback(const void *userData, GfxCmdBufContext context, GfxC
     v6.bottom = height + y;
     device->SetRenderState(D3DRS_SCISSORTESTENABLE, 1u);
     device->SetScissorRect(&v6);
-    if (viewInfo->needsFloatZ)
+    if (viewInfo->needsFloatZ && !s_floatZFromDepth)
     {
         iassert( R_HaveFloatZ() );
         R_SetRenderTarget(context, R_RENDERTARGET_FLOAT_Z);

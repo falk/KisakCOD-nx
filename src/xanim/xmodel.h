@@ -92,14 +92,18 @@ struct XModel // sizeof=0xDC
     struct PhysPreset* physPreset;
     struct PhysGeomList* physGeoms;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(XModel) == 220);
+#endif
 
 struct XModelPiece // sizeof=0x10
 {
     XModel *model;
     float offset[3];
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(XModelPiece) == 16);
+#endif
 
 struct XModelPieces // sizeof=0xC
 {                                       // ...
@@ -107,7 +111,9 @@ struct XModelPieces // sizeof=0xC
     int numpieces;
     XModelPiece *pieces;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(XModelPieces) == 12);
+#endif
 
 struct QueueElement // sizeof=0x8
 {                                       // ...
@@ -143,7 +149,9 @@ struct XModelSurfs // sizeof=0x14
     struct XSurface *surfs;                    // ...
     int partBits[4];                    // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(XModelSurfs) == 20);
+#endif
 
 struct XModelConfigEntry // sizeof=0x404
 {                                       // ...
@@ -175,7 +183,9 @@ struct XModelPartsLoad // sizeof=0x1C
     unsigned __int8 *partClassification;
     DObjAnimMat *baseMat;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(XModelPartsLoad) == 28);
+#endif
 
 struct XModelDefault // sizeof=0x4C
 {                                       // ...
@@ -288,6 +298,10 @@ bool __cdecl XSurfaceVisitTrianglesInAabb_ProcessVertices(XSurfaceGetTriCandidat
 char __cdecl XSurfaceVisitTrianglesInAabb_ProcessTriangles(XSurfaceGetTriCandidatesLocals *locals);
 char __cdecl XSurfaceVisitTrianglesInAabb_ProcessLeaf(XSurfaceGetTriCandidatesLocals *locals);
 char __cdecl XSurfaceVisitTrianglesInAabb_ProcessNode(XSurfaceGetTriCandidatesLocals *locals);
+void __cdecl XModelReadSurface_BuildCollisionTree(
+    XSurface *surface,
+    uint32_t vertListIndex,
+    void *(__cdecl *Alloc)(int));
 int __cdecl XModelGetBoneIndex(const XModel *model, uint32_t name, uint32_t offset, unsigned __int8 *index);
 int __cdecl XModelGetStaticBounds(const XModel *model, mat3x3 &axis, float *mins, float *maxs);
 

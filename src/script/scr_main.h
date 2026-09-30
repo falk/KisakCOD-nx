@@ -70,7 +70,9 @@ struct scrVarPub_t // sizeof=0x2007C
     int totalObjectRefCount;
     volatile uint32_t totalVectorRefCount;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(scrVarPub_t) == 0x2007C);
+#endif
 
 struct PrecacheEntry // sizeof=0x8
 {                                       // ...

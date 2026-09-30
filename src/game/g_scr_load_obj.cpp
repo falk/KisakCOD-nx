@@ -10,6 +10,7 @@
 #include <script/scr_main.h>
 #include <xanim/xanim.h>
 #include <universal/profile.h>
+#include <game/g_bsp.h>
 
 int __cdecl GScr_LoadScriptAndLabel(const char *filename, const char *label, ScriptFunctions *functions)
 {
@@ -24,6 +25,10 @@ int __cdecl GScr_LoadScriptAndLabel(const char *filename, const char *label, Scr
         return 0;
     }
 
+    // TEMP script-execution scoping note: per-file begin/compiled prints
+    // lived here while locating a silent guest death (now root-caused to
+    // debugger script-list widths); reverted as log spam. Phase markers
+    // (entities/begin/end) in the probe stay.
     if (!Scr_LoadScript(filename))
     {
         functions->address[functions->count++] = 0;
@@ -97,32 +102,45 @@ void __cdecl GScr_LoadLevelScript(const char *mapname, ScriptFunctions *function
     GScr_LoadScriptAndLabel(filename, "main", functions);
 }
 
+struct PathNodeScriptLoadContext
+{
+    ScriptFunctions *functions;
+    uint32_t stringSet;
+    uint32_t nodesSeen;
+    uint32_t beginNodes;
+    uint32_t beginWithAnim;
+    uint32_t added;
+};
+
 void __cdecl GScr_LoadScriptsForPathNode(pathnode_t *loadNode, void *data)
 {
-    ScriptFunctions *functions; // r28
-    unsigned int count; // r27
+    PathNodeScriptLoadContext *context; // r28
     const char *animscript; // r31
     char filename[112]; // [sp+50h] [-70h] BYREF
 
-    functions = (ScriptFunctions *)data;
-    count = functions->count;
+    iassert(data);
 
-    iassert(functions);
+    context = (PathNodeScriptLoadContext *)data;
+    ++context->nodesSeen;
 
     if (loadNode->constant.type)
     {
         if (loadNode->constant.type == NODE_NEGOTIATION_BEGIN)
         {
+            ++context->beginNodes;
             if (loadNode->constant.animscript)
             {
+                ++context->beginWithAnim;
                 animscript = SL_ConvertToString(loadNode->constant.animscript);
 
                 iassert(animscript);
 
-                if (Scr_AddStringSet(count, animscript))
+                if (Scr_AddStringSet(context->stringSet, animscript))
                 {
+                    ++context->added;
                     Com_sprintf(filename, 64, "animscripts/traverse/%s", animscript);
-                    GScr_LoadScriptAndLabel(filename, "main", functions);
+                    
+                    GScr_LoadScriptAndLabel(filename, "main", context->functions);
                 }
             }
             else
@@ -146,11 +164,11 @@ void __cdecl GScr_LoadScriptsForPathNode(pathnode_t *loadNode, void *data)
 
 void __cdecl GScr_LoadScriptsForPathNodes(ScriptFunctions *functions)
 {
-    unsigned int inited; // [sp+54h] [-1Ch]
-
-    inited = Scr_InitStringSet();
-    Path_CallFunctionForNodes(GScr_LoadScriptsForPathNode, functions);
-    Scr_ShutdownStringSet(inited);
+    const uint32_t stringSet = Scr_InitStringSet();
+    PathNodeScriptLoadContext context{functions, stringSet, 0, 0, 0, 0};
+    Path_CallFunctionForNodes(GScr_LoadScriptsForPathNode, &context);
+    
+    Scr_ShutdownStringSet(stringSet);
 }
 
 void __cdecl GScr_LoadScriptsForEntities(ScriptFunctions *functions)
@@ -202,6 +220,7 @@ void __cdecl GScr_LoadScriptsForEntities(ScriptFunctions *functions)
             if (animscript[0] && Scr_AddStringSet(animstringset, animscript))
             {
                 Com_sprintf(filename, 64, "animscripts/traverse/%s", animscript); // Note the `/traverse/`!
+                
                 GScr_LoadScriptAndLabel(filename, "main", functions);
             }
         }
@@ -230,6 +249,18 @@ void __cdecl GScr_LoadScriptsForEntities(ScriptFunctions *functions)
             }
         }
     }
+    // The compiled path data is the authoritative traverse-animscript set:
+    // the entity string can omit node_negotiation_begin spawns that the
+    // pathnode array still carries. Load those scripts through the same
+    // dedupe set so GScr_SetScripts' pathnode pass (one slot per unique
+    // animscript, Hunk-deduped against the entity pass) finds every function
+    // address it expects. The load and set passes must stay paired.
+    {
+        PathNodeScriptLoadContext context{functions, animstringset, 0, 0, 0, 0};
+        
+        Path_CallFunctionForNodes(GScr_LoadScriptsForPathNode, &context);
+        
+    }
     Scr_ShutdownStringSet(stringset);
     Scr_ShutdownStringSet(animstringset); // LWSS ADD
     G_ResetEntityParsePoint();
@@ -257,7 +288,6 @@ void __cdecl GScr_LoadEntities()
 
 void __cdecl GScr_LoadScripts(const char *mapname, ScriptFunctions *functions)
 {
-    unsigned int inited; // [sp+54h] [-7Ch]
     char filename[112]; // [sp+60h] [-70h] BYREF
 
     Scr_BeginLoadScripts();
@@ -279,11 +309,9 @@ void __cdecl GScr_LoadScripts(const char *mapname, ScriptFunctions *functions)
     }
     {
         PROF_SCOPED("load entity scripts");
-        GScr_LoadScriptsForEntities(functions); // LWSS: function changed to register functions for `node_negotiation_begin`
+        // Registers node_negotiation_begin entity scripts and the compiled
+        // pathnode traverse set together, sharing one dedupe string set.
+        GScr_LoadScriptsForEntities(functions);
     }
-    // LWSS: Removing this. Don't see it in SP PC. There should be 57 functions here.
-    //inited = Scr_InitStringSet();
-    //Path_CallFunctionForNodes(GScr_LoadScriptsForPathNode, functions);
-    //Scr_ShutdownStringSet(inited);
     Scr_PostCompileScripts();
 }

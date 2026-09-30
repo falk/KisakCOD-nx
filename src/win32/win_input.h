@@ -26,12 +26,23 @@ void	IN_KillRumbleScripts(int controller);
 void	IN_KillRumbleScripts( void );
 
 // LWSS add
+// Real implementations are switch_input_lifecycle.cpp, a C-linkage
+// (extern "C") TU; match that linkage here too for the same reason as
+// IN_Frame in win_local.h.
+#if defined(__SWITCH__) && defined(__cplusplus)
+extern "C" {
+#endif
 void __cdecl IN_SetForegroundWindow();
 bool __cdecl IN_IsForegroundWindow();
 
 void IN_ActivateMouse(qboolean force);
+#if defined(__SWITCH__) && defined(__cplusplus)
+}
+#endif
 void __cdecl IN_RecenterMouse();
+#if !defined(__SWITCH__)
 void __cdecl IN_SetCursorPos(tagPOINT x);
+#endif
 // LWSS end
 
 #define IN_CMD_GOTO_XTIMES	-5

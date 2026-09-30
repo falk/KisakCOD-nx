@@ -3,11 +3,23 @@
 #include <universal/assertive.h>
 #include "r_init.h"
 
-#define INITGUID 
+#if !defined(__SWITCH__)
+#define INITGUID
 #include <ddraw.h>
+#endif
 
 uint32_t s_maxReportedTexMem;
 
+#if defined(__SWITCH__)
+// No DirectDraw on Horizon.  R_DetectCurrentTextureMemory() below already
+// treats a zero vidMemInMegs as "couldn't tell available video memory" and
+// falls back to the real D3D9 dx.device->GetAvailableTextureMem() figure
+// alone, so this is a correct (if less precise) answer, not a stub.
+uint32_t __cdecl R_VideoMemory()
+{
+    return 0;
+}
+#else
 uint32_t __cdecl R_VideoMemoryForDevice(_GUID *lpGUID)
 {
     _DDSCAPS2 caps; // [esp+0h] [ebp-20h] BYREF
@@ -139,6 +151,7 @@ uint32_t __cdecl R_VideoMemory()
         size >>= 1;
     return size;
 }
+#endif
 
 uint32_t __cdecl R_AvailableTextureMemory()
 {

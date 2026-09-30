@@ -89,11 +89,11 @@ void __cdecl Actor_UpdateLookAngles(actor_s *self)
 {
     ai_orient_t *p_ScriptOrient; // r30
     double v4; // fp31
-    long double v5; // fp2
+    double v5; // fp2
     double v6; // fp0
     double v7; // fp25
     double v8; // fp31
-    long double v9; // fp2
+    double v9; // fp2
     double v10; // fp0
 
     double a2;
@@ -137,7 +137,7 @@ void __cdecl Actor_UpdateBodyAngle(actor_s *self)
     double fDesiredBodyYaw; // fp0
     gentity_s *ent; // r11
     double v5; // fp31
-    long double v6; // fp2
+    double v6; // fp2
     double v7; // fp31
     double v8; // fp13
     double v9; // fp0

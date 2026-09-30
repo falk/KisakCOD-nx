@@ -45,7 +45,11 @@ struct GfxSceneEntityCull // sizeof=0x40
     volatile uint32_t state;
     float mins[3];
     float maxs[3];
-    char lods[32];
+    // Signed: -1 means "this submodel is culled at every LOD".  Plain char is
+    // unsigned on AArch64, so the original char[32] made DObjGetSurfaceData's
+    // -1 read back as 255 and index XModel::lodInfo[255] in every render path
+    // that guards with `lod < 0`.
+    int8_t lods[32];
     GfxSkinnedXModelSurfs skinnedSurfs;
 };
 

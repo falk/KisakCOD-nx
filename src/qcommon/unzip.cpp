@@ -240,8 +240,9 @@ const char * gzerror OF((gzFile file, int *errnum));
 
 
 #ifndef UNZ_BUFSIZE
-//#define UNZ_BUFSIZE (65536)
-#define UNZ_BUFSIZE (0x4000)
+// Flash-era read granularity: IWIs average ~230KB compressed, so a 256KB
+// input window turns each entry into 1-2 reads instead of ~15.
+#define UNZ_BUFSIZE (0x40000)
 #endif
 
 #ifndef UNZ_MAXFILENAMEINZIP
@@ -998,8 +999,20 @@ extern int unzOpenCurrentFile (unzFile file)
 	pfile_in_zip_read_info = (file_in_zip_read_info_s*) ALLOC(sizeof(file_in_zip_read_info_s));
 	// NOTE(mrsteyk): @Hack
 	memset(pfile_in_zip_read_info, 0, sizeof(*pfile_in_zip_read_info));
+	pfile_in_zip_read_info->read_file_pos = ~0ul;
 
-	pfile_in_zip_read_info->read_buffer=(char*)ALLOC(UNZ_BUFSIZE);
+	// Size the input window to the entry instead of always 256KB: an IWI
+	// averages ~230KB (one or two reads), while tiny entries (headers,
+	// lookups) should not pay a 256KB allocation and cache footprint.
+	{
+		unsigned long bufSize = UNZ_BUFSIZE;
+		if (s->cur_file_info.compressed_size && s->cur_file_info.compressed_size < bufSize)
+			bufSize = s->cur_file_info.compressed_size;
+		if (bufSize < 0x1000)
+			bufSize = 0x1000;
+		pfile_in_zip_read_info->read_buffer=(char*)ALLOC(bufSize);
+		pfile_in_zip_read_info->read_buffer_size = bufSize;
+	}
 	pfile_in_zip_read_info->offset_local_extrafield = offset_local_extrafield;
 	pfile_in_zip_read_info->size_local_extrafield = size_local_extrafield;
 	pfile_in_zip_read_info->pos_local_extrafield=0;
@@ -1028,7 +1041,7 @@ extern int unzOpenCurrentFile (unzFile file)
 	  // LWSS END
 	  
 	  //err=inflateInit(&pfile_in_zip_read_info->stream, Z_SYNC_FLUSH, 1);
-	  err = inflateInit2_(&pfile_in_zip_read_info->stream, -15, "1.1.4", sizeof(z_stream_s));
+	  err = inflateInit2_(&pfile_in_zip_read_info->stream, -15, ZLIB_VERSION, sizeof(z_stream_s));
 	  if (err == Z_OK)
 	    pfile_in_zip_read_info->stream_initialised=1;
         /* windowBits is passed < 0 to tell that there is no zlib header.
@@ -1093,7 +1106,7 @@ extern int unzReadCurrentFile  (unzFile file, void *buf, unsigned len)
 	{
 		if ((pfile_in_zip_read_info->stream.avail_in==0) && (pfile_in_zip_read_info->rest_read_compressed>0))
 		{
-			uInt uReadThis = UNZ_BUFSIZE;
+			uInt uReadThis = (uInt)pfile_in_zip_read_info->read_buffer_size;
 			if (pfile_in_zip_read_info->rest_read_compressed<uReadThis)
 				uReadThis = (uInt)pfile_in_zip_read_info->rest_read_compressed;
 			if (uReadThis == 0)
@@ -1102,12 +1115,15 @@ extern int unzReadCurrentFile  (unzFile file, void *buf, unsigned len)
 			// LWSS: Removing this line is accurate to COD4
 			//if (s->cur_file_info.compressed_size == pfile_in_zip_read_info->rest_read_compressed)
 
-			if (ZIP_fseek(pfile_in_zip_read_info->file,
-					  pfile_in_zip_read_info->pos_in_zipfile +
-						 pfile_in_zip_read_info->byte_before_the_zipfile,2)!=0)
+			const unsigned long readPos =
+				pfile_in_zip_read_info->pos_in_zipfile +
+				pfile_in_zip_read_info->byte_before_the_zipfile;
+			if (pfile_in_zip_read_info->read_file_pos != readPos &&
+				ZIP_fseek(pfile_in_zip_read_info->file, readPos, 2) != 0)
 				return UNZ_ERRNO;
 			if (ZIP_fread(pfile_in_zip_read_info->read_buffer,uReadThis, pfile_in_zip_read_info->file)!= uReadThis)
 				return UNZ_ERRNO;
+			pfile_in_zip_read_info->read_file_pos = readPos + uReadThis;
 			pfile_in_zip_read_info->pos_in_zipfile += uReadThis;
 
 			pfile_in_zip_read_info->rest_read_compressed-=uReadThis;

@@ -17,6 +17,7 @@
 #include <qcommon/cmd.h>
 #include <EffectsCore/fx_system.h>
 #include <game/bullet.h>
+#include <port/switch_rumble.h>
 
 #ifdef KISAK_MP
 #include <cgame_mp/cg_local_mp.h>
@@ -39,42 +40,110 @@ const float MYLERP_END = 0.1f;
 
 int32_t removeMeWhenMPStopsCrashingInHere;
 
+// byte offsets into WeaponDef, indexed by the
+// viewmodel anim index (the szXAnims[] slot), naming the "how long should this
+// anim take" field GetWeaponAnimRate divides the anim length by.  -1 means
+// "no time field, play at rate 1".
+//
+// The IDA-derived table shipped the *ILP32* offsets (888, 896, 900, ...).
+// WeaponDef is 2168 bytes on the 32-bit reference ABI and 2832 bytes here, so
+// on LP64 every entry was 548 bytes short and GetWeaponAnimRate's
+// `*(int32_t *)((char *)&weapDef->szInternalName + offset)` read four bytes out
+// of the pointer blocks (gunXModel/szXAnims/sound aliases) instead of the
+// intended int.  That produced garbage anim rates: a null pointer reads 0 (rate
+// 0 -> the anim never advances, which is the reported "reload does not work"),
+// and half of a live 64-bit address reads *negative* (rate = length / negative
+// time -> a tiny negative rate -> a tiny negative `dtimea` in
+// XAnimUpdateTimeAndNotetrackLeaf -> `ASSERT FAIL xanim.cpp:1245 (time >= 0)`
+// with `(time) = -4.67135e-08`).  Derive the offsets from the live layout.
+//
+// Each entry keeps its ILP32 constant in the comment, and the static_asserts
+// below re-check that constant against the retail wire map that
+// db_retail_decode_weapon.cpp already validates, so the mapping is proven at
+// compile time on both ABIs rather than trusted.
+#define WEAP_ANIM_RATE_OFS(member) ((int32_t)offsetof(WeaponDef, member))
+
 int32_t g_animRateOffsets[NUM_WEAP_ANIMS] =
 {
-  -1,
-  -1,
-  -1,
-  -1,
-  888,
-  -1,
-  -1,
-  896,
-  900,
-  904,
-  912,
-  920,
-  928,
-  936,
-  956,
-  932,
-  944,
-  940,
-  952,
-  948,
-  960,
-  964,
-  968,
-  972,
-  976,
-  -1,
-  980,
-  992,
-  -1,
-  -1,
-  -1,
-  -1,
-  -1
-}; // idb
+  -1,                                      //  0 (root)
+  -1,                                      //  1 idleAnim
+  -1,                                      //  2 emptyIdleAnim
+  -1,                                      //  3 fireAnim
+  WEAP_ANIM_RATE_OFS(iHoldFireTime),       //  4 holdFireAnim        (ILP32 888)
+  -1,                                      //  5 lastShotAnim
+  -1,                                      //  6 rechamberAnim
+  WEAP_ANIM_RATE_OFS(iMeleeTime),          //  7 meleeAnim           (ILP32 896)
+  WEAP_ANIM_RATE_OFS(meleeChargeTime),     //  8 meleeChargeAnim     (ILP32 900)
+  WEAP_ANIM_RATE_OFS(iReloadTime),         //  9 reloadAnim          (ILP32 904)
+  WEAP_ANIM_RATE_OFS(iReloadEmptyTime),    // 10 reloadEmptyAnim     (ILP32 912)
+  WEAP_ANIM_RATE_OFS(iReloadStartTime),    // 11 reloadStartAnim     (ILP32 920)
+  WEAP_ANIM_RATE_OFS(iReloadEndTime),      // 12 reloadEndAnim       (ILP32 928)
+  WEAP_ANIM_RATE_OFS(iRaiseTime),          // 13 raiseAnim           (ILP32 936)
+  WEAP_ANIM_RATE_OFS(iFirstRaiseTime),     // 14 firstRaiseAnim      (ILP32 956)
+  WEAP_ANIM_RATE_OFS(iDropTime),           // 15 dropAnim            (ILP32 932)
+  WEAP_ANIM_RATE_OFS(iAltRaiseTime),       // 16 altRaiseAnim        (ILP32 944)
+  WEAP_ANIM_RATE_OFS(iAltDropTime),        // 17 altDropAnim         (ILP32 940)
+  WEAP_ANIM_RATE_OFS(quickRaiseTime),      // 18 quickRaiseAnim      (ILP32 952)
+  WEAP_ANIM_RATE_OFS(quickDropTime),       // 19 quickDropAnim       (ILP32 948)
+  WEAP_ANIM_RATE_OFS(iEmptyRaiseTime),     // 20 emptyRaiseAnim      (ILP32 960)
+  WEAP_ANIM_RATE_OFS(iEmptyDropTime),      // 21 emptyDropAnim       (ILP32 964)
+  WEAP_ANIM_RATE_OFS(sprintInTime),        // 22 sprintInAnim        (ILP32 968)
+  WEAP_ANIM_RATE_OFS(sprintLoopTime),      // 23 sprintLoopAnim      (ILP32 972)
+  WEAP_ANIM_RATE_OFS(sprintOutTime),       // 24 sprintOutAnim       (ILP32 976)
+  -1,                                      // 25 detonateAnim
+  WEAP_ANIM_RATE_OFS(nightVisionWearTime), // 26 nightVisionWearAnim (ILP32 980)
+  WEAP_ANIM_RATE_OFS(nightVisionRemoveTime),// 27 nightVisionRemoveAnim (ILP32 992)
+  -1,                                      // 28 adsFireAnim
+  -1,                                      // 29 adsLastShotAnim
+  -1,                                      // 30 adsRechamberAnim
+  -1,                                      // 31 WEAP_ANIM_ADS_UP
+  -1                                       // 32 WEAP_ANIM_ADS_DOWN
+};
+
+// Proof that each offsetof above names the same member the ILP32 constant
+// named.  db_retail_decode_weapon.cpp's wire map carries the run
+// `{848, offsetof(WeaponDef, playerDamage), 224}`: 32-bit offsets 848..1071 are
+// a run of 4-byte scalars that lands natively at offsetof(playerDamage) + delta.
+// Every anim-rate offset (888..992) lives inside that run, so the ILP32
+// constant and the native offsetof must agree through it.  If WeaponDef's field
+// order ever drifts, or if someone re-hardcodes a 32-bit offset here, this
+// fails to compile instead of silently reading a pointer at runtime.
+#define WEAP_ANIM_RATE_ILP32_RUN_BASE 848
+#define WEAP_ANIM_RATE_CHECK(member, ilp32)                                            \
+    static_assert(offsetof(WeaponDef, member)                                          \
+                      == offsetof(WeaponDef, playerDamage)                             \
+                             + ((ilp32) - WEAP_ANIM_RATE_ILP32_RUN_BASE),              \
+                  "g_animRateOffsets: WeaponDef::" #member                             \
+                  " no longer sits at the ILP32 offset " #ilp32)
+
+WEAP_ANIM_RATE_CHECK(iHoldFireTime, 888);
+WEAP_ANIM_RATE_CHECK(iMeleeTime, 896);
+WEAP_ANIM_RATE_CHECK(meleeChargeTime, 900);
+WEAP_ANIM_RATE_CHECK(iReloadTime, 904);
+WEAP_ANIM_RATE_CHECK(iReloadEmptyTime, 912);
+WEAP_ANIM_RATE_CHECK(iReloadStartTime, 920);
+WEAP_ANIM_RATE_CHECK(iReloadEndTime, 928);
+WEAP_ANIM_RATE_CHECK(iDropTime, 932);
+WEAP_ANIM_RATE_CHECK(iRaiseTime, 936);
+WEAP_ANIM_RATE_CHECK(iAltDropTime, 940);
+WEAP_ANIM_RATE_CHECK(iAltRaiseTime, 944);
+WEAP_ANIM_RATE_CHECK(quickDropTime, 948);
+WEAP_ANIM_RATE_CHECK(quickRaiseTime, 952);
+WEAP_ANIM_RATE_CHECK(iFirstRaiseTime, 956);
+WEAP_ANIM_RATE_CHECK(iEmptyRaiseTime, 960);
+WEAP_ANIM_RATE_CHECK(iEmptyDropTime, 964);
+WEAP_ANIM_RATE_CHECK(sprintInTime, 968);
+WEAP_ANIM_RATE_CHECK(sprintLoopTime, 972);
+WEAP_ANIM_RATE_CHECK(sprintOutTime, 976);
+WEAP_ANIM_RATE_CHECK(nightVisionWearTime, 980);
+WEAP_ANIM_RATE_CHECK(nightVisionRemoveTime, 992);
+
+// The whole point: on LP64 these are *not* the ILP32 numbers.  Keeping this
+// assertion makes a silent revert to the old table a build failure.
+#if UINTPTR_MAX != UINT32_MAX
+static_assert(offsetof(WeaponDef, iReloadTime) != 904,
+              "LP64 WeaponDef unexpectedly matches the ILP32 anim-rate offsets");
+#endif
 
 bool __cdecl CG_JavelinADS(int32_t localClientNum)
 {
@@ -162,10 +231,19 @@ void __cdecl CG_RegisterWeapon(int32_t localClientNum, uint32_t weaponNum)
                 DObjSetHidePartBits(obj, weapInfo->partBits);
                 DObjUpdateClientInfo(weapInfo->viewModelDObj, 0.05f, 0);
             }
-            if (weapDef->hudIcon)
-                cgMedia.stanceMaterials[weaponNum - 129] = weapDef->hudIcon;
-            else
-                cgMedia.stanceMaterials[weaponNum - 129] = 0;
+            // KISAKFIX (LP64): the decompile reads this store as
+            // `cgMedia.stanceMaterials[weaponNum - 129] = hudIcon` (0 when the
+            // weapon has none). stanceMaterials directly follows
+            // hintMaterials[HINT_NUM_HINTS = 133], so on ILP32 the wrapped
+            // 32-bit index lands on hintMaterials[weaponNum + 4], i.e.
+            // hintMaterials[weaponNum + WEAPON_HINT_OFFSET]: retail registers
+            // each weapon's HUD icon as its cursor-hint material. On LP64 the
+            // unsigned subtraction no longer wraps inside cgMedia (it faulted
+            // ~34 GB away at 0x809AFA000), and the earlier fix for that fault
+            // dropped the store for every SP weapon, which left all weapon
+            // hint materials NULL; CG_DrawCursorhint returns early on a NULL
+            // material, so "Press X to pick up / swap" never drew.
+            cgMedia.hintMaterials[weaponNum + WEAPON_HINT_OFFSET] = weapDef->hudIcon;
             weapInfo->translatedDisplayName = SEH_StringEd_GetString(weapDef->szDisplayName);
             if (!weapInfo->translatedDisplayName)
             {
@@ -712,16 +790,17 @@ void __cdecl HoldBreathSoundLerp(int32_t localClientNum, float lerp)
     float channelVolumes[64]; // [esp+Ch] [ebp-100h] BYREF
     cgs_t *cgs;
 
+    // SND_CHANNELVOLPRIO_HOLDBREATH: 2 in SP (retail iw3sp 0x433710), 1 in MP.
     if (lerp == 0.0)
     {
-        SND_DeactivateChannelVolumes(1, 0);
+        SND_DeactivateChannelVolumes(SND_CHANNELVOLPRIO_HOLDBREATH, 0);
     }
     else
     {
         cgs = CG_GetLocalClientStaticGlobals(localClientNum);
         for (channelIndex = 0; channelIndex < SND_GetEntChannelCount(); ++channelIndex)
             channelVolumes[channelIndex] = (cgs->holdBreathParams.sound.channelvolume[channelIndex] - 1.0) * lerp + 1.0;
-        SND_SetChannelVolumes(1, channelVolumes, 0);
+        SND_SetChannelVolumes(SND_CHANNELVOLPRIO_HOLDBREATH, channelVolumes, 0);
     }
 }
 
@@ -980,6 +1059,26 @@ double __cdecl GetWeaponAnimRate(WeaponDef *weapDef, XAnim_s *anims, uint32_t an
         return 1.0;
     time = *(int32_t *)((char *)&weapDef->szInternalName + offset);
     iassert(time >= 0);
+    if (time < 0)
+    {
+        // a negative anim time is never valid retail data -- it is the
+        // signature of this offset table naming the wrong WeaponDef member
+        // (see the note above g_animRateOffsets).  It yields a tiny negative
+        // rate, then a tiny negative `dtimea`, then
+        // `ASSERT FAIL xanim.cpp:1245 (time >= 0)`.  Name the weapon, the anim
+        // and the value here so one hardware run identifies it instead of
+        // leaving the assert as the only evidence.  Gated and capped; there is
+        // deliberately no clamp, the assert downstream must still fire.
+        extern const dvar_t *com_diagMarkers;
+        static uint32_t s_d40AnimRateLog = 0;
+        if (com_diagMarkers && com_diagMarkers->current.enabled && s_d40AnimRateLog < 8)
+        {
+            ++s_d40AnimRateLog;
+            Com_Printf(0, "KISAK_D40_ANIMRATE weapon=%s animIndex=%u offset=%d time=%d lengthMsec=%d\n",
+                       weapDef->szInternalName ? weapDef->szInternalName : "(null)",
+                       animIndex, offset, time, XAnimGetLengthMsec(anims, animIndex));
+        }
+    }
     if (!time)
         return 0.0;
     return (float)((double)XAnimGetLengthMsec(anims, animIndex) / (double)time);
@@ -2564,15 +2663,19 @@ void __cdecl CG_FireWeapon(
             if (isPlayer)
                 TakeClipOnlyWeaponIfEmpty(localClientNum, &cgameGlob->predictedPlayerState);
 #elif KISAK_SP
-            //if (playerUsingTurret || v19 || p_nextState->eType == ET_PLAYER)
-            //{
-            //    fireRumble = weaponDef->fireRumble;
-            //    if (fireRumble)
-            //    {
-            //        if (*fireRumble)
-            //            CG_PlayRumbleOnClient(localClientNum, fireRumble);
-            //    }
-            //}
+            // Retail's fireRumble is a rumble-asset *name*
+            // (WeaponDef::fireRumble, bg_weapons_load_obj.cpp); there is no
+            // rumble-graph asset type in this port's zone/database layer to
+            // resolve it against (switch_rumble.cpp's top comment), so the
+            // original CG_PlayRumbleOnClient(fireRumble) call this replaced
+            // could never have worked here either. Switch HD Rumble instead
+            // gets a fixed per-weapon-class envelope, fired on the same
+            // `isPlayer` condition (local player's own weapon, including
+            // turret use -- see the playerUsingTurret assignment above).
+#if defined(__SWITCH__)
+            if (isPlayer)
+                Switch_RumbleNotifyWeaponFire((int32_t)weaponDef->weapClass);
+#endif
 #endif
         }
         else
@@ -2654,7 +2757,7 @@ void __cdecl DrawBulletImpacts(
             tracerStart[2] = gunOrient.origin[2];
             AngleVectors(viewang, orient.axis[0], orient.axis[1], orient.axis[2]);
         }
-        drawTracers = cg_firstPersonTracerChance->current.value * 32768.0 > (double)rand();
+        drawTracers = cg_firstPersonTracerChance->current.value * (RAND_MAX + 1.0) > (double)rand();
         goto LABEL_33;
     }
     if (ent->nextState.eType != ET_PLAYER)
@@ -3096,7 +3199,7 @@ char __cdecl BulletTrace(
     iassert(attacker);
     iassert(br);
     bcassert(lastSurfaceType, SURF_TYPECOUNT);
-    Com_Memset((uint32_t *)br, 0, 68);
+    Com_Memset((uint32_t *)br, 0, sizeof(*br)); // LP64: was the ILP32 sizeof(BulletTraceResults)
     CG_LocationalTrace(&br->trace, (float*)bp->start, (float*)bp->end, bp->ignoreEntIndex, MASK_SHOT);
     if (br->trace.hitType == TRACE_HITTYPE_NONE)
         return 0;
@@ -3849,7 +3952,7 @@ bool __cdecl ShouldSpawnTracer(int32_t localClientNum, int32_t sourceEntityNum)
         return 0;
     }
 
-    return cg_tracerChance->current.value * 32768.0 > (double)rand();
+    return cg_tracerChance->current.value * (RAND_MAX + 1.0) > (double)rand();
 }
 
 void __cdecl CG_BulletHitClientEvent(
@@ -4182,7 +4285,7 @@ void CG_ArchiveWeaponInfo(MemoryFile *memFile)
     float numWeapons; // r30
     uint32_t NumWeapons; // r3
     int v5; // r28
-    int *p_hasAnimTree; // r30
+    weaponInfo_s *p_weaponInfo; // r30
     const DObj_s *v7; // r3
     float v8[24]; // [sp+50h] [-60h] BYREF
 
@@ -4203,21 +4306,23 @@ void CG_ArchiveWeaponInfo(MemoryFile *memFile)
     if (LODWORD(numWeapons) > 1)
     {
         v5 = LODWORD(numWeapons) - 1;
-        p_hasAnimTree = &cg_weaponsArray[0][1].hasAnimTree;
+        // weaponInfo_s carries native pointers on LP64; the retail -11 int /
+        // +18 int walk assumed the 72-byte ILP32 record.
+        p_weaponInfo = &cg_weaponsArray[0][1];
         do
         {
             if (IsWriting)
             {
-                v7 = (const DObj_s *)*(p_hasAnimTree - 11);
-                *p_hasAnimTree = v7 && DObjGetTree(v7);
+                v7 = p_weaponInfo->viewModelDObj;
+                p_weaponInfo->hasAnimTree = v7 && DObjGetTree(v7);
             }
             iassert(memFile);
             iassert(memFile->archiveProc);
-            memFile->archiveProc(memFile, 4, (byte*)p_hasAnimTree);
+            memFile->archiveProc(memFile, 4, (byte*)&p_weaponInfo->hasAnimTree);
             iassert(memFile->archiveProc);
-            memFile->archiveProc(memFile, 4, (byte *)p_hasAnimTree - 1);
+            memFile->archiveProc(memFile, 4, (byte *)&p_weaponInfo->iPrevAnim);
             --v5;
-            p_hasAnimTree += 18;
+            ++p_weaponInfo;
         } while (v5);
     }
     iassert(memFile);

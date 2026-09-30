@@ -1,5 +1,6 @@
 #include <universal/q_shared.h>
 #include "r_model_pose.h"
+#include <universal/spin_pause.h>
 #include <xanim/dobj_utils.h>
 #include "r_dobj_skin.h"
 #include <universal/profile.h>
@@ -81,9 +82,16 @@ DObjAnimMat *R_UpdateSceneEntBounds(
         *pLocalSceneEnt = 0;
         if (waitForCullState)
         {
+            uint32_t spin = 0;
             do
             {
-                state = sceneEnt->cull.state;
+                if (spin)
+                    Sys_SpinPause(spin);
+                ++spin;
+                // Acquire pairs with the owner's release store below: on
+                // AArch64 a plain volatile read could see BOUNDED before the
+                // mins/maxs the owner wrote first (x86/TSO hid this).
+                state = __atomic_load_n(&sceneEnt->cull.state, __ATOMIC_ACQUIRE);
                 iassert(state >= CULL_STATE_BOUNDED_PENDING);
             } while (state == CULL_STATE_BOUNDED_PENDING);
             if (state == CULL_STATE_DONE)
@@ -137,6 +145,15 @@ DObjAnimMat *R_UpdateSceneEntBounds(
 
                 DObjGetBoneInfo(obj, boneInfoArray);
                 boneCount = DObjNumBones(obj);
+                if (boneCount > 128)
+                {
+                    static unsigned s_boneDbg = 0;
+                    if (s_boneDbg < 24u)
+                    {
+                        ++s_boneDbg;
+                        
+                    }
+                }
                 animPartBit = 0x80000000;
                 boneIndex = 0;
 
@@ -187,9 +204,9 @@ DObjAnimMat *R_UpdateSceneEntBounds(
                         v10 = boneAxis.axis[1][1] >= 0.0 ? 0 : 12;
                         v28 = *(float *)((char *)&v35->bounds[0][2] + v10) * boneAxis.axis[1][1] + v27;
                         v19 = *(float *)((char *)&v35->bounds[1][2] - v10) * boneAxis.axis[1][1] + v18;
-                        if (v28 < (double)minWorld.v[0])
+                        if (v28 < minWorld.v[0])
                             minWorld.v[0] = v28;
-                        if (v19 > (double)maxWorld.v[0])
+                        if (v19 > maxWorld.v[0])
                             maxWorld.v[0] = v19;
                         v11 = v37 >= 0.0 ? 0 : 12;
                         v29 = *(float *)((char *)v35->bounds[0] + v11) * v37 + boneAxis.axis[2][2];
@@ -200,9 +217,9 @@ DObjAnimMat *R_UpdateSceneEntBounds(
                         v13 = boneAxis.axis[1][2] >= 0.0 ? 0 : 12;
                         v31 = *(float *)((char *)&v35->bounds[0][2] + v13) * boneAxis.axis[1][2] + v30;
                         v22 = *(float *)((char *)&v35->bounds[1][2] - v13) * boneAxis.axis[1][2] + v21;
-                        if (v31 < (double)minWorld.v[1])
+                        if (v31 < minWorld.v[1])
                             minWorld.v[1] = v31;
-                        if (v22 > (double)maxWorld.v[1])
+                        if (v22 > maxWorld.v[1])
                             maxWorld.v[1] = v22;
                         v14 = v38 >= 0.0 ? 0 : 12;
                         v32 = *(float *)((char *)v35->bounds[0] + v14) * v38 + boneAxis.axis[2][3];
@@ -213,9 +230,9 @@ DObjAnimMat *R_UpdateSceneEntBounds(
                         v16 = boneAxis.axis[1][3] >= 0.0 ? 0 : 0xC;
                         v34 = *(float *)((char *)&v35->bounds[0][2] + v16) * boneAxis.axis[1][3] + v33;
                         v25 = *(float *)((char *)&v35->bounds[1][2] - v16) * boneAxis.axis[1][3] + v24;
-                        if (v34 < (double)minWorld.v[2])
+                        if (v34 < minWorld.v[2])
                             minWorld.v[2] = v34;
-                        if (v25 > (double)maxWorld.v[2])
+                        if (v25 > maxWorld.v[2])
                             maxWorld.v[2] = v25;
                     }
                     ++boneIndex;
@@ -232,7 +249,7 @@ DObjAnimMat *R_UpdateSceneEntBounds(
 
                 iassert(localSceneEnt->cull.state == CULL_STATE_BOUNDED_PENDING);
 
-                localSceneEnt->cull.state = CULL_STATE_BOUNDED;
+                __atomic_store_n(&localSceneEnt->cull.state, (uint32_t)CULL_STATE_BOUNDED, __ATOMIC_RELEASE);
                 return boneMatrix;
             }
             else
@@ -282,7 +299,7 @@ void __cdecl R_SetNoDraw(GfxSceneEntity *sceneEnt)
             "%s\n\t(sceneEnt->cull.state) = %i",
             "(sceneEnt->cull.state == CULL_STATE_BOUNDED_PENDING)",
             sceneEnt->cull.state);
-    sceneEnt->cull.state = 4;
+    __atomic_store_n(&sceneEnt->cull.state, (uint32_t)CULL_STATE_DONE, __ATOMIC_RELEASE);
 }
 
 void __cdecl R_UpdateGfxEntityBoundsCmd(GfxSceneEntity **data)

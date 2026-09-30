@@ -1,0 +1,26 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "switch-sp",
+      "displayName": "Nintendo Switch, single player, optimised",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/switch-sp",
+      "toolchainFile": "$env{DEVKITPRO}/cmake/Switch.cmake",
+      "cacheVariables": {
+        "KISAK_PLATFORM": "switch",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O2 -g -DNDEBUG",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O2 -g -DNDEBUG",
+        "KISAK_SWITCH_LTO": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "switch-sp",
+      "configurePreset": "switch-sp"
+    }
+  ]
+}

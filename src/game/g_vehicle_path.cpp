@@ -649,8 +649,8 @@ void __cdecl VP_GetAngles(const vehicle_pathpos_t *vpp, float *angles)
     int i; // r31
     double v8; // fp1
     double v9; // fp31
-    long double v10; // fp2
-    long double v11; // fp2
+    double v10; // fp2
+    double v11; // fp2
     float anglesEnd[3];   // was v12 (BYREF) + v13 + v14
     float anglesStart[3]; // was v15 (BYREF) + v16 + v17
 
@@ -1611,9 +1611,9 @@ void __cdecl G_DrawVehiclePaths()
     int v4; // r8
     vehicle_pathpos_t v5; // [sp+50h] [-100h] BYREF
 
-    if (*(_BYTE *)g_vehicleDrawPath->current.integer)
+    if (g_vehicleDrawPath->current.string[0])
     {
-        if (*(_BYTE *)g_vehicleDrawPath->current.integer != 48)
+        if (g_vehicleDrawPath->current.string[0] != '0')
         {
             v0 = 0;
             if (s_numNodes > 0)
@@ -1622,7 +1622,7 @@ void __cdecl G_DrawVehiclePaths()
                 while (1)
                 {
                     v2 = SL_ConvertToString(s_nodes[v1].name);
-                    integer = (unsigned __int8 *)g_vehicleDrawPath->current.integer;
+                    integer = (unsigned __int8 *)g_vehicleDrawPath->current.string;
                     do
                     {
                         v4 = *(unsigned __int8 *)v2 - *integer;
@@ -1652,4 +1652,3 @@ void __cdecl G_DrawVehiclePaths()
         }
     }
 }
-

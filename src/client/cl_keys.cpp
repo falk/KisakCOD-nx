@@ -1,4 +1,7 @@
 #include <universal/q_shared.h>
+#ifdef __SWITCH__
+#include <platform/switch/switch_input.h>
+#endif
 #include "client.h"
 #include <universal/assertive.h>
 #include <qcommon/mem_track.h>
@@ -8,7 +11,9 @@
 #include <universal/com_memory.h>
 #include <cgame/cg_local.h>
 #include <stringed/stringed_hooks.h>
+#ifndef __SWITCH__
 #include <win32/win_local.h>
+#endif
 #include <universal/com_files.h>
 #include <devgui/devgui.h>
 #include <script/scr_debugger.h>
@@ -694,6 +699,13 @@ char __cdecl Field_KeyDownEvent(int32_t localClientNum, const ScreenPlacement *s
 
 char __cdecl Field_Paste(int32_t localClientNum, const ScreenPlacement *scrPlace, field_t *edit)
 {
+#ifdef __SWITCH__
+    (void)localClientNum;
+    (void)scrPlace;
+    (void)edit;
+    Com_Error(ERR_FATAL, "Field_Paste is unsupported on Switch without a platform clipboard");
+    return 0;
+#else
     int32_t v4; // [esp+0h] [ebp-1Ch]
     int32_t i; // [esp+14h] [ebp-8h]
     char *cbd; // [esp+18h] [ebp-4h]
@@ -706,6 +718,7 @@ char __cdecl Field_Paste(int32_t localClientNum, const ScreenPlacement *scrPlace
         Field_CharEvent(localClientNum, scrPlace, edit, cbd[i]);
     Com_FreeEvent(cbd);
     return 1;
+#endif
 }
 
 bool __cdecl Field_CharEvent(int32_t localClientNum, const ScreenPlacement *scrPlace, field_t *edit, int32_t ch)
@@ -1160,6 +1173,14 @@ void __cdecl Key_SetBinding(int32_t localClientNum, int32_t keynum, char *bindin
 {
     if (keynum != -1)
     {
+        if (keynum < 0 || keynum >= 256)
+            MyAssertHandler(
+                ".\\client\\cl_keys.cpp",
+                1171,
+                0,
+                "keynum doesn't index MAX_KEYS\n\t%i not in [0, %i)",
+                keynum,
+                256);
         ReplaceString(&playerKeys[localClientNum].keys[keynum].binding, binding);
         dvar_modifiedFlags |= 1u;
     }
@@ -2121,6 +2142,21 @@ int32_t __cdecl CL_GetKeyBindingInternal(int32_t localClientNum, const char *com
     int32_t bindCount; // [esp+8h] [ebp-4h]
 
     (*keyNames)[128] = 0;
+#ifdef __SWITCH__
+    {
+        // The Switch pad performs these commands from fixed buttons
+        // (CL_SwitchPadMove), not through the key binding table, so hint
+        // strings ("Press [{+activate}] to pick up", PLATFORM_* hints, script
+        // key hints) name the pad button instead of a keyboard default.
+        const char *padName = Switch_InputPadButtonName(Switch_InputPadButtonForCommand(command));
+        if (padName)
+        {
+            I_strncpyz(keyNames[0], padName, 128);
+            keyNames[1][0] = 0;
+            return 1;
+        }
+    }
+#endif
     bindCount = Key_GetCommandAssignmentInternal(localClientNum, command, keys);
     if ((uint32_t)bindCount > 2)
         MyAssertHandler(".\\client\\cl_keys.cpp", 2347, 0, "bindCount not in [0, 2]\n\t%i not in [%i, %i]", bindCount, 0, 2);

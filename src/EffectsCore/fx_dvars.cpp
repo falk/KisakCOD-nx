@@ -9,6 +9,8 @@ const dvar_t *fx_cull_elem_draw;
 const dvar_t *fx_freeze ;
 const dvar_t *fx_debugBolt;
 const dvar_t *fx_count  ;
+const dvar_t *fx_census;
+const dvar_t *fx_drawStats;
 const dvar_t *fx_visMinTraceDist;
 const dvar_t *fx_drawClouds;
 const dvar_t *fx_marks  ;
@@ -39,6 +41,18 @@ void __cdecl FX_RegisterDvars(void)
     min.value.min = 0.0;
     fx_debugBolt = Dvar_RegisterFloat("fx_debugBolt", 0.0, min, DVAR_CHEAT, "Debug effects bolt");
     fx_count = Dvar_RegisterBool("fx_count", false, DVAR_CHEAT, "Debug effects count");
+    // Switch diagnostic: every N ms print FX_CENSUS (pool accounting and the
+    // heaviest effects) to tell FX_ELEM_LIMIT load from a pool leak.
+    DvarLimits censusLimits;
+    censusLimits.integer.min = 0;
+    censusLimits.integer.max = 600000;
+    fx_census = Dvar_RegisterInt("fx_census", 0, censusLimits, DVAR_NOFLAG,
+                                 "Print an FX pool census every N msec (0 = off)");
+    // Switch diagnostic: per sprite material, the
+    // screen area the generated quads cover (FX_DRAWSTAT lines), reported
+    // with the A/B tour's census phases or every N msec outside the tour.
+    fx_drawStats = Dvar_RegisterInt("fx_drawStats", 0, censusLimits, DVAR_NOFLAG,
+                                    "Sprite screen-area census: print FX_DRAWSTAT every N msec (0 = off)");
     mina.value.max = 1000.0;
     mina.value.min = 0.0;
     fx_visMinTraceDist = Dvar_RegisterFloat("fx_visMinTraceDist", 80.0, mina, DVAR_CHEAT, "Minimum visibility trace size");

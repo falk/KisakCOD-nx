@@ -1,5 +1,6 @@
 #include <universal/q_shared.h>
 #include "r_draw_bsp.h"
+#include "r_image.h"
 #include "r_state.h"
 #include "rb_logfile.h"
 #include "r_dvars.h"
@@ -8,6 +9,8 @@
 #include "rb_stats.h"
 #include "rb_tess.h"
 #include "r_pretess.h"
+#include <database/db_retail_frame_evidence.h>
+#include <deko9/deko9_native.h>
 
 const int g_layerDataStride[16] = { 0, 0, 0, 8, 12, 16, 20, 24, 24, 28, 32, 32, 36, 40, 0, 0 }; // idb
 
@@ -29,30 +32,23 @@ void __cdecl R_SetStreamSource(
 
 void __cdecl R_HW_SetSamplerTexture(IDirect3DDevice9 *device, uint32_t samplerIndex, const GfxTexture *texture)
 {
-    int hr; // [esp+0h] [ebp-4h]
+    // Upstream shape restored. This used to carry a two-tier silent
+    // substitution -- a non-live texture became rgp.whiteImage, and if that
+    // was not live either it fabricated its own 1x1 0xFFFFFFFF texture and
+    // bound that -- with no counter, so a surface could render solid white
+    // and nothing in the evidence would show it. Liveness is the caller's
+    // problem (R_SetSampler fails loudly), and a bind failure is logged, not
+    // papered over.
+    iassert(device);
+    if (r_logFile && r_logFile->current.integer)
+        RB_LogPrint("device->SetTexture( samplerIndex, baseTex )\n");
 
-    iassert(texture);
-    iassert(texture->basemap);
-
-    do
-    {
-        if (r_logFile && r_logFile->current.integer)
-            RB_LogPrint("device->SetTexture( samplerIndex, texture->basemap )\n");
-
-        hr = device->SetTexture(samplerIndex, texture->basemap);
-        if (hr < 0)
-        {
-            do
-            {
-                ++g_disableRendering;
-                Com_Error(
-                    ERR_FATAL,
-                    "c:\\trees\\cod3\\src\\gfx_d3d\\r_setstate_d3d.h (%i) device->SetTexture( samplerIndex, texture->basemap ) failed: %s\n",
-                    121,
-                    R_ErrorDescription(hr));
-            } while (alwaysfails);
-        }
-    } while (alwaysfails);
+    // Native bind: no COM reference churn, store resolved once per bind.
+    Deko9_SetTexture(device, samplerIndex, texture ? texture->basemap : nullptr);
+    return;
+    HRESULT hr = device->SetTexture(samplerIndex, texture ? texture->basemap : nullptr);
+    if (FAILED(hr) && r_logFile && r_logFile->current.integer)
+        RB_LogPrint("device->SetTexture failed\n");
 }
 
 void __cdecl R_SetStreamsForBspSurface(GfxCmdBufPrimState *state, const srfTriangles_t *tris)
@@ -64,6 +60,11 @@ void __cdecl R_SetStreamsForBspSurface(GfxCmdBufPrimState *state, const srfTrian
     uint32_t layerDataStride; // [esp+28h] [ebp-4h]
 
     layerDataStride = g_layerDataStride[state->vertDeclType];
+    // A retained CPU stream is not a GPU resource. Fail at the consumption
+    // boundary if world activation omitted either required upload.
+    if (!rgp.world->vd.worldVb ||
+        (rgp.world->vertexLayerDataSize && !rgp.world->vld.layerVb))
+        Com_Error(ERR_FATAL, "BSP draw has incomplete world vertex resources");
     if (layerDataStride)
     {
         vertexLayerData = tris->vertexLayerData;
@@ -170,6 +171,11 @@ void __cdecl R_DrawTrianglesLit(
     lightmapSecondaryFlag = drawStream->customSamplerFlags & 4;
     reflectionProbeTextures = drawStream->reflectionProbeTextures;
     hasSunDirChanged = drawStream->hasSunDirChanged;
+    // Original retail lightmap override: r_lightMap (DVAR_CHEAT) selects a
+    // pure black/white/gray replacement. The port's force-white diagnostic
+    // (r_killhouseWhiteLightmap) was removed: a renderer
+    // diagnostic must not be able to replace lightmap resources in a
+    // production checkpoint.
     override = r_lightMap->current.integer != 1;
     device = primState->device;
     while (R_ReadBspDrawSurfs(&drawStream->primDrawSurfPos, &list, &count))
@@ -311,13 +317,57 @@ void __cdecl R_DrawTrianglesLit(
     drawStream->lightmapSecondaryTexture = lightmapSecondaryTexture;
 }
 
+int R_SetWorldIndexData(GfxCmdBufPrimState *state, const srfTriangles_t *tris, int triCount)
+{
+    if (IDirect3DIndexBuffer9 *staticIb = R_StaticPretessWorldIb())
+    {
+        if (state->indexBuffer != staticIb)
+            R_ChangeIndices(state, staticIb);
+        return tris->baseIndex;
+    }
+    R_NOTE_SETIDX(SWITCH_PERF_EV_SETIDX_BMODEL);
+    return R_SetIndexData(state, (uint8_t *)&rgp.world->indices[tris->baseIndex], triCount);
+}
+
 void __cdecl R_DrawBspTris(GfxCmdBufPrimState *state, const srfTriangles_t *tris, uint32_t triCount)
 {
     GfxDrawPrimArgs args; // [esp+0h] [ebp-Ch] BYREF
 
     args.vertexCount = tris->vertexCount;
     args.triCount = triCount;
+    if (IDirect3DIndexBuffer9 *staticIb = R_StaticPretessWorldIb())
+    {
+        // r_deko9StaticPretess: the merged surfaces are contiguous in
+        // rgp.world->indices (R_DrawTriangles merges only then), so draw
+        // them straight from the static world index buffer.
+        if (state->indexBuffer != staticIb)
+            R_ChangeIndices(state, staticIb);
+        args.baseIndex = tris->baseIndex;
+        R_DrawIndexedPrimitive(state, &args);
+        g_frameStatsCur.geoIndexCount += 3 * triCount;
+        iassert(g_primStats);
+        g_primStats->staticIndexCount += 3 * triCount;
+        return;
+    }
+    R_NOTE_SETIDX(SWITCH_PERF_EV_SETIDX_BSP);
     args.baseIndex = R_SetIndexData(state, (uint8_t *)&rgp.world->indices[tris->baseIndex], triCount);
+    if (args.baseIndex + 3 * (int)triCount > gfxBuf.dynamicIndexBuffer->total)
+    {
+        // an overflowed index span is not allowed to keep going
+        // into R_DrawIndexedPrimitive with out-of-range indices; stop the
+        // affected draw loudly instead of rendering OOB geometry.
+        Com_Printf(0, "FAIL:KILLHOUSE_IB_OVERFLOW baseIndex=%d triCount=%u total=%d\n",
+                   args.baseIndex, triCount, gfxBuf.dynamicIndexBuffer->total);
+        return;
+    }
+    if (rgp.world && state->streams[0].offset + 44 * args.vertexCount > 44 * (uint32_t)rgp.world->vertexCount)
+    {
+        // Same contract for a vertex range that leaves rgp.world's vertex
+        // buffer: the draw would read past the verified array.
+        Com_Printf(0, "FAIL:KILLHOUSE_VB_OVERFLOW streamOff=%u vertBytes=%u vbSize=%u\n",
+                   state->streams[0].offset, 44 * args.vertexCount, 44 * (uint32_t)rgp.world->vertexCount);
+        return;
+    }
     R_DrawIndexedPrimitive(state, &args);
     g_frameStatsCur.geoIndexCount += 3 * triCount;
     iassert( g_primStats );
@@ -405,6 +455,138 @@ void __cdecl R_DrawPreTessTris(
     g_primStats->dynamicIndexCount += 3 * triCount;
 }
 
+// ---- Static world index buffer batches (R_PRETESS_STATIC_FLAG, r_pretess.h) --
+//
+// A static batch's entries are runs: contiguous ranges of the static world
+// index buffer (rgp.world->indices as uploaded at load). Consecutive runs that
+// the copying path would have drawn with one R_DrawIndexedPrimitive (same
+// firstVertex; for lit, also the same lightmap and probe) go to one
+// R_DrawIndexedRanges with the streams of the group's first surface, which
+// is what that draw used. Same state changes, same triangles, same order.
+
+namespace
+{
+struct StaticRangeGroup
+{
+    GfxIndexRange ranges[128];
+    uint32_t count;
+    uint32_t triCount;
+    const srfTriangles_t *tris; // the group's first surface (streams, vertexCount)
+};
+} // namespace
+
+static bool R_BindStaticWorldIndices(GfxCmdBufPrimState *prim)
+{
+    IDirect3DIndexBuffer9 *ib = R_StaticPretessWorldIbAny();
+    if (!ib)
+    {
+        // The front end recorded a static batch for a world whose static
+        // buffer is gone: nothing valid to draw from. Never expected.
+        static bool warned;
+        if (!warned)
+        {
+            warned = true;
+            Com_Printf(CON_CHANNEL_SYSTEM, "FAIL:STATIC_PRETESS_NO_IB static world batch without a static index buffer\n");
+        }
+        return false;
+    }
+    if (prim->indexBuffer != ib)
+        R_ChangeIndices(prim, ib);
+    return true;
+}
+
+static void R_BindPreTessIndices(GfxCmdBufContext context)
+{
+    IDirect3DIndexBuffer9 *ib = context.source->input.data->preTessIb;
+    if (context.state->prim.indexBuffer != ib)
+        R_ChangeIndices(&context.state->prim, ib);
+}
+
+static void R_FlushStaticRangeGroup(GfxCmdBufPrimState *prim, StaticRangeGroup *group)
+{
+    if (!group->count)
+        return;
+    R_SetStreamsForBspSurface(prim, group->tris);
+    R_DrawIndexedRanges(prim, group->tris->vertexCount, group->ranges, group->count);
+    g_frameStatsCur.geoIndexCount += 3 * group->triCount;
+    iassert(g_primStats);
+    g_primStats->staticIndexCount += 3 * group->triCount;
+    group->count = 0;
+    group->triCount = 0;
+    group->tris = nullptr;
+}
+
+static void R_AddStaticRange(
+    GfxCmdBufPrimState *prim,
+    StaticRangeGroup *group,
+    const srfTriangles_t *tris,
+    uint32_t triCount)
+{
+    if (group->tris && group->tris->firstVertex != tris->firstVertex)
+        R_FlushStaticRangeGroup(prim, group);
+    if (!group->tris)
+        group->tris = tris;
+    if (!triCount)
+        return;
+    iassert(group->count < 128);
+    group->ranges[group->count].firstIndex = (uint32_t)tris->baseIndex;
+    group->ranges[group->count].triCount = triCount;
+    group->ranges[group->count].baseVertex = 0;
+    ++group->count;
+    group->triCount += triCount;
+}
+
+static const GfxSurface *R_StaticRunSurface(const GfxBspPreTessDrawSurf &run)
+{
+    const uint32_t surfIndex = run.baseSurfIndex;
+    if (surfIndex >= (uint32_t)rgp.world->surfaceCount)
+        MyAssertHandler(".\\r_draw_bsp.cpp", 0, 0, "surfIndex doesn't index rgp.world->surfaceCount\n\t%i not in [0, %i)",
+                        surfIndex, rgp.world->surfaceCount);
+    return &rgp.world->dpvs.surfaces[surfIndex];
+}
+
+static void R_DrawBspStaticRuns(const GfxBspPreTessDrawSurf *list, uint32_t count, GfxCmdBufContext context)
+{
+    if (!R_BindStaticWorldIndices(&context.state->prim))
+        return;
+    StaticRangeGroup group;
+    group.count = group.triCount = 0;
+    group.tris = nullptr;
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        const GfxSurface *bspSurf = R_StaticRunSurface(list[index]);
+        R_AddStaticRange(&context.state->prim, &group, &bspSurf->tris, list[index].totalTriCount);
+    }
+    R_FlushStaticRangeGroup(&context.state->prim, &group);
+}
+
+static void R_DrawBspStaticRunsLit(const GfxBspPreTessDrawSurf *list, uint32_t count, GfxCmdBufContext context)
+{
+    if (!R_BindStaticWorldIndices(&context.state->prim))
+        return;
+    StaticRangeGroup group;
+    group.count = group.triCount = 0;
+    group.tris = nullptr;
+    uint32_t reflectionProbeIndex = 255;
+    uint32_t lightmapIndex = 31;
+    for (uint32_t index = 0; index < count; ++index)
+    {
+        const GfxSurface *bspSurf = R_StaticRunSurface(list[index]);
+        if (reflectionProbeIndex != bspSurf->reflectionProbeIndex || lightmapIndex != bspSurf->lightmapIndex)
+        {
+            R_FlushStaticRangeGroup(&context.state->prim, &group);
+            reflectionProbeIndex = bspSurf->reflectionProbeIndex;
+            lightmapIndex = bspSurf->lightmapIndex;
+            R_SetReflectionProbe(context, reflectionProbeIndex);
+            R_SetLightmap(context, lightmapIndex);
+            R_SetupPassPerObjectArgs(context);
+            R_SetupPassPerPrimArgs(context);
+        }
+        R_AddStaticRange(&context.state->prim, &group, &bspSurf->tris, list[index].totalTriCount);
+    }
+    R_FlushStaticRangeGroup(&context.state->prim, &group);
+}
+
 void __cdecl R_DrawBspDrawSurfsPreTess(const uint32_t *primDrawSurfPos, GfxCmdBufContext context)
 {
     uint32_t baseIndex; // [esp+0h] [ebp-2Ch] BYREF
@@ -424,6 +606,12 @@ void __cdecl R_DrawBspDrawSurfsPreTess(const uint32_t *primDrawSurfPos, GfxCmdBu
     cmdBuf.primDrawSurfPos = primDrawSurfPos;
     while (R_ReadBspPreTessDrawSurfs(&cmdBuf, &list, &count, &baseIndex))
     {
+        if (baseIndex == R_PRETESS_STATIC_FLAG)
+        {
+            R_DrawBspStaticRuns(list, count, context);
+            continue;
+        }
+        R_BindPreTessIndices(context);
         prevTris = 0;
         triCount = 0;
         baseVertex = -1;
@@ -477,6 +665,12 @@ void __cdecl R_DrawBspDrawSurfsLitPreTess(const uint32_t *primDrawSurfPos, GfxCm
     cmdBuf.primDrawSurfPos = primDrawSurfPos;
     while (R_ReadBspPreTessDrawSurfs(&cmdBuf, &list, &count, &baseIndex))
     {
+        if (baseIndex == R_PRETESS_STATIC_FLAG)
+        {
+            R_DrawBspStaticRunsLit(list, count, context);
+            continue;
+        }
+        R_BindPreTessIndices(context);
         reflectionProbeIndex = 255;
         lightmapIndex = 31;
         for (index = 0; index < count; ++index)

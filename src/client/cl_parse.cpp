@@ -353,7 +353,7 @@ void __cdecl CL_ParseGamestate(char *configstrings)
     v2 = 0;
     v3 = clients[0].configstrings;
     v4 = configstrings - (char *)clients[0].configstrings;
-    do
+    for (; v2 < MAX_CONFIGSTRINGS; ++v2, ++v3)
     {
         v5 = *(unsigned __int16 *)((char *)v3 + v4);
         if (!*(unsigned __int16 *)((char *)v3 + v4))
@@ -371,16 +371,14 @@ void __cdecl CL_ParseGamestate(char *configstrings)
         if (clientUIActives[0].isLoadComplete)
             CG_ConfigStringModifiedInternal(0, v2);
     LABEL_15:
-        ++v3;
-        ++v2;
-    } while ((int)v3 < (int)clients[0].mapname);
+    }
 }
 
 void __cdecl CL_ParseServerCommands(msg_t *msg)
 {
     int Short; // r3
     int v3; // r31
-    char v4[32]; // [sp+50h] [-4020h] BYREF
+    char v4[0x4000]; // [sp+50h] [-4020h] BYREF (was [32]: MSG_ReadString writes up to 0x4000)
 
     Short = MSG_ReadShort(msg);
     if (Short > 0)
@@ -400,7 +398,7 @@ void __cdecl CL_RecordServerCommands(serverCommands_s *serverCommands)
 {
     int i; // r31
     msg_t v3; // [sp+50h] [-4050h] BYREF
-    unsigned __int8 v4[32]; // [sp+80h] [-4020h] BYREF
+    unsigned __int8 v4[0x4000]; // [sp+80h] [-4020h] BYREF (was [32]: MSG_Init sizes it 0x4000)
 
     if (!cls.demorecording)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\client\\cl_parse.cpp", 213, 0, "%s", "cls.demorecording");
@@ -479,6 +477,7 @@ void __cdecl CL_ParseServerMessage(msg_t *msg)
         Com_Printf(CON_CHANNEL_CLIENT, "------------------\n");
     }
     v3 = 0;
+    
     while (1)
     {
         if (msg->readcount > msg->cursize)
@@ -522,4 +521,3 @@ void __cdecl CL_ParseServerMessage(msg_t *msg)
     if (v5 >= 2)
         Com_Printf(CON_CHANNEL_CLIENT, "%3i %3i:%s\n", msg->readcount - 1, msg->cursize, "END OF MESSAGE");
 }
-

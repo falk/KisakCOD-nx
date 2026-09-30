@@ -145,7 +145,7 @@ void __cdecl R_ModelList_f()
 void __cdecl R_GetModelList(XAssetHeader header, XAssetHeader *data)
 {
     //iassert( modelList->count < ARRAY_COUNT( modelList->sorted ) ); // KISAKTODO
-    data[(int)data->xmodelPieces++ + 1] = header;
+    data[(int)(intptr_t)data->xmodelPieces++ + 1] = header;
 }
 
 XModel *__cdecl R_RegisterModel(const char *name)
@@ -282,7 +282,9 @@ int __cdecl R_SkinXModel(
     XSurface* xsurf; // [esp+38h] [ebp-E4Ch]
     int surfaceIndex; // [esp+40h] [ebp-E44h]
     uint16_t* surfPos; // [esp+44h] [ebp-E40h]
-    uint8_t surfBuf[3580]; // [esp+48h] [ebp-E3Ch] BYREF
+    // Native records: a hidden surface is a bare 4-byte -3 marker, a visible
+    // one is sizeof(GfxModelRigidSurface) (56 on ILP32, 72 on LP64).
+    uint8_t surfBuf[128 * sizeof(GfxModelRigidSurface)]; // [esp+48h] [ebp-E3Ch] BYREF
     uint32_t hidePartBits[4]; // [esp+E4Ch] [ebp-38h] BYREF
     //XSurface* surfaces; // [esp+E5Ch] [ebp-28h]
     XSurface* surfaces; // [esp+E60h] [ebp-24h] BYREF
@@ -336,14 +338,18 @@ int __cdecl R_SkinXModel(
                 startSurfPos = -2;
             else
                 startSurfPos = -1;
-            *(_DWORD*)surfPos = startSurfPos;
-            // @Correctness
-            *((_DWORD*)surfPos + 1) = (_DWORD)xsurf;
-            surfPos[7] = gfxEntIndex;
-            surfPos[8] = 0;
-            qmemcpy(surfPos + 12, placement, 0x1Cu);
-            *((float*)surfPos + 13) = val;
-            surfPos += 28;
+            // Native GfxModelRigidSurface layout. The original wrote the
+            // ILP32 field offsets and a 56-byte stride; on the Switch target
+            // `xsurf` then lived at the wrong offset (read back as null by
+            // R_DrawXModelRigidModelSurf) and consecutive records overlapped.
+            GfxModelRigidSurface rigid{};
+            rigid.surf.skinnedCachedOffset = static_cast<int>(startSurfPos);
+            rigid.surf.xsurf = xsurf;
+            rigid.surf.info.gfxEntIndex = static_cast<uint16_t>(gfxEntIndex);
+            rigid.placement.base = *placement;
+            rigid.placement.scale = val;
+            memcpy(surfPos, &rigid, sizeof(rigid));
+            surfPos = reinterpret_cast<uint16_t *>(reinterpret_cast<uint8_t *>(surfPos) + sizeof(rigid));
         }
     }
     startSurfPos = InterlockedExchangeAdd(&frontEndDataOut->surfPos, (char*)surfPos - (char*)surfBuf);
@@ -412,7 +418,7 @@ void __cdecl R_LockSkinnedCache()
         PROF_SCOPED("LockSkinnedCache");
 
         gfxBuf.skinnedCacheLockAddr = (unsigned char *)R_LockVertexBuffer(vb, 0, 0, 0x2000);
-        if (((uint32_t)gfxBuf.skinnedCacheLockAddr & 0xF) != 0)
+        if (((uint32_t)(intptr_t)gfxBuf.skinnedCacheLockAddr & 0xF) != 0)
         {
             R_UnlockVertexBuffer(vb);
             gfxBuf.skinnedCacheLockAddr = 0;

@@ -709,8 +709,8 @@ char __cdecl G_ParseAIWeaponAccurayGraphFile(
     int *knotCount)
 {
     int v4; // eax
-    long double v5; // st7
-    long double v6; // st7
+    double v5; // st7
+    double v6; // st7
     int knotCountIndex; // [esp+0h] [ebp-8h]
     parseInfo_t *tokenb; // [esp+4h] [ebp-4h]
     parseInfo_t *token; // [esp+4h] [ebp-4h]

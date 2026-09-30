@@ -66,6 +66,12 @@ struct level_locals_t
 	int bDrawCompassFriendlies;
 	int bPlayerIgnoreRadiusDamage;
 	int bPlayerIgnoreRadiusDamageLatched;
+	// Retail PC (iw3sp 0x00e19978): G_RunFrame's resume point. SV_PreFrame
+	// resets it to 0, G_RunFrame starts at 1, and each stage advances it, so a
+	// time-capped SV_FRAME_DO_SMOOTHING call can stop between stages (or
+	// between entities) and a later call resumes there. PC-only; the Xbox 360
+	// layout this struct follows has no such field.
+	int runFrameStage;
 	unsigned __int8 triggerIndex;
 	int currentEntityThink;
 	int currentIndex;
@@ -268,6 +274,16 @@ extern const dvar_t *vehHelicopterDecelerationSide;
 extern const dvar_t *pickupPrints;
 extern const dvar_t *ai_playerLOSMinTime;
 extern const dvar_t *player_radiusDamageMultiplier;
+
+// P2: evidence that Killhouse's inside_start() script
+// established client 0 at the authored inside_start entity. Set only by
+// PlayerCmd_setOrigin when the requested origin actually matches that entity
+// (never by hardcoded coordinates), so the player-spawn checkpoint can prove
+// the normal script path ran even after the retail flying_intro cinematic
+// moves the player.
+void G_P2_RecordInsideStartTeleport(const float *origin);
+extern bool g_p2InsideStartEstablished;
+extern float g_p2InsideStartOrigin[3];
 
 extern struct entityHandler_t entityHandlers[27];
 extern gentity_s g_entities[MAX_GENTITIES];

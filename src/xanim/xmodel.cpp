@@ -3,6 +3,7 @@
 
 #include "dobj.h"
 #include "dobj_utils.h"
+#include "xmodel_static_bounds.h"
 
 #include <qcommon/qcommon.h>
 #include <qcommon/mem_track.h>
@@ -11,6 +12,15 @@
 #include <database/database.h>
 #include <devgui/devgui.h>
 #include <physics/phys_local.h>
+
+// Allocator for lazily built collision trees (see
+// XSurfaceVisitTrianglesInAabb).  malloc keeps them out of the zone arena,
+// which may not be writable from the render thread; the trees are tiny and
+// built once per vertList that actually receives marks.
+static void *__cdecl CollisionTreeAlloc(int bytes)
+{
+    return malloc(static_cast<std::size_t>(bytes));
+}
 
 void __cdecl XModelPartsFree(XModelPartsLoad *modelParts)
 {
@@ -363,7 +373,21 @@ char __cdecl XSurfaceVisitTrianglesInAabb(
     vertList = &surface->vertList[vertListIndex];
     locals.tree = vertList->collisionTree;
     if (!locals.tree)
-        MyAssertHandler(".\\xanim\\xmodel.cpp", 1098, 0, "%s", "locals.tree");
+    {
+        // Retail-loaded models can have no collision tree: the wire only
+        // widens a vertList's tree ref when its array is inline, and the
+        // arrays that come from an already-streamed span keep it null.  Build
+        // it here, on first use, when the zone is fully loaded and every span
+        // has been streamed -- building at load time reads forward references
+        // before the bytes arrive (wild pointer on hardware).  Trees are
+        // process-lifetime (malloc), small, and built once per vertList that
+        // bullet marks actually touch.
+        XModelReadSurface_BuildCollisionTree(const_cast<XSurface *>(surface),
+                                             vertListIndex, CollisionTreeAlloc);
+        locals.tree = vertList->collisionTree;
+        if (!locals.tree)
+            return 0; // unencodable/absent data: no candidates, never crash
+    }
     PrefetchArray_XSurfaceCollisionNode_(locals.tree->nodes, 1u);
     locals.visitorFunc = visitorFunc;
     locals.visitorContext = visitorContext;
@@ -610,60 +634,11 @@ int __cdecl XModelGetBoneIndex(const XModel *model, uint32_t name, uint32_t offs
 
 int __cdecl XModelGetStaticBounds(const XModel *model, mat3x3 &axis, float *mins, float *maxs)
 {
-    float v5; // [esp+0h] [ebp-34h]
-    float v6; // [esp+4h] [ebp-30h]
-    float v7; // [esp+8h] [ebp-2Ch]
-    int j; // [esp+Ch] [ebp-28h]
-    int k; // [esp+10h] [ebp-24h]
-    const XModelCollSurf_s *csurf; // [esp+14h] [ebp-20h]
-    float rotated[3]; // [esp+18h] [ebp-1Ch] BYREF
-    int i; // [esp+24h] [ebp-10h]
-    float corner[3]; // [esp+28h] [ebp-Ch] BYREF
-
     if (model->numCollSurfs)
     {
-
-        mins[0] = FLT_MAX;
-        mins[1] = FLT_MAX;
-        mins[2] = FLT_MAX;
-
-        maxs[1] = -FLT_MAX;
-        maxs[2] = -FLT_MAX;
-        maxs[0] = -FLT_MAX;
-
-        for (i = 0; i < model->numCollSurfs; ++i)
-        {
-            csurf = &model->collSurfs[i];
-            for (k = 0; k < 8; ++k)
-            {
-                if ((k & 1) != 0)
-                    v7 = csurf->mins[0];
-                else
-                    v7 = csurf->maxs[0];
-                corner[0] = v7;
-
-                if ((k & 2) != 0)
-                    v6 = csurf->mins[1];
-                else
-                    v6 = csurf->maxs[1];
-                corner[1] = v6;
-
-                if ((k & 4) != 0)
-                    v5 = csurf->mins[2];
-                else
-                    v5 = csurf->maxs[2];
-                corner[2] = v5;
-
-                MatrixTransformVector(corner, axis, rotated);
-                for (j = 0; j < 3; ++j)
-                {
-                    if (rotated[j] < (double)mins[j])
-                        mins[j] = rotated[j];
-                    if (rotated[j] > (double)maxs[j])
-                        maxs[j] = rotated[j];
-                }
-            }
-        }
+        // Corner loop in xmodel_static_bounds.h (NEON on AArch64, the retail
+        // scalar loop elsewhere; identical results).
+        XModelStaticBounds(model->collSurfs, model->numCollSurfs, axis, mins, maxs);
         return 1;
     }
     else

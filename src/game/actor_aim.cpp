@@ -1306,16 +1306,17 @@ void __cdecl Actor_ShutdownWeaponAccuracyGraph()
     v0 = 0;
     if (g_numAccuracyGraphs)
     {
-        p_data = (const char ***)&g_accuracyGraphs[0].data;
         do
         {
+            // LP64: index the graph.  The decompiled walk stepped a
+            // const char *** by 8 (32 = ILP32 sizeof(DevGraph), LP64 56).
+            p_data = (const char ***)&g_accuracyGraphs[v0].data;
             v2 = *p_data;
             snprintf(v3, ARRAYSIZE(v3), "AI/AI Vs. AI Accuracy/%s", **p_data);
             DevGui_RemoveMenu(v3);
             snprintf(v3, ARRAYSIZE(v3), "AI/AI Vs. Player Accuracy/%s", *v2);
             DevGui_RemoveMenu(v3);
             ++v0;
-            p_data += 8;
         } while (v0 < g_numAccuracyGraphs);
     }
     g_numAccuracyGraphs = 0;

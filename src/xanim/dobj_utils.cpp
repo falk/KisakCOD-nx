@@ -4,6 +4,7 @@
 #include <universal/assertive.h>
 #include <gfx_d3d/r_utils.h>
 #include <universal/profile.h>
+#include <universal/spin_pause.h>
 
 DObjAnimMat *__cdecl DObjGetRotTransArray(const DObj_s *obj)
 {
@@ -16,7 +17,7 @@ int __cdecl DObjGetNumModels(const DObj_s *obj)
     return obj->numModels;
 }
 
-int __cdecl DObjGetSurfaces(const DObj_s *obj, int *partBits, const char *lods)
+int __cdecl DObjGetSurfaces(const DObj_s *obj, int *partBits, const int8_t *lods)
 {
     int j; // [esp+0h] [ebp-4Ch]
     int numBones; // [esp+4h] [ebp-48h]
@@ -97,7 +98,7 @@ int __cdecl DObjGetSurfaces(const DObj_s *obj, int *partBits, const char *lods)
     return surfaceCount;
 }
 
-void __cdecl DObjGetSurfaceData(const DObj_s *obj, const float *origin, float scale, char *lods)
+void __cdecl DObjGetSurfaceData(const DObj_s *obj, const float *origin, float scale, int8_t *lods)
 {
     XModelLodRampType lodRampType; // [esp+Ch] [ebp-18h]
     XModel *model; // [esp+10h] [ebp-14h]
@@ -528,10 +529,11 @@ void __cdecl DObjLock(DObj_s *obj)
     volatile uint32_t *Destination; // [esp+0h] [ebp-4h]
 
     Destination = &obj->locked;
+    uint32_t spin = 0;
     do
     {
         while (*Destination)
-            ;
+            Sys_SpinPause(spin++);
     } while (InterlockedCompareExchange(Destination, 1, 0));
 }
 
@@ -539,7 +541,9 @@ void __cdecl DObjUnlock(DObj_s *obj)
 {
     iassert(obj->locked);
 
-    obj->locked = 0;
+    // Release: the next DObjLock (CAS, acquire) must see this owner's writes;
+    // a plain volatile store is not ordered on AArch64.
+    __atomic_store_n(&obj->locked, 0u, __ATOMIC_RELEASE);
 }
 
 // seems blops specific

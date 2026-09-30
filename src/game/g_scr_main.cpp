@@ -12,6 +12,7 @@
 #include <script/scr_vm.h>
 #include "g_local.h"
 #include "pathnode.h"
+#include "g_bsp.h"
 #include <server/sv_game.h>
 
 #include "actor_script_cmd.h"
@@ -23,6 +24,7 @@
 #include <xanim/dobj_utils.h>
 #include "actor_spawner.h"
 #include "actor_grenade.h"
+#include <sound/snd_public.h>
 #include "bullet.h"
 #include <server/sv_public.h>
 #include <universal/com_sndalias.h>
@@ -623,7 +625,10 @@ int __cdecl GScr_SetScriptAndLabel(
         return 0;
 
     if (functions->count >= functions->maxSize)
-        Com_Error(ERR_DROP, "CODE ERROR: GScr_SetScriptAndLabel: functions->maxSize exceeded");
+        Com_Error(ERR_DROP,
+                  "CODE ERROR: GScr_SetScriptAndLabel: functions->maxSize exceeded (%d/%d %s:%s)",
+                  functions->count, functions->maxSize, filename ? filename : "",
+                  label ? label : "");
 
     count = functions->count;
     func = functions->address[count];
@@ -675,10 +680,11 @@ void __cdecl GScr_SetScriptsForPathNode(pathnode_t *loadNode, void *data)
             {
                 animscript = SL_ConvertToString(loadNode->constant.animscript);
                 iassert(animscript);
-                loadNode->constant.animscriptfunc = (int)Hunk_FindDataForFile(1, animscript);
+                loadNode->constant.animscriptfunc = (int)(intptr_t)Hunk_FindDataForFile(1, animscript);
                 if (!loadNode->constant.animscriptfunc)
                 {
                     Com_sprintf(filename, 64, "animscripts/traverse/%s", animscript);
+                    
                     loadNode->constant.animscriptfunc = (int)GScr_SetScriptAndLabel(functions, filename, "main", 1);
                     Hunk_SetDataForFile(1, animscript, (void*)loadNode->constant.animscriptfunc, GScr_AnimscriptAlloc);
                 }
@@ -1486,7 +1492,7 @@ void GScr_GetDvarFloat()
 {
     const char *String; // r3
     const char *VariantString; // r3
-    long double v2; // fp2
+    double v2; // fp2
 
     String = Scr_GetString(0);
     VariantString = SV_Archived_Dvar_GetVariantString(String);
@@ -1529,7 +1535,7 @@ void GScr_GetDebugDvarFloat()
 {
     const char *String; // r3
     const char *VariantString; // r3
-    long double v2; // fp2
+    double v2; // fp2
 
     String = Scr_GetString(0);
     VariantString = Dvar_GetVariantString(String);
@@ -1610,6 +1616,12 @@ void GScr_SetDvar()
         if ((v8->flags & 0x4000) == 0)
             return;
     }
+    if (!strcmp(String, "g_speed"))
+    {
+        
+        if (scrVmPub.function_frame && scrVmPub.function_frame->fs.pos)
+            Scr_PrintPrevCodePos(0, (char *)scrVmPub.function_frame->fs.pos, 0);
+    }
     Dvar_SetFromStringByNameFromSource(String, v10, DVAR_SOURCE_SCRIPT);
 }
 
@@ -1639,16 +1651,21 @@ void GScr_SetSavedDvar()
         v2 = (char *)Scr_GetString(1);
     }
     memset(v9, 0, sizeof(v9));
-    for (i = 0; i < 0x2000; ++i)
+    // Direct source indexing: the decompiled pointer-difference copy
+    // (v9[i + v2 - v9]) is UB between distinct stack/script objects and LLVM
+    // removed the whole loop on LP64, so setsaveddvar("g_speed", 190) stored
+    // an empty string (g_speed=0 -> ps->speed=0 -> no player movement).
+    for (i = 0; i < (int)sizeof(v9) - 1; ++i)
     {
-        v4 = &v9[i];
-        v5 = v9[i + v2 - v9];
+        v5 = v2[i];
         if (!v5)
             break;
+        v4 = &v9[i];
         *v4 = v5;
         if (v5 == 34)
             *v4 = 39;
     }
+    v9[i] = 0;
     if (Dvar_IsValidName(String))
     {
         Var = Dvar_FindVar(String);
@@ -1659,6 +1676,12 @@ void GScr_SetSavedDvar()
             //    Dvar_SetFromStringByNameFromSource(String, v9, DVAR_SOURCE_SCRIPT);
             //else
             //    Scr_Error("SetSavedDvar can only be called on dvars with the SAVED flag set");
+            if (!strcmp(String, "g_speed"))
+            {
+                
+                if (scrVmPub.function_frame && scrVmPub.function_frame->fs.pos)
+                    Scr_PrintPrevCodePos(0, (char *)scrVmPub.function_frame->fs.pos, 0);
+            }
             Dvar_SetFromStringByNameFromSource(String, v9, DVAR_SOURCE_SCRIPT);
         }
         else
@@ -3042,9 +3065,8 @@ void __cdecl ScrCmd_ItemWeaponSetAmmo(scr_entref_t entref)
             MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\game\\g_scr_main.cpp", 3240, 0, "%s", "weapDef->iClipSize >= 0");
         if (WeaponDef->iClipSize < Int)
             Int = WeaponDef->iClipSize;
-        v8 = (char *)Entity + 12 * v4;
-        *((unsigned int *)v8 + 88) = v3;
-        *((unsigned int *)v8 + 89) = Int;
+        Entity->item[v4].ammoCount = v3;
+        Entity->item[v4].clipAmmoCount = Int;
     }
 }
 
@@ -3563,6 +3585,9 @@ void __cdecl ParsePlaySoundCmd(scr_entref_t entref, int event, int notifyevent)
         }
         ConstString = Scr_GetConstString(1);
     }
+    if (SND_DebugStartsEnabled())
+        Com_Printf(CON_CHANNEL_SOUND, "SND_SCRDBG alias=%s ent=%d idx=%u notify=%s ev=%d t=%d\n",
+                   String, Entity->s.number, v8, ConstString ? SL_ConvertToString(ConstString) : "-", event, level.time);
     G_PlaySoundAliasWithNotify(Entity, v8, ConstString, Int, event, notifyevent);
 }
 
@@ -3756,7 +3781,10 @@ void __cdecl ScrCmd_GetNormalHealth(scr_entref_t entref)
     {
         if (Entity->health)
         {
-            Scr_AddFloat(Entity->health / client->pers.maxHealth);
+            // Float division, as in retail (the PPC decompile's int64 temporaries
+            // were the int->float conversion); int/int returned 0.0 for any
+            // health below max, so scripts saw a hurt player as nearly dead.
+            Scr_AddFloat((float)Entity->health / (float)client->pers.maxHealth);
         }
         else
         {
@@ -3767,7 +3795,7 @@ void __cdecl ScrCmd_GetNormalHealth(scr_entref_t entref)
     {
         if (Entity->maxHealth)
         {
-            Scr_AddFloat(Entity->health / Entity->maxHealth);
+            Scr_AddFloat((float)Entity->health / (float)Entity->maxHealth);
         }
         else
         {
@@ -4561,7 +4589,7 @@ void __cdecl GScr_SetCursorHint(scr_entref_t entref)
                 break;
             Com_Printf(CON_CHANNEL_PARSERSCRIPT, "%s\n", *v8++);
         //} while ((int)v8 < (int)&functions[9].actionFunc);
-        } while ((int)v8 < (uintptr_t)&hintStrings[4]);
+        } while ((uintptr_t)v8 < (uintptr_t)&hintStrings[4]); // LP64: full-width compare
         v9 = va("%s is not a valid hint type. See above for list of valid hint types\n", v4);
         Scr_Error(v9);
     }
@@ -5527,8 +5555,8 @@ void Scr_RandomFloatRange()
 
 void GScr_sin()
 {
-    long double v0; // fp2
-    long double v1; // fp2
+    double v0; // fp2
+    double v1; // fp2
 
     *(double *)&v0 = (float)(DEG2RAD( Scr_GetFloat(0) ));
     v1 = sin(v0);
@@ -5537,8 +5565,8 @@ void GScr_sin()
 
 void GScr_cos()
 {
-    long double v0; // fp2
-    long double v1; // fp2
+    double v0; // fp2
+    double v1; // fp2
 
     *(double *)&v0 = (float)(DEG2RAD( Scr_GetFloat(0) ));
     v1 = cos(v0);
@@ -5548,10 +5576,10 @@ void GScr_cos()
 void GScr_tan()
 {
     double v0; // fp31
-    long double v1; // fp2
-    long double v2; // fp2
+    double v1; // fp2
+    double v2; // fp2
     double v3; // fp30
-    long double v4; // fp2
+    double v4; // fp2
     double v5; // fp31
 
     v0 = (float)(DEG2RAD( Scr_GetFloat(0) ));
@@ -5568,10 +5596,10 @@ void GScr_tan()
 
 void GScr_asin()
 {
-    long double v0; // fp2
+    double v0; // fp2
     double v1; // fp31
     const char *v2; // r3
-    long double v3; // fp2
+    double v3; // fp2
 
     *(double *)&v0 = Scr_GetFloat(0);
     v1 = *(double *)&v0;
@@ -5587,10 +5615,10 @@ void GScr_asin()
 
 void GScr_acos()
 {
-    long double v0; // fp2
+    double v0; // fp2
     double v1; // fp31
     const char *v2; // r3
-    long double v3; // fp2
+    double v3; // fp2
 
     *(double *)&v0 = Scr_GetFloat(0);
     v1 = *(double *)&v0;
@@ -5606,8 +5634,8 @@ void GScr_acos()
 
 void GScr_atan()
 {
-    long double v0; // fp2
-    long double v1; // fp2
+    double v0; // fp2
+    double v1; // fp2
 
     *(double *)&v0 = Scr_GetFloat(0);
     v1 = atan(v0);
@@ -5708,8 +5736,8 @@ void GScr_max()
 
 void GScr_floor()
 {
-    long double v0; // fp2
-    long double v1; // fp2
+    double v0; // fp2
+    double v1; // fp2
 
     *(double *)&v0 = Scr_GetFloat(0);
     v1 = floor(v0);
@@ -5718,8 +5746,8 @@ void GScr_floor()
 
 void GScr_ceil()
 {
-    long double v0; // fp2
-    long double v1; // fp2
+    double v0; // fp2
+    double v1; // fp2
 
     *(double *)&v0 = Scr_GetFloat(0);
     v1 = ceil(v0);
@@ -6216,8 +6244,8 @@ void Scr_MusicStop()
 {
     unsigned int NumParam; // r3
     const char *v1; // r3
-    long double v2; // fp2
-    long double v3; // fp2
+    double v2; // fp2
+    double v3; // fp2
     int v4; // r31
     const char *v5; // r3
     const char *v6; // r3
@@ -6515,8 +6543,8 @@ void Scr_AmbientPlay()
     int v0; // r30
     unsigned int NumParam; // r3
     const char *v2; // r3
-    long double v3; // fp2
-    long double v4; // fp2
+    double v3; // fp2
+    double v4; // fp2
     const char *name; // r31
 
     v0 = 0;
@@ -6552,8 +6580,8 @@ void Scr_AmbientPlay()
 void Scr_AmbientStop()
 {
     unsigned int NumParam; // r3
-    long double v2; // fp2
-    long double v3; // fp2
+    double v2; // fp2
+    double v3; // fp2
     int v4; // r31
 
     NumParam = Scr_GetNumParam();
@@ -6909,11 +6937,11 @@ void GScr_ChangeLevel()
 {
     gentity_s *v0; // r31
     unsigned int NumParam; // r3
-    long double v2; // fp2
-    long double v3; // fp2
+    double v2; // fp2
+    double v3; // fp2
     const char *String; // r30
-    long double v5; // fp2
-    long double v6; // fp2
+    double v5; // fp2
+    double v6; // fp2
 
     v0 = G_Find(0, offsetof(gentity_s, classname), scr_const.player);
     if (!v0)
@@ -7038,11 +7066,11 @@ void __cdecl GScr_SetMissionDvar()
 
 void GScr_Cinematic()
 {
-    long double v0; // fp2
-    long double v1; // fp2
+    double v0; // fp2
+    double v1; // fp2
     const char *String; // r30
-    long double v3; // fp2
-    long double v4; // fp2
+    double v3; // fp2
+    double v4; // fp2
 
     if (!g_reloading->current.integer)
     {
@@ -7135,8 +7163,8 @@ void GScr_IsCinematicPlaying()
 void GScr_Earthquake()
 {
     double Float; // fp30
-    long double v1; // fp2
-    long double v2; // fp2
+    double v1; // fp2
+    double v2; // fp2
     double v3; // fp29
     gentity_s *v4; // r3
     int v5; // [sp+50h] [-40h]
@@ -7807,8 +7835,8 @@ skipAxes:
 void Scr_TriggerFX()
 {
     gentity_s *Entity; // r31
-    long double v1; // fp2
-    long double v2; // fp2
+    double v1; // fp2
+    double v2; // fp2
 
     if (!Scr_GetNumParam() || Scr_GetNumParam() > 2)
         Scr_Error("Incorrect number of parameters");
@@ -7950,6 +7978,17 @@ void __cdecl Scr_SetFog(const char *cmd, double start, double density, double r,
     {
         Scr_Error(va("%s: transition time must be >= 0 seconds", cmd));
     }
+    // the level's own fog value as the script
+    // hands it to the server command path, so the applied renderer fog can
+    // be compared against it. Always on, bounded.
+    {
+        static uint32_t s_killhouseFogScriptLines = 0;
+        if (s_killhouseFogScriptLines < 8)
+        {
+            ++s_killhouseFogScriptLines;
+            
+        }
+    }
     if (level.loading != LOADING_SAVEGAME)
     {
         G_setfog(va(
@@ -7993,15 +8032,28 @@ void Scr_SetExponentialFog()
     Dvar_SetFloat((dvar_s*)g_fogHalfDistReadOnly, halfwayDist);
 
     iassert(density > 0.0f && density < 1.0f);
-    
+    // the level's authored setExpFog arguments
+    // (start/halfway/rgb/time), which the renderer fog values must match.
+    {
+        static uint32_t s_killhouseExpFogLines = 0;
+        if (s_killhouseExpFogLines < 8)
+        {
+            ++s_killhouseExpFogLines;
+            Com_Printf(0,
+                       "KILLHOUSE_VISION_SCRIPT_EXPFOG start=%g halfway=%g r=%g g=%g b=%g "
+                       "time=%g density=%g\n",
+                       startDist, halfwayDist, v3, v4, v5, v6, density);
+        }
+    }
+
     Scr_SetFog("setExpFog", startDist, density, v3, v4, v5, v6);
 }
 
 void Scr_VisionSetNaked()
 {
     unsigned int NumParam; // r3
-    long double v1; // fp2
-    long double v2; // fp2
+    double v1; // fp2
+    double v2; // fp2
     int v5; // [sp+50h] [-10h]
 
     v5 = 1000;
@@ -8017,14 +8069,24 @@ void Scr_VisionSetNaked()
         v2 = floor(v1);
         v5 = (int)(float)*(double *)&v2;
     }
+    // the level's own vision-set request.
+    {
+        static uint32_t s_killhouseVisionScriptLines = 0;
+        if (s_killhouseVisionScriptLines < 8)
+        {
+            ++s_killhouseVisionScriptLines;
+            Com_Printf(0, "KILLHOUSE_VISION_SCRIPT_NAKED name=%s time=%d\n",
+                       Scr_GetString(0), v5);
+        }
+    }
     SV_SetConfigstring(CS_VISIONSET_NAKED, va("\"%s\" %i", Scr_GetString(0), v5));
 }
 
 void Scr_VisionSetNight()
 {
     unsigned int NumParam; // r3
-    long double v1; // fp2
-    long double v2; // fp2
+    double v1; // fp2
+    double v2; // fp2
     int v5; // [sp+50h] [-10h]
 
     v5 = 1000;
@@ -8039,6 +8101,14 @@ void Scr_VisionSetNight()
         *(double *)&v1 = (float)((float)(Scr_GetFloat(1) * (float)1000.0) + (float)0.5);
         v2 = floor(v1);
         v5 = (int)(float)*(double *)&v2;
+    }
+    {
+        static uint32_t s_killhouseVisionNightLines = 0;
+        if (s_killhouseVisionNightLines < 8)
+        {
+            ++s_killhouseVisionNightLines;
+            
+        }
     }
     SV_SetConfigstring(CS_VISIONSET_NIGHT, va("\"%s\" %i", Scr_GetString(0), v5));
 }
@@ -8179,8 +8249,8 @@ void Scr_BadPlace_Delete()
 void Scr_BadPlace_Cylinder()
 {
     unsigned int ConstString; // r31
-    long double v1; // fp2
-    long double v2; // fp2
+    double v1; // fp2
+    double v2; // fp2
     double Float; // fp1
     int v4; // r8
     int v5; // r7
@@ -8217,8 +8287,8 @@ void Scr_BadPlace_Cylinder()
 void Scr_BadPlace_Arc()
 {
     unsigned int ConstString; // r31
-    long double v1; // fp2
-    long double v2; // fp2
+    double v1; // fp2
+    double v2; // fp2
     double v3; // fp31
     double Float; // fp1
     double angle1; // fp0
@@ -8278,8 +8348,8 @@ void Scr_BadPlace_Arc()
 void Scr_BadPlace_Brush()
 {
     unsigned int ConstString; // r30
-    long double v1; // fp2
-    long double v2; // fp2
+    double v1; // fp2
+    double v2; // fp2
     gentity_s *Entity; // r31
     int TeamFlags; // r5
     int v5; // [sp+50h] [-20h]
@@ -9314,9 +9384,9 @@ void __cdecl GScr_ShellShock(scr_entref_t entref)
     const char *String; // r31
     int v3; // r30
     const char *v4; // r3
-    long double v5; // fp2
+    double v5; // fp2
     __int64 v6; // r10
-    long double v7; // fp2
+    double v7; // fp2
     unsigned int v8; // r31
     double v9; // r4
     const char *v10; // r3
@@ -10026,7 +10096,7 @@ void GScr_OpenFile()
         {
             ++openScriptIOFileHandles;
             ++v2;
-            if ((int)openScriptIOFileHandles >= (int)level.openScriptIOFileBuffers)
+            if ((uintptr_t)openScriptIOFileHandles >= (uintptr_t)level.openScriptIOFileBuffers) // LP64: full-width compare
                 goto LABEL_7;
         }
         v4 = v2;
@@ -10058,8 +10128,8 @@ void GScr_OpenFile()
                 v12 = (unsigned char *)Z_VirtualAlloc(Remote + 1, "GScr_OpenFile", 10);
                 v13 = v23[0];
                 level.openScriptIOFileBuffers[v4] = v12;
-                FS_Read(v12, v11, (int)v13);
-                FS_FCloseFile((int)v23[0]);
+                FS_Read(v12, v11, (int)(intptr_t)v13);
+                FS_FCloseFile((int)(intptr_t)v23[0]);
                 level.openScriptIOFileBuffers[v4][v11] = 0;
                 Com_BeginParseSession(String);
                 Com_SetCSV(1);
@@ -11155,6 +11225,7 @@ void __cdecl GScr_SetScriptsAndAnimsForEntities(ScriptFunctions *functions)
                         int func;
 
                         Com_sprintf(filename, 64, "animscripts/traverse/%s", animscript);
+                        
                         if (G_ExitAfterConnectPaths())
                         {
                             func = 0;
@@ -11243,6 +11314,13 @@ void __cdecl GScr_SetScriptsAndAnimsForEntities(ScriptFunctions *functions)
     G_ResetEntityParsePoint();
 }
 
+// Cached instead of a Dvar_FindVar("com_diagMarkers") lookup per call.
+extern const dvar_t *com_diagMarkers;
+static bool GScrDiagMarkers()
+{
+    return com_diagMarkers && com_diagMarkers->current.enabled;
+}
+
 void __cdecl GScr_SetScripts(ScriptFunctions *functions)
 {
     g_scr_data.delete_ = GScr_SetScriptAndLabel(functions, "codescripts/delete", "main", 1);
@@ -11251,11 +11329,21 @@ void __cdecl GScr_SetScripts(ScriptFunctions *functions)
     GScr_SetAnimScripts(functions);
     GScr_SetLevelScript(functions);
     GScr_SetScriptsAndAnimsForEntities(functions);
+    
     Path_CallFunctionForNodes(GScr_SetScriptsForPathNode, functions);
+    
     GScr_PostLoadScripts();
     Scr_EndLoadScripts();
+    // B3 landed: XAnimParts widen live through Load_XAnimPartsAsset, so the
+    // anim-tree tail below runs for real against the zone's actual anim set
+    // (Scr_PrecacheAnimTrees -> GScr_FindAnimTrees -> G_LoadAnimTreeInstances
+    // via the probe caller). Any missing anim still fails loudly at its own
+    // Com_Error site, never skipped.
     if (!G_ExitAfterConnectPaths())
     {
+        if (GScrDiagMarkers())
+            Com_Printf(0, "KISAK_SAVE_STAGE setscripts animtrees xanim_num=%u animtrees=%p\n",
+                       scrAnimPub.xanim_num[1], (void *)scrAnimPub.animtrees);
         Scr_PrecacheAnimTrees(Hunk_AllocXAnimCreate, 1);
         GScr_FindAnimTrees();
     }

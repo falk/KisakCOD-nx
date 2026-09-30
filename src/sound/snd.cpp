@@ -1,6 +1,7 @@
 #include <universal/q_shared.h>
 #include "snd_local.h"
 #include "snd_public.h"
+#include <universal/critical_section.h>
 #include <qcommon/mem_track.h>
 #include <qcommon/qcommon.h>
 #include <qcommon/cmd.h>
@@ -10,10 +11,31 @@
 #include <client/client.h>
 #include <universal/profile.h>
 
+#ifdef KISAK_OPENAL
+#include "snd_stream_openal.h"
+#endif
 #ifdef KISAK_MP
 #include <cgame_mp/cg_local_mp.h>
 #elif KISAK_SP
 #include <cgame/cg_main.h>
+
+#include <port/switch_perf.h>
+#ifdef __SWITCH__
+// switch_perfTrace-gated breakdown of per-frame alias plays: how many looping
+// plays continue an existing voice versus (re)start one, and what the starts
+// cost.  Printed once per second from SND_Update as SWITCH_PERF sndloop.
+static struct
+{
+    uint32_t loopCalls, loopOutOfRange, loopContinue, loopStartOk, loopStartFail;
+    uint32_t oneShotStarts;
+    uint64_t loopStartTicks, loopContinueTicks;
+    const char *lastFailAlias;
+    const char *lastStartAlias;
+    uint32_t lastStartType, lastStartEnt, lastStartChannel;
+    uint32_t lastPrintMs;
+    uint32_t frames;
+} s_sndLoopDiag;
+#endif
 #endif 
 
 struct AsyncPlaySound // sizeof=0x14
@@ -29,6 +51,24 @@ const dvar_t *snd_cinematicVolumeScale;
 const dvar_t *snd_enable3D;
 const dvar_t *snd_enableEq;
 const dvar_t *snd_debugReplace;
+const dvar_t *snd_debugStreams;
+const dvar_t *snd_debugStarts;
+const char *snd_stopReason;
+
+bool SND_DebugStartsEnabled()
+{
+    return snd_debugStarts && snd_debugStarts->current.enabled;
+}
+
+// snd_debugStarts: a start request that did not produce a playing channel,
+// with the reason (no silent drops).  offline tooling reads it.
+void SND_DebugStartFail(const snd_alias_t *alias, int ent, const char *reason)
+{
+    if (!SND_DebugStartsEnabled())
+        return;
+    Com_Printf(CON_CHANNEL_SOUND, "SND_STARTFAIL alias=%s ent=%d reason=%s t=%d\n",
+               alias && alias->aliasName ? alias->aliasName : "?", ent, reason, g_snd.time);
+}
 const dvar_t *snd_debugAlias;
 const dvar_t *snd_enable2D;
 //const dvar_t *snd_khz;
@@ -45,6 +85,16 @@ const dvar_t *snd_levelFadeTime;
 const dvar_t *snd_touchStreamFilesOnLoad;
 
 snd_local_t g_snd;
+
+// Evidence for offline tooling: what the last
+// SND_Restore decoded (printed by SND_Update once the deferred restore ran).
+static struct
+{
+    int ch3d;
+    int ch2d;
+    int stream;
+    float ambientGoal[4]; // saved goalvolume of tracks 1..4
+} s_sndRestoreEvidence;
 snd_physics g_sndPhysics;
 
 uint32_t g_FXPlaySoundCount;
@@ -688,6 +738,22 @@ char __cdecl SND_AddLengthNotify(int playbackId, const snd_alias_t *lengthNotify
     }
 }
 
+// A channel started with an unknown length (totalMsec < 0) learns it later:
+// record it and deliver the length notifies SND_AddLengthNotify queued.
+void __cdecl SND_SetKnownLength(int index, int totalMsec)
+{
+    iassert(index >= 0 && index < SND_MAX_CHANNELS);
+
+    snd_channel_info_t *chanInfo = &g_snd.chaninfo[index];
+    if (chanInfo->totalMsec >= 0)
+        return;
+    chanInfo->totalMsec = totalMsec < 0 ? 0 : totalMsec;
+    for (int i = 0; i < chanInfo->lengthNotifyInfo.count; ++i)
+        DoLengthNotify(chanInfo->totalMsec, (const snd_alias_t *)chanInfo->lengthNotifyInfo.data[i],
+                       chanInfo->lengthNotifyInfo.id[i]);
+    chanInfo->lengthNotifyInfo.count = 0;
+}
+
 void __cdecl DoLengthNotify(int msec, const snd_alias_t *lengthNotifyData, SndLengthId id)
 {
 #ifdef KISAK_SP
@@ -1000,7 +1066,9 @@ int __cdecl SND_FindReplaceableChannel(
 
         timeLeft = chaninfo->totalMsec + chaninfo->startTime - g_snd.time;
 
-        if ((alias->flags & 1) == 0 && timeLeft <= 0)
+        // totalMsec < 0 is an unknown length (a stream whose frames are still
+        // being counted), not a finished sound.
+        if ((alias->flags & 1) == 0 && chaninfo->totalMsec >= 0 && timeLeft <= 0)
             return i;
 
         if (newSubtitle || !alias->subtitle)
@@ -1266,12 +1334,14 @@ void __cdecl StopSoundAliasesOnEnt(SndEntHandle sndEnt, const char *aliasName)
                         alias1 = chaninfo->alias1;
                         v3 = I_stricmp(alias1->aliasName, aliasName);
                         SND_DebugAliasPrint(v3 == 0, alias1, "stopped on entity by name");
+                        snd_stopReason = "stopsoundonent_name";
                         stopChannel(chanIdx);
                     }
                 }
                 else
                 {
                     SND_DebugAliasPrint(1, chaninfo->alias0, "stopped all on entity");
+                    snd_stopReason = "stopsoundsonent";
                     stopChannel(chanIdx);
                 }
             }
@@ -1385,14 +1455,37 @@ int __cdecl SND_PlaySoundAlias_Internal(
         Vec3Sub(a->orient.origin, org, diff);
         distListenerSq = Vec3LengthSq(diff);
         outOfRange = distListenerSq > distMax * distMax;
-        if (*(_BYTE *)snd_debugAlias->current.integer)
+        if (snd_debugAlias->current.string[0])
         {
             SND_DebugAliasPrint(outOfRange, alias0, va("Not playing, out of range: %.1f > %.1f", sqrt(distListenerSq), distMax));
         }
     }
+#ifdef __SWITCH__
+    const bool diagLoop = SwitchPerf_g_enabled && (alias0->flags & 1) != 0;
+    uint64_t diagStart = diagLoop ? SwitchPerf_NowTicks() : 0;
+    if (diagLoop)
+    {
+        ++s_sndLoopDiag.loopCalls;
+        if (outOfRange)
+            ++s_sndLoopDiag.loopOutOfRange;
+    }
+#endif
     if (!outOfRange)
     {
-        if (SND_ContinueLoopingSound(alias0, alias1, lerp, volumeScale, sndEnt, org, pChannel))
+        const bool continued = SND_ContinueLoopingSound(alias0, alias1, lerp, volumeScale, sndEnt, org, pChannel);
+#ifdef __SWITCH__
+        if (diagLoop)
+        {
+            const uint64_t now = SwitchPerf_NowTicks();
+            if (continued)
+            {
+                ++s_sndLoopDiag.loopContinue;
+                s_sndLoopDiag.loopContinueTicks += now - diagStart;
+            }
+            diagStart = now;
+        }
+#endif
+        if (continued)
         {
             if (alias0->secondaryAliasName)
             {
@@ -1420,7 +1513,12 @@ int __cdecl SND_PlaySoundAlias_Internal(
             SND_StopEntityChannel(sndEnt, alias0Channel);
 
         if (SND_IsNullSoundFile(alias0->soundFile))
+        {
+            if (SND_DebugStartsEnabled())
+                Com_Printf(CON_CHANNEL_SOUND, "SND_STARTDBG alias=%s file=null ent=%d id=-1 t=%d\n", alias0->aliasName,
+                           sndEnt.field.entIndex, g_snd.time);
             return SND_PLAYBACKID_NOTPLAYED;
+        }
 
         SND_ChoosePitchAndVolume(alias0, alias1, lerp, volumeScale, &startAliasInfo.volume, &startAliasInfo.pitch);
         startAliasInfo.alias0 = alias0;
@@ -1452,6 +1550,29 @@ int __cdecl SND_PlaySoundAlias_Internal(
             }
             playbackId = SND_PLAYBACKID_NOTPLAYED;
         }
+#ifdef __SWITCH__
+        if (diagLoop)
+        {
+            s_sndLoopDiag.loopStartTicks += SwitchPerf_NowTicks() - diagStart;
+            if (playbackId == SND_PLAYBACKID_NOTPLAYED || playbackId < 0)
+            {
+                ++s_sndLoopDiag.loopStartFail;
+                s_sndLoopDiag.lastFailAlias = alias0->aliasName;
+            }
+            else
+            {
+                ++s_sndLoopDiag.loopStartOk;
+                s_sndLoopDiag.lastStartAlias = alias0->aliasName;
+                s_sndLoopDiag.lastStartType = (alias0->flags & 0xC0) >> 6;
+                s_sndLoopDiag.lastStartEnt = sndEnt.field.entIndex;
+                s_sndLoopDiag.lastStartChannel = (alias0->flags & 0x3F00) >> 8;
+            }
+        }
+        else if (SwitchPerf_g_enabled)
+        {
+            ++s_sndLoopDiag.oneShotStarts;
+        }
+#endif
     }
     if (alias0->secondaryAliasName)
     {
@@ -1515,6 +1636,22 @@ int __cdecl SND_PlaySoundAlias_Internal(
         }
     }
     SND_DebugAliasPrint(playbackId != SND_PLAYBACKID_NOTPLAYED, alias0, "Started");
+    if (SND_DebugStartsEnabled())
+    {
+        Com_Printf(
+            CON_CHANNEL_SOUND,
+            "SND_STARTDBG alias=%s file=%s ent=%d type=%s ch=%d entchan=%s master=%d range=%s id=%d t=%d\n",
+            alias0->aliasName ? alias0->aliasName : "?",
+            SND_IsNullSoundFile(alias0->soundFile) ? "null" : "ok",
+            sndEnt.field.entIndex,
+            ((alias0->flags & 0xC0) >> 6) == 1 ? "loaded" : (((alias0->flags & 0xC0) >> 6) == 2 ? "streamed" : "bad"),
+            alias0Channel,
+            alias0Channel < g_snd.entchannel_count ? g_snd.entchaninfo[alias0Channel].name : "?",
+            treatAsMaster || (alias0->flags & 2) != 0,
+            outOfRange ? "out" : "in",
+            playbackId,
+            g_snd.time);
+    }
     return playbackId;
 }
 
@@ -1537,6 +1674,7 @@ void __cdecl SND_StopEntityChannel(SndEntHandle sndEnt, int entchannel)
             && g_snd.chaninfo[i].entchannel == entchannel
             && !SND_IsStreamChannelFree(i))
         {
+            snd_stopReason = "restricted_entchannel";
             SND_StopStreamChannel(i);
         }
     }
@@ -1626,7 +1764,10 @@ int __cdecl SND_StartAliasStream(SndStartAliasInfo *startAliasInfo, int *pChanne
     iassert(index >= ((0 + 8) + 32) && index < ((0 + 8) + 32) + g_snd.max_stream_channels);
 
     if (!snd_enableStream->current.enabled)
+    {
+        SND_DebugStartFail(startAliasInfo->alias0, startAliasInfo->sndEnt.field.entIndex, "snd_enableStream_0");
         return SND_PLAYBACKID_NOTPLAYED;
+    }
 
     if (SND_IsAliasChannel3D((startAliasInfo->alias0->flags & 0x3F00) >> 8) && !SND_AnyActiveListeners())
         Com_Error(
@@ -1661,7 +1802,10 @@ int __cdecl SND_FindFreeStreamChannel(SndStartAliasInfo *startAliasInfo, int ent
     int i; // [esp+6Ch] [ebp-4h]
 
     if (!SND_HasFreeVoice(entchannel))
+    {
+        SND_DebugStartFail(startAliasInfo->alias0, startAliasInfo->sndEnt.field.entIndex, "stream_no_free_voice");
         return SND_PLAYBACKID_NOTPLAYED;
+    }
 
     for (i = 5; i < g_snd.max_stream_channels; ++i)
     {
@@ -1683,10 +1827,18 @@ int __cdecl SND_FindFreeStreamChannel(SndStartAliasInfo *startAliasInfo, int ent
             if (Vec3LengthSq(v) <= v16)
                 i = SND_PLAYBACKID_NOTPLAYED;
             else
+            {
+                snd_stopReason = "replaced_same_alias";
                 SND_StopStreamChannel(i);
+            }
         }
         else
         {
+            snd_stopReason = "replaced";
+            if (SND_DebugStartsEnabled())
+                Com_Printf(CON_CHANNEL_SOUND, "SND_REPLACEDBG ch=%d old=%s new=%s\n", i,
+                           g_snd.chaninfo[i].alias0 ? g_snd.chaninfo[i].alias0->aliasName : "?",
+                           startAliasInfo->alias0->aliasName);
             SND_StopStreamChannel(i);
         }
         if (i >= 0 && !SND_IsStreamChannelFree(i))
@@ -1726,6 +1878,8 @@ int __cdecl SND_FindFreeStreamChannel(SndStartAliasInfo *startAliasInfo, int ent
     }
 
     SND_DebugAliasPrint(i < 0, startAliasInfo->alias0, "No free channels");
+    if (i < 0)
+        SND_DebugStartFail(startAliasInfo->alias0, startAliasInfo->sndEnt.field.entIndex, "stream_no_channel");
     return i;
 }
 
@@ -2102,12 +2256,22 @@ int __cdecl SND_PlayLocalSoundAliasByName(
     const char *aliasname,
     snd_alias_system_t system)
 {
-    snd_alias_t *alias; // [esp+0h] [ebp-4h]
+    snd_alias_t *alias = aliasname ? Com_PickSoundAlias(aliasname) : 0;
 
-    if (aliasname && (alias = Com_PickSoundAlias(aliasname)) != 0)
+    extern const dvar_t *com_diagMarkers;
+    if (com_diagMarkers && com_diagMarkers->current.enabled)
+    {
+        static uint32_t s_aliasLogs = 0;
+        if (s_aliasLogs < 48u)
+        {
+            ++s_aliasLogs;
+            Com_Printf(0, "KILLHOUSE_SNDALIAS name=%s found=%d\n", aliasname ? aliasname : "(null)", alias ? 1 : 0);
+        }
+    }
+
+    if (alias)
         return SND_PlayLocalSoundAlias(localClientNum, alias, system);
-    else
-        return SND_PLAYBACKID_NOTPLAYED;
+    return SND_PLAYBACKID_NOTPLAYED;
 }
 
 void __cdecl SND_ResetPauseSettingsToDefaults()
@@ -2538,7 +2702,10 @@ void __cdecl SND_UpdateLoopingSounds()
                 iassert(g_snd.chaninfo[i].alias0);
 
                 if ((g_snd.chaninfo[i].alias0->flags & 1) != 0 && g_snd.chaninfo[i].looptime != g_snd.looptime)
+                {
+                    snd_stopReason = "stale_loop";
                     SND_StopStreamChannel(i);
+                }
             }
         }
 
@@ -2727,6 +2894,42 @@ void __cdecl SND_Update()
         KISAK_NULLSUB();
         SND_UpdatePause();
         SND_UpdateMasterVolumes(frametime);
+#ifdef __SWITCH__
+        if (SwitchPerf_g_enabled)
+        {
+            ++s_sndLoopDiag.frames;
+            if (v0 - s_sndLoopDiag.lastPrintMs >= 1000)
+            {
+                const double frames = s_sndLoopDiag.frames ? (double)s_sndLoopDiag.frames : 1.0;
+                Com_Printf(16, "SWITCH_PERF sndloop frames=%u calls=%.1f oor=%.1f cont=%.1f start_ok=%.2f start_fail=%.2f oneshot=%.2f cont_us=%.0f start_us=%.0f last_fail=%s last_start=%s type=%u ent=%u entchan=%u\n",
+                           s_sndLoopDiag.frames,
+                           s_sndLoopDiag.loopCalls / frames, s_sndLoopDiag.loopOutOfRange / frames,
+                           s_sndLoopDiag.loopContinue / frames, s_sndLoopDiag.loopStartOk / frames,
+                           s_sndLoopDiag.loopStartFail / frames, s_sndLoopDiag.oneShotStarts / frames,
+                           (double)SwitchPerf_TicksToUs(s_sndLoopDiag.loopContinueTicks) / frames,
+                           (double)SwitchPerf_TicksToUs(s_sndLoopDiag.loopStartTicks) / frames,
+                           s_sndLoopDiag.lastFailAlias ? s_sndLoopDiag.lastFailAlias : "-",
+                           s_sndLoopDiag.lastStartAlias ? s_sndLoopDiag.lastStartAlias : "-",
+                           s_sndLoopDiag.lastStartType, s_sndLoopDiag.lastStartEnt, s_sndLoopDiag.lastStartChannel);
+                memset(&s_sndLoopDiag, 0, sizeof(s_sndLoopDiag));
+                s_sndLoopDiag.lastPrintMs = v0;
+            }
+        }
+#endif
+#ifdef KISAK_OPENAL
+        // Close stream file handles the stream thread finished with, and
+        // delete loaded-sound buffers whose zone was unloaded.
+        SND_StreamServiceMainThread();
+        SND_ServiceLoadedSoundBuffers();
+#endif
+#if defined(__SWITCH__) && defined(KISAK_OPENAL)
+        {
+            extern void SND_AlEmitEvidence();
+            SND_AlEmitEvidence(); // play evidence
+            if (SwitchPerf_g_enabled)
+                SND_StreamEmitPerf(v0);
+        }
+#endif
         if (!g_snd.paused)
         {
             if (g_snd.restore.size)
@@ -2734,6 +2937,11 @@ void __cdecl SND_Update()
                 MemFile_InitForReading(&memFile, g_snd.restore.size, g_snd.restore.buffer, g_snd.restore.compress);
                 SND_Restore(&memFile);
                 MemFile_MoveToSegment(&memFile, SND_PLAYBACKID_NOTPLAYED);
+                Com_Printf(CON_CHANNEL_SOUND, "SND_RESTORE used=%d size=%d ch3d=%d ch2d=%d stream=%d amb=%g,%g,%g,%g\n",
+                           memFile.bytesUsed, g_snd.restore.size, s_sndRestoreEvidence.ch3d,
+                           s_sndRestoreEvidence.ch2d, s_sndRestoreEvidence.stream,
+                           s_sndRestoreEvidence.ambientGoal[0], s_sndRestoreEvidence.ambientGoal[1],
+                           s_sndRestoreEvidence.ambientGoal[2], s_sndRestoreEvidence.ambientGoal[3]);
 
                 iassert(memFile.bytesUsed == g_snd.restore.size);
 
@@ -3182,7 +3390,10 @@ void __cdecl SND_StopSounds(snd_stopsounds_arg_t which)
             if (!SND_IsStreamChannelFree(i) && ((which & 2) == 0 || i != SND_FIRST_STREAM_CHANNEL))
             {
                 if ((which & 4) == 0 || (i < 41 || i > 44 ? (v1 = 0) : (v1 = 1), !v1))
+                {
+                    snd_stopReason = "stopsounds";
                     SND_StopStreamChannel(i);
+                }
             }
         }
 
@@ -3264,6 +3475,16 @@ void __cdecl SND_Init()
         DVAR_CHEAT | DVAR_ARCHIVE,
         "Show which ents can have EQ turned on/off, which ones are on (green) and off (magenta)");
     snd_drawEqChannels = Dvar_RegisterBool("snd_drawEqChannels", 0, 0x81u, "Draw overlay of EQ settings for each channel");
+    snd_debugStreams = Dvar_RegisterBool(
+        "snd_debugStreams",
+        0,
+        DVAR_NOFLAG,
+        "Port diagnostic: print every active stream channel's gain terms and AL state once a second");
+    snd_debugStarts = Dvar_RegisterBool(
+        "snd_debugStarts",
+        0,
+        DVAR_NOFLAG,
+        "Port diagnostic: print every sound alias start request (alias, entity, type, channel, result)");
     snd_debugReplace = Dvar_RegisterBool(
         "snd_debugReplace",
         0,
@@ -3618,13 +3839,16 @@ void __cdecl SND_ErrorCleanup()
 void __cdecl SND_Save(MemoryFile *memFile)
 {
     for (int i = 1; i < SND_CHANNELVOLPRIO_COUNT; ++i)
-        MemFile_WriteData(memFile, 772, &g_snd.channelVolGroups[i]);
+        MemFile_WriteData(memFile, sizeof(g_snd.channelVolGroups[i]), &g_snd.channelVolGroups[i]);
 
     for (int i = SND_ENVEFFECTPRIO_LEVEL; i < SND_ENVEFFECTPRIO_COUNT; ++i)
-        MemFile_WriteData(memFile, 32, &g_snd.envEffects[i]);
+        MemFile_WriteData(memFile, sizeof(g_snd.envEffects[i]), &g_snd.envEffects[i]);
 
     SND_SaveEq(memFile);
-    MemFile_WriteData(memFile, 8, g_snd.background);
+    // All SND_TRACK_COUNT records (40 bytes): the port's saves have carried
+    // the whole array since 6a58a59c, so the reader below consumes the same
+    // 40 bytes.  Retail archived only the music track (8 bytes).
+    MemFile_WriteData(memFile, sizeof(g_snd.background), g_snd.background);
 
     if (g_snd.Initialized2d)
     {
@@ -3813,7 +4037,7 @@ void __cdecl SND_Restore(MemoryFile *memFile)
     if (g_snd.Initialized2d)
     {
         for (int i = 1; i < SND_CHANNELVOLPRIO_COUNT; ++i)
-            MemFile_ReadData(memFile, 772, (uint8_t *)&g_snd.channelVolGroups[i]);
+            MemFile_ReadData(memFile, sizeof(g_snd.channelVolGroups[i]), (uint8_t *)&g_snd.channelVolGroups[i]);
 
         for (int i = 0; i < SND_CHANNELVOLPRIO_COUNT; ++i)
         {
@@ -3822,7 +4046,7 @@ void __cdecl SND_Restore(MemoryFile *memFile)
         }
 
         for (int i = SND_ENVEFFECTPRIO_LEVEL; i < SND_ENVEFFECTPRIO_COUNT; ++i)
-            MemFile_ReadData(memFile, 32, (uint8_t *)&g_snd.envEffects[i]);
+            MemFile_ReadData(memFile, sizeof(g_snd.envEffects[i]), (uint8_t *)&g_snd.envEffects[i]);
 
         SND_RestoreEq(memFile);
 
@@ -3833,22 +4057,37 @@ void __cdecl SND_Restore(MemoryFile *memFile)
         }
 
         SND_SetRoomtype(g_snd.effect->roomtype);
-        MemFile_ReadData(memFile, 8, (uint8_t *)g_snd.background);
+        {
+            // Read exactly what SND_Save wrote (the whole array).  Reading one
+            // 8-byte record left the other 32 bytes in the stream, so the
+            // 3D-channel loop read ambient-track goal floats as an alias name
+            // ("SND_GetAliasWithOffset: could not find sound alias
+            // '<16 float bytes>'") whenever an ambient track was fading.
+            // Only the music track is applied, as retail did: the ambient
+            // tracks belong to cgame, which restarts them from its own
+            // state, and their stream channels are not archived.
+            snd_background_info_t saved[SND_TRACK_COUNT];
+            MemFile_ReadData(memFile, sizeof(g_snd.background), (uint8_t *)saved);
+            g_snd.background[SND_TRACK_MUSIC] = saved[SND_TRACK_MUSIC];
+            s_sndRestoreEvidence = {};
+            for (int track = 0; track < 4; ++track)
+                s_sndRestoreEvidence.ambientGoal[track] = saved[SND_TRACK_AMBIENT_PRIMARY_0 + track].goalvolume;
+        }
 
         while (SND_Restore3DChannel(memFile))
-            ;
+            ++s_sndRestoreEvidence.ch3d;
 
         while (SND_Restore2DChannel(memFile))
-            ;
+            ++s_sndRestoreEvidence.ch2d;
 
         for (int i = 0; i < 5; ++i)
         {
             if (SND_FIRST_STREAM_CHANNEL + i < 41 || SND_FIRST_STREAM_CHANNEL + i > 44)
-                SND_RestoreStreamChannel(SND_FIRST_STREAM_CHANNEL + i, memFile);
+                s_sndRestoreEvidence.stream += SND_RestoreStreamChannel(SND_FIRST_STREAM_CHANNEL + i, memFile) ? 1 : 0;
         }
 
         while (SND_RestoreStreamChannel(SND_PLAYBACKID_NOTPLAYED, memFile))
-            ;
+            ++s_sndRestoreEvidence.stream;
     }
 }
 
@@ -3969,7 +4208,6 @@ void __cdecl SND_RestoreChanInfo(snd_channel_info_t *chaninfo, MemoryFile *memFi
 void __cdecl SND_RestoreLengthNotifyInfo(MemoryFile *memFile, sndLengthNotifyInfo *info)
 {
     snd_alias_t *v2; // eax
-    void *v3; // [esp+4h] [ebp-14h] BYREF
     uint8_t v4; // [esp+Bh] [ebp-Dh] BYREF
     int p; // [esp+Ch] [ebp-Ch] BYREF
     int i; // [esp+10h] [ebp-8h]
@@ -4002,8 +4240,13 @@ void __cdecl SND_RestoreLengthNotifyInfo(MemoryFile *memFile, sndLengthNotifyInf
             }
             else
             {
-                MemFile_ReadData(memFile, 4, (uint8_t *)&v3);
-                info->data[i] = v3;
+                // Script length notifies carry an entity number in the
+                // pointer slot and the save stores its low 32 bits; widen
+                // explicitly instead of reading 4 bytes into an 8-byte
+                // void* whose high half was left uninitialised on LP64.
+                uint32_t scriptData = 0;
+                MemFile_ReadData(memFile, 4, (uint8_t *)&scriptData);
+                info->data[i] = (void *)(uintptr_t)scriptData;
             }
         }
     }
@@ -4511,48 +4754,38 @@ void SND_MapInit()
 
 int SND_FindPlaybackId(const snd_alias_t *sndEnt, const char *aliasName)
 {
+    // LP64: walk g_snd.chaninfo by struct.  The decompiled form stepped a
+    // pointer-width cursor through alias0 with ILP32 offsets (-18 words =
+    // sndEnt, -12 words = playbackId).  The "sndEnt" argument is an entity
+    // number smuggled through a pointer by the caller (cg_event.cpp).
     int v4; // r31
-    const snd_alias_t **p_alias0; // r29
+    const snd_channel_info_t *chan; // r29
     bool IsStreamChannelFree; // r3
-    const char **v7; // r11
+    const int entHandle = (int)(intptr_t)sndEnt;
 
     if (!g_snd.Initialized2d)
         return SND_PLAYBACKID_NOTPLAYED;
-    v4 = 0;
-    p_alias0 = &g_snd.chaninfo[0].alias0;
-    while (1)
+    for (v4 = 0; v4 < (int)ARRAY_COUNT(g_snd.chaninfo); ++v4)
     {
-        if (*(p_alias0 - 18) != sndEnt)
-            goto LABEL_18;
+        chan = &g_snd.chaninfo[v4];
+        if (chan->sndEnt.handle != entHandle)
+            continue;
         if (v4 >= 0 && v4 < g_snd.max_2D_channels)
-        {
             IsStreamChannelFree = SND_Is2DChannelFree(v4);
-            goto LABEL_13;
-        }
-        if (v4 >= 8 && v4 < g_snd.max_3D_channels + 8)
-        {
+        else if (v4 >= 8 && v4 < g_snd.max_3D_channels + 8)
             IsStreamChannelFree = SND_Is3DChannelFree(v4);
-            goto LABEL_13;
-        }
-        if (v4 < SND_FIRST_STREAM_CHANNEL || v4 >= SND_FIRST_STREAM_CHANNEL + g_snd.max_stream_channels)
-            break;
-        IsStreamChannelFree = SND_IsStreamChannelFree(v4);
-    LABEL_13:
-        if (!IsStreamChannelFree)
-            break;
-    LABEL_18:
-        p_alias0 += 35;
-        ++v4;
-        if ((int)p_alias0 >= (int)&g_sndPhysics.info[4].org[2])
-            return SND_PLAYBACKID_NOTPLAYED;
+        else if (v4 >= SND_FIRST_STREAM_CHANNEL && v4 < SND_FIRST_STREAM_CHANNEL + g_snd.max_stream_channels)
+            IsStreamChannelFree = SND_IsStreamChannelFree(v4);
+        else
+            continue;
+        if (IsStreamChannelFree)
+            continue;
+        if (chan->alias0 && !I_stricmp(chan->alias0->aliasName, aliasName))
+            return chan->playbackId;
+        if (chan->alias1 && !I_stricmp(chan->alias1->aliasName, aliasName))
+            return chan->playbackId;
     }
-    if (!*p_alias0 || I_stricmp((*p_alias0)->aliasName, aliasName))
-    {
-        v7 = (const char **)p_alias0[1];
-        if (!v7 || I_stricmp(*v7, aliasName))
-            goto LABEL_18;
-    }
-    return (int)*(p_alias0 - 12);
+    return SND_PLAYBACKID_NOTPLAYED;
 }
 
 #endif // KISAK_SP

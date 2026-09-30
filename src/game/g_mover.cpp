@@ -3,6 +3,7 @@
 #include <qcommon/mem_track.h>
 #include <server/sv_world.h>
 #include <server/sv_game.h>
+#include <port/switch_perf.h>
 
 #ifdef KISAK_MP
 #include <game_mp/g_utils_mp.h>
@@ -26,12 +27,14 @@ struct pushed_t // sizeof=0x2C
 
 //Line 51761:  0006 : 0000559c       char const **hintStrings      827b559c     g_mover.obj
 
-pushed_t pushed[1024];
+// The retail guard below reads "pushed_p < &pushed[MAX_GENTITIES]": the
+// array holds MAX_GENTITIES entries (2176 in SP, not 1024).
+pushed_t pushed[MAX_GENTITIES];
 pushed_t *pushed_p;
 
 void __cdecl TRACK_g_mover()
 {
-    track_static_alloc_internal(pushed, 45056, "pushed", 9);
+    track_static_alloc_internal(pushed, sizeof(pushed), "pushed", 9);
     track_static_alloc_internal(hintStrings, 20, "hintStrings", 9);
 }
 
@@ -148,7 +151,7 @@ int __cdecl G_TryPushingEntity(gentity_s *check, gentity_s *pusher, float *move,
         {
             for (fz = -z; ; fz = z * 2.0 + fz)
             {
-                if (z < (double)fz)
+                if (z < fz)
                 {
                 LABEL_36:
                     z = z + 4.0;
@@ -163,7 +166,7 @@ int __cdecl G_TryPushingEntity(gentity_s *check, gentity_s *pusher, float *move,
             }
             for (fx = -x; ; fx = x * 2.0 + fx)
             {
-                if (x < (double)fx)
+                if (x < fx)
                 {
                     x = x + 4.0;
                     goto LABEL_15;
@@ -175,7 +178,7 @@ int __cdecl G_TryPushingEntity(gentity_s *check, gentity_s *pusher, float *move,
             }
             for (fy = -y; ; fy = y * 2.0 + fy)
             {
-                if (y < (double)fy)
+                if (y < fy)
                 {
                     y = y + 4.0;
                     goto LABEL_19;
@@ -275,6 +278,19 @@ void __cdecl G_MoverTeam(gentity_s *ent)
     {
         if (!Com_IsRagdollTrajectory(&ent->s.lerp.pos))
         {
+#ifdef KISAK_SP
+            // Retail SP G_MoverTeam (iw3sp 0x4C2430) retires an INTERPOLATE
+            // trajectory to STATIONARY and returns for a mover that is not
+            // moving; the decompile dropped both. Without it every stationary
+            // mover ran a full zero-distance G_MoverPush each server frame,
+            // which dominated the mover-push budget.
+            if (ent->s.lerp.pos.trType == TR_INTERPOLATE)
+                ent->s.lerp.pos.trType = TR_STATIONARY;
+            if (ent->s.lerp.apos.trType == TR_INTERPOLATE)
+                ent->s.lerp.apos.trType = TR_STATIONARY;
+            if (ent->s.lerp.pos.trType == TR_STATIONARY && ent->s.lerp.apos.trType == TR_STATIONARY)
+                return;
+#endif
             obstacle = 0;
             pushed_p = pushed;
             BG_EvaluateTrajectory(&ent->s.lerp.pos, level.time, origin);
@@ -387,6 +403,14 @@ char __cdecl G_MoverPush(gentity_s *pusher, float *move, float *amove, gentity_s
 
     *obstacle = 0;
     v18 = 1;
+#ifdef __SWITCH__
+    if (SwitchPerf_Enabled())
+    {
+        SwitchPerf_AddEvent(SWITCH_PERF_EV_MOVER_PUSHES, 1);
+        if (!move[0] && !move[1] && !move[2] && !amove[0] && !amove[1] && !amove[2])
+            SwitchPerf_AddEvent(SWITCH_PERF_EV_MOVER_STILL, 1);
+    }
+#endif
 
     mins[0] = pusher->r.mins[0];
     mins[1] = pusher->r.mins[1];
@@ -399,9 +423,9 @@ char __cdecl G_MoverPush(gentity_s *pusher, float *move, float *amove, gentity_s
     {
         for (i = 0; i < 3; ++i)
         {
-            if (mins[i] > (double)outMins[i])
+            if (mins[i] > outMins[i])
                 mins[i] = outMins[i];
-            if (maxs[i] < (double)outMaxs[i])
+            if (maxs[i] < outMaxs[i])
                 maxs[i] = outMaxs[i];
         }
     }
@@ -461,17 +485,21 @@ char __cdecl G_MoverPush(gentity_s *pusher, float *move, float *amove, gentity_s
 #endif
                 || ent->physicsObject)
             && (ent->s.groundEntityNum == pusher->s.number
-                || maxBound[0] > (double)ent->r.absmin[0]
-                && maxBound[1] > (double)ent->r.absmin[1]
-                && maxBound[2] > (double)ent->r.absmin[2]
-                && minBound[0] < (double)ent->r.absmax[0]
-                && minBound[1] < (double)ent->r.absmax[1]
-                && minBound[2] < (double)ent->r.absmax[2]
+                || maxBound[0] > ent->r.absmin[0]
+                && maxBound[1] > ent->r.absmin[1]
+                && maxBound[2] > ent->r.absmin[2]
+                && minBound[0] < ent->r.absmax[0]
+                && minBound[1] < ent->r.absmax[1]
+                && minBound[2] < ent->r.absmax[2]
                 && G_TestEntityPosition(ent, ent->r.currentOrigin) == pusher))
         {
             v23[v10++] = entityList[j];
         }
     }
+#ifdef __SWITCH__
+    if (SwitchPerf_Enabled())
+        SwitchPerf_AddEvent(SWITCH_PERF_EV_MOVER_PUSHED, v10);
+#endif
     for (j = 0; j < v10; ++j)
     {
         ent = &g_entities[v23[j]];
@@ -480,7 +508,10 @@ char __cdecl G_MoverPush(gentity_s *pusher, float *move, float *amove, gentity_s
     for (j = 0; j < v10; ++j)
     {
         ent = &g_entities[v23[j]];
-        if (pushed_p >= (pushed_t *)&pushed_p)
+        // The decompiled form compared against &pushed_p, the symbol the original
+        // linker placed right after the array; with our layout that address is
+        // unrelated, so the guard fired (or never fired) at random.
+        if (pushed_p >= &pushed[MAX_GENTITIES])
             MyAssertHandler(".\\game\\g_mover.cpp", 428, 0, "%s", "pushed_p < &pushed[MAX_GENTITIES]");
         pushed_p->ent = ent;
         origin = pushed_p->origin;

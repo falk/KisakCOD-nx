@@ -336,7 +336,6 @@ int __cdecl Actor_PendingTransitionTo(actor_s *self, ai_state_t eState)
 void __cdecl Actor_SimplifyStateTransitions(actor_s *self)
 {
     unsigned int transitionCount; // r11
-    int v3; // r10
     unsigned int v4; // r30
     unsigned int v5; // r29
     ai_state_transition_t v6; // r11
@@ -347,16 +346,18 @@ void __cdecl Actor_SimplifyStateTransitions(actor_s *self)
         while (1)
         {
             transitionCount = self->transitionCount;
-            v3 = 8 * (transitionCount + 6);
-            v4 = self->StateTransitions[transitionCount - 2].eTransition;
-            v5 = self->StateTransitions[transitionCount - 1].eTransition;
+            // The retail x86 binary read the last two transition commands
+            // through raw ILP32 offsets; on LP64 those offsets land one
+            // command early. Address the array directly.
+            v4 = (unsigned int)self->StateTransitions[transitionCount - 2].eTransition;
+            v5 = (unsigned int)self->StateTransitions[transitionCount - 1].eTransition;
             if (v4 >= 4)
                 MyAssertHandler(
                     "c:\\trees\\cod3\\cod3src\\src\\game\\actor_state.cpp",
                     399,
                     0,
                     "eCmd1 doesn't index ARRAY_COUNT( g_eSimplificationRules )\n\t%i not in [0, %i)",
-                    *(gentity_s **)((char *)&self->ent + v3),
+                    v4,
                     4);
             if (v5 >= 4)
                 MyAssertHandler(
@@ -373,8 +374,11 @@ void __cdecl Actor_SimplifyStateTransitions(actor_s *self)
             {
                 if (v6)
                 {
-                    self->StateTransitions[self->transitionCount - 2].eTransition = v6;
-                    self->StateTransitions[self->transitionCount - 2].eState = self->StateTransitions[self->transitionCount - 1].eState;
+                    // Collapse the last two commands into one: keep the
+                    // newer state with the rule's transition.
+                    self->StateTransitions[transitionCount - 2].eTransition = v6;
+                    self->StateTransitions[transitionCount - 2].eState =
+                        self->StateTransitions[transitionCount - 1].eState;
                     v7 = self->transitionCount - 1;
                 }
                 else
@@ -588,7 +592,6 @@ int __cdecl Actor_PushState(actor_s *self, ai_state_t eState)
 {
     int result; // r3
     unsigned int simulatedStateLevel; // r7
-    unsigned int v6; // r10
 
     if (!self)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\game\\actor_state.cpp", 535, 0, "%s", "self");
@@ -617,9 +620,12 @@ int __cdecl Actor_PushState(actor_s *self, ai_state_t eState)
         self->StateTransitions[self->transitionCount].eTransition = AIS_TRANSITION_PUSH;
         self->StateTransitions[self->transitionCount++].eState = eState;
         Actor_SimplifyStateTransitions(self);
-        v6 = 4 * (self->simulatedStateLevel + 40);
+        // The retail x86 binary stored through an ILP32 raw offset from
+        // &self->ent; on LP64 that aliases transitionCount and corrupts the
+        // command list (invalid state transition 0 asserts). Store through
+        // the member: new simulated slot, then raise the level.
+        self->eSimulatedState[self->simulatedStateLevel + 1] = eState;
         ++self->simulatedStateLevel;
-        *(gentity_s **)((char *)&self->ent + v6) = (gentity_s *)eState;
         Actor_ClearArrivalPos(self);
         return 1;
     }

@@ -223,10 +223,10 @@ void ProfLoad_PrintHotSpots()
     MapProfileEntry *v12; // [esp+24A4h] [ebp-34h]
     int j; // [esp+24A8h] [ebp-30h]
     int v14; // [esp+24ACh] [ebp-2Ch]
-    long double v15; // [esp+24B0h] [ebp-28h]
-    long double v16; // [esp+24B8h] [ebp-20h]
-    long double v17; // [esp+24C0h] [ebp-18h]
-    long double v18; // [esp+24C8h] [ebp-10h]
+    double v15; // [esp+24B0h] [ebp-28h]
+    double v16; // [esp+24B8h] [ebp-20h]
+    double v17; // [esp+24C0h] [ebp-18h]
+    double v18; // [esp+24C8h] [ebp-10h]
     int i; // [esp+24D4h] [ebp-4h]
 
     for (i = 0; i < mapLoadProfile.profileEntryCount; ++i)

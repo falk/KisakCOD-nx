@@ -52,25 +52,36 @@ void __cdecl XAnimSaveAnimInfo(XAnimInfo *info, MemoryFile *memFile)
     MemFile_ArchiveData(memFile, 32, &info->state);
 }
 
+int xanimSaveDiagInfos;
+int xanimLoadDiagInfos;
+
 void __cdecl XAnimLoadAnimTree(DObj_s *obj, MemoryFile *memFile)
 {
     unsigned int i; // r4
     XAnimInfo *v5; // r3
+    // One block per in-use entity on the save side, DObj or not, so this walk is
+    // unconditional too: a block with no tree to load into is parsed and dropped.
+    // Gating the read on obj->tree let the two sides disagree about a single
+    // entity's DObj and shifted every read after it.
+    XAnimInfo discarded; // [sp+40h] [-40h] BYREF
     _WORD v6[24]; // [sp+50h] [-30h] BYREF
 
-    iassert(obj);
+    iassert(memFile);
+    xanimLoadDiagInfos = 0;
 
-    if (obj->tree)
+    if (obj && obj->tree && obj->tree->children)
+        MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\xanim\\xanim_readwrite.cpp", 65, 0, "%s", "!tree->children");
+
+    MemFile_ReadData(memFile, 2, (unsigned char *)v6);
+    for (i = v6[0]; v6[0] != 0xFFFF; i = v6[0])
     {
-        if (obj->tree->children)
-            MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\xanim\\xanim_readwrite.cpp", 65, 0, "%s", "!tree->children");
-        MemFile_ReadData(memFile, 2, (unsigned char *)v6);
-        for (i = v6[0]; v6[0] != 0xFFFF; i = v6[0])
-        {
+        if (obj && obj->tree)
             v5 = XAnimAllocInfo(obj, i, 1);
-            XAnimLoadAnimInfo(v5, memFile);
-            MemFile_ReadData(memFile, 2, (unsigned char *)v6);
-        }
+        else
+            v5 = &discarded;
+        XAnimLoadAnimInfo(v5, memFile);
+        ++xanimLoadDiagInfos;
+        MemFile_ReadData(memFile, 2, (unsigned char *)v6);
     }
 }
 
@@ -82,6 +93,7 @@ void __cdecl XAnimSaveAnimTree_r(const XAnimTree_s *tree, MemoryFile *memFile, i
     unsigned __int16 animIndex; // [sp+50h] [-40h] BYREF
 
     iassert(tree);
+    ++xanimSaveDiagInfos;
     info = GetAnimInfo(infoIndex);
     iassert(info->inuse);
     animIndex = info->animIndex;
@@ -104,16 +116,17 @@ void __cdecl XAnimSaveAnimTree(const DObj_s *obj, MemoryFile *memFile)
     XAnimTree_s *tree; // r3
     __int16 v5[4]; // [sp+50h] [-20h] BYREF
 
-    iassert(obj);
+    iassert(memFile);
+    xanimSaveDiagInfos = 0;
 
-    tree = obj->tree;
-
-    if (obj->tree)
-    {
-        if (tree->children > 0 && tree->children < 4096)
-            XAnimSaveAnimTree_r(tree, memFile, tree->children);
-        v5[0] = -1;
-        MemFile_WriteData(memFile, 2, v5);
-    }
+    // Every in-use entity gets a block, including one whose DObj has no tree (or
+    // no DObj at all): the marker alone then.  Skipping the write is what made
+    // the load's matching read conditional and let the two sides disagree about
+    // one entity (eType/model at save time differed from load time), which shifted every read after it.
+    tree = obj ? obj->tree : 0;
+    if (tree && tree->children > 0 && tree->children < 4096)
+        XAnimSaveAnimTree_r(tree, memFile, tree->children);
+    v5[0] = -1;
+    MemFile_WriteData(memFile, 2, v5);
 }
 

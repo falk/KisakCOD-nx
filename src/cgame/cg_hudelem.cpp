@@ -1763,7 +1763,9 @@ int32_t __cdecl GetSortedHudElems(int32_t localClientNum, hudelem_s **elems)
     CopyInUseHudElems(elems, &elemCount, ps->hud.elem, 256);
 #endif
 
-    qsort(elems, elemCount, 4, compare_hudelems);
+    // LP64: elems is an array of hudelem_s*; the old ILP32 constant 4 made
+    // qsort shuffle half-pointers and compare_hudelems read a NULL element.
+    qsort(elems, elemCount, sizeof(elems[0]), compare_hudelems);
     return elemCount;
 }
 

@@ -7,9 +7,9 @@ set(CMAKE_CXX_STANDARD 20)
 
 add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE)
 
-# Set this to match the folder name in scripts/platform
-# This will handle the path overrides if needed
-set(KISAK_PLATFORM win32)
+# Set this to match the folder name in scripts/platform.
+set(KISAK_PLATFORM win32 CACHE STRING "Target platform: win32, linux, or switch")
+set_property(CACHE KISAK_PLATFORM PROPERTY STRINGS win32 linux switch)
 
 # Set Address Sanitizer
 # NOTE: If you use this you will need to copy to the game's directory
@@ -40,8 +40,13 @@ include(${SCRIPTS_DIR}/platform_override.cmake)
 # Log out the KISAK_PLATFORM
 message("Building KISAK_PLATFORM: ${KISAK_PLATFORM}")
 
-# Include the subprojects
-add_subdirectory(${SCRIPTS_DIR}/mp)
-add_subdirectory(${SCRIPTS_DIR}/sp)
-add_subdirectory(${SCRIPTS_DIR}/dedi)
-add_subdirectory(${SCRIPTS_DIR}/radiant)
+# Keep the Switch target SP-first.  The MP, dedicated, and Radiant projects
+# carry Windows-only dependencies and must not be configured for Horizon.
+if (KISAK_PLATFORM STREQUAL "switch")
+    add_subdirectory(${SCRIPTS_DIR}/sp)
+else()
+    add_subdirectory(${SCRIPTS_DIR}/mp)
+    add_subdirectory(${SCRIPTS_DIR}/sp)
+    add_subdirectory(${SCRIPTS_DIR}/dedi)
+    add_subdirectory(${SCRIPTS_DIR}/radiant)
+endif()

@@ -851,6 +851,12 @@ void __cdecl PlayerCmd_setOrigin(scr_entref_t entref)
         }
     }
     Scr_GetVector(0, v3);
+    // P2: this is the player's `setorigin` method, which Killhouse's
+    // inside_start() uses to establish the authored interior start. Record it
+    // so the spawn checkpoint can prove the real script path ran even though
+    // the retail flying_intro cinematic then moves the player.
+    if (v4 == 0)
+        G_P2_RecordInsideStartTeleport(v3);
     SetClientOrigin(v1, v3);
 }
 
@@ -926,7 +932,7 @@ void __cdecl PlayerCmd_setAngles(scr_entref_t entref)
 {
     gentity_s *v1; // r31
     const char *v2; // r3
-    long double v3; // fp2
+    double v3; // fp2
     float v4[6]; // [sp+50h] [-30h] BYREF
     unsigned __int16 v5; // [sp+94h] [+14h]
 
@@ -3230,9 +3236,9 @@ void __cdecl PlayerCmd_BeginLocationSelection(scr_entref_t entref)
     const char *String; // r3
     int LocSelIndex; // r3
     int v5; // r30
-    long double v6; // fp2
+    double v6; // fp2
     double Float; // fp31
-    long double v8; // fp2
+    double v8; // fp2
     unsigned int v9; // r31
     unsigned __int16 v10; // [sp+A4h] [+14h]
 
@@ -4288,4 +4294,3 @@ void __cdecl G_AddCommandNotify(volatile unsigned __int16 notify)
     //__lwsync();
     s_cmdNotify.write += v3 + 2;
 }
-

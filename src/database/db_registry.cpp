@@ -5,11 +5,16 @@
 #include <qcommon/mem_track.h>
 
 #include <xanim/xmodel.h>
+#ifndef __SWITCH__
 #include <win32/win_net.h>
+#endif
 #include <qcommon/threads.h>
+#include <universal/critical_section.h>
 #include <qcommon/com_bsp.h>
 #include <gfx_d3d/r_init.h>
+#ifndef __SWITCH__
 #include <win32/win_local.h>
+#endif
 #include <gfx_d3d/rb_uploadshaders.h>
 #include <gfx_d3d/r_image.h>
 #include <universal/com_files.h>
@@ -19,11 +24,20 @@
 #include <qcommon/cmd.h>
 #include <universal/physicalmemory.h>
 #include <gfx_d3d/rb_shade.h>
+#include <sound/snd_public.h>
 #include <gfx_d3d/r_staticmodelcache.h>
+#include <gfx_d3d/r_buffers.h>
 #include <win32/win_localize.h>
 #include <universal/profile.h>
+#if defined(__SWITCH__)
+#include <database/db_retail_walk.h>
+#include <database/db_retail_decode_material.h>
+#include <database/db_retail_decode_weapon.h>
+#endif
 
 #include <algorithm>
+#include <atomic>
+#include <cstring>
 
 #include <setjmp.h>
 #include <game/g_bsp.h>
@@ -244,6 +258,8 @@ void __cdecl DB_FreeXAssetHeader_StringTable_(void *arg, XAssetHeader header)
 
 void NULLSUB(void *crap, XAssetHeader head)
 {
+    (void)crap;
+    (void)head;
 }
 
 void(__cdecl *DB_FreeXAssetHeaderHandler[ASSET_TYPE_COUNT])(void *, XAssetHeader) =
@@ -425,6 +441,34 @@ fileData_s *com_fileDataHashTable[1024];
 
 FastCriticalSection db_hashCritSect;
 
+// Lookup generation for by-name memos of this registry (Com_FindSoundAlias'
+// NamePtrCache). It changes whenever what a by-name lookup returns may
+// change: every write-locked section of db_hashCritSect bumps it on entry
+// and on exit (hash chains, entry headers, zoneIndex / default status,
+// overrides, unloads all change only in there), and DB_ReleaseXAssets bumps
+// it for the inuse flags DB_FindXAssetHeader sets. Never 0 (0 = "do not
+// memoize"). A new writer of the hash table or of entries must take the
+// write lock through DB_HashLockWrite / DB_HashUnlockWrite like the others.
+static std::atomic<uint32_t> s_dbLookupGeneration{1};
+
+static void DB_BumpLookupGeneration()
+{
+    if (s_dbLookupGeneration.fetch_add(1, std::memory_order_acq_rel) + 1 == 0)
+        s_dbLookupGeneration.fetch_add(1, std::memory_order_acq_rel);
+}
+
+static void DB_HashLockWrite()
+{
+    Sys_LockWrite(&db_hashCritSect);
+    DB_BumpLookupGeneration();
+}
+
+static void DB_HashUnlockWrite()
+{
+    DB_BumpLookupGeneration();
+    Sys_UnlockWrite(&db_hashCritSect);
+}
+
 bool g_zoneInited;
 int32_t g_zoneCount;
 
@@ -438,6 +482,21 @@ char g_debugZoneName[64];
 uint32_t g_zoneAllocType;
 uint32_t g_zoneIndex;
 uint32_t _S1;
+uint32_t g_retailZoneParent[32];
+uint32_t g_retailZoneDepth;
+// Load policy per retail zone slot for the reload-idempotency check (see
+// database.h): true when the resident zone was bounded-loaded.  Only
+// meaningful while the slot's name is set; cleared on slot (re)init and
+// retire.  Normal (non-retail) zones share these slots but never match a
+// retail-path name lookup, so no policy entry of theirs is ever consulted.
+bool g_retailZoneBounded[32];
+// Retail zone slot that registered the resident CLIPMAP asset (0 = none).
+// CM_Shutdown invalidates the global `cm`, but Com_Restart keeps retail zone
+// memory resident, so a same-map re-spawn would skip the zone (reload
+// idempotency) and leave `cm` zeroed while DB_FindXAssetHeader still returns
+// it -- CM_InitThreadData then memcpys from a null cm.box_brush.  Retiring
+// exactly this zone makes the next CM_LoadMap re-decode the clipmap.
+uint32_t g_retailClipMapZone;
 const dvar_t *zone_reorder;
 volatile uint32_t g_loadingAssets;
 XZoneInfoInternal g_zoneInfo[8];
@@ -479,7 +538,7 @@ char *__cdecl DB_ReferencedFFNameList()
                 I_strncat(g_zoneNameList, 2080, " ");
             if (g_zones[i].modZone)
             {
-                I_strncat(g_zoneNameList, 2080, (const char*)fs_gameDirVar->current.integer);
+                I_strncat(g_zoneNameList, 2080, fs_gameDirVar->current.string);
                 I_strncat(g_zoneNameList, 2080, "/");
             }
             I_strncat(g_zoneNameList, 2080, g_zones[i].name);
@@ -635,7 +694,9 @@ void __cdecl TRACK_db_registry()
 void __cdecl DB_GetIndexBufferAndBase(uint8_t zoneHandle, void *indices, void **ib, int32_t *baseIndex)
 {
     *ib = g_zones[zoneHandle].mem.indexBuffer;
-    *baseIndex = ((uint32_t)indices - (uint32_t)g_zones[zoneHandle].mem.blocks[8].data) >> 1;
+    *baseIndex = static_cast<int32_t>(
+        (reinterpret_cast<uintptr_t>(indices) -
+         reinterpret_cast<uintptr_t>(g_zones[zoneHandle].mem.blocks[8].data)) >> 1);
 }
 
 void __cdecl DB_GetVertexBufferAndOffset(uint8_t zoneHandle, _BYTE *verts, void **vb, int32_t *vertexOffset)
@@ -644,12 +705,61 @@ void __cdecl DB_GetVertexBufferAndOffset(uint8_t zoneHandle, _BYTE *verts, void 
     *vb = g_zones[zoneHandle].mem.vertexBuffer;
 }
 
+// Zone block-7/8 sizes for pre-draw bounds checks.
+// Returns false for an unregistered handle instead of handing out garbage.
+bool __cdecl DB_GetZoneGeometrySizes(uint8_t zoneHandle, uint32_t *vertBytes, uint32_t *indexBytes)
+{
+    if (zoneHandle >= 32 || !g_zones[zoneHandle].name[0])
+        return false;
+    if (vertBytes)
+        *vertBytes = g_zones[zoneHandle].mem.blocks[7].size;
+    if (indexBytes)
+        *indexBytes = g_zones[zoneHandle].mem.blocks[8].size;
+    return true;
+}
+
+// See database.h.  Mirrors the finished block-7/8 bytes into the still-mapped
+// D3D buffers DB_AllocXZoneMemory created for this zone and unlocks them, the
+// same publish DB_CloneStreamData + DB_FinishGeometryBlocks perform for a
+// normal DB_LoadXFileInternal load.  Prints the state it found
+// (including the pre-call locked state) so a log shows whether the
+// buffers were already published.
+void __cdecl DB_RetailZoneUploadGeometryBuffers(uint32_t zoneIndex)
+{
+    if (zoneIndex == 0 || zoneIndex >= 32 || !g_zones[zoneIndex].name[0])
+        return;
+    XZoneMemory *mem = &g_zones[zoneIndex].mem;
+    const uint32_t vertBytes = mem->blocks[7].size;
+    const uint32_t indexBytes = mem->blocks[8].size;
+    const int wasVertexLocked = mem->lockedVertexData ? 1 : 0;
+    const int wasIndexLocked = mem->lockedIndexData ? 1 : 0;
+    uint32_t uploadedVertexBytes = 0;
+    uint32_t uploadedIndexBytes = 0;
+
+    if (vertBytes && mem->blocks[7].data && mem->lockedVertexData && mem->vertexBuffer)
+    {
+        std::memcpy(mem->lockedVertexData, mem->blocks[7].data, vertBytes);
+        uploadedVertexBytes = vertBytes;
+        R_FinishStaticVertexBuffer((IDirect3DVertexBuffer9 *)mem->vertexBuffer);
+        mem->lockedVertexData = 0;
+    }
+    if (indexBytes && mem->blocks[8].data && mem->lockedIndexData && mem->indexBuffer)
+    {
+        std::memcpy(mem->lockedIndexData, mem->blocks[8].data, indexBytes);
+        uploadedIndexBytes = indexBytes;
+        R_FinishStaticIndexBuffer((IDirect3DIndexBuffer9 *)mem->indexBuffer);
+        mem->lockedIndexData = 0;
+    }
+
+    
+}
+
 void __cdecl DB_BuildOSPath_Mod(const char *zoneName, uint32_t size, char *filename)
 {
     char *v3; // eax
     const char *string; // [esp-8h] [ebp-8h]
 
-    if (!*(_BYTE *)fs_gameDirVar->current.integer)
+    if (!*fs_gameDirVar->current.string)
         MyAssertHandler(".\\database\\db_registry.cpp", 3204, 0, "%s", "IsUsingMods()");
     string = fs_gameDirVar->current.string;
     v3 = Sys_DefaultInstallPath();
@@ -661,7 +771,7 @@ bool __cdecl DB_ModFileExists()
     char filename[256]; // [esp+0h] [ebp-108h] BYREF
     void *zoneFile; // [esp+104h] [ebp-4h]
 
-    if (!*(_BYTE *)fs_gameDirVar->current.integer)
+    if (!*fs_gameDirVar->current.string)
         return 0;
     DB_BuildOSPath_Mod("mod", 0x100u, filename);
     zoneFile = CreateFileA(filename, 0x80000000, 1u, 0, 3u, 0x60000000u, 0);
@@ -843,6 +953,10 @@ void __cdecl Mark_ClipMapAsset(clipMap_t *clipMap)
 void __cdecl DB_RemoveLoadedSound(XAssetHeader header)
 {
     //Z_Free((char *)header.xmodelPieces[3].numpieces, 15);
+#ifdef KISAK_OPENAL
+    // Drop the shared AL buffer keyed by this PCM before the address can be reused.
+    SND_ReleaseLoadedSoundBuffer(header.loadSnd->sound.data);
+#endif
     Z_Free(header.loadSnd->sound.data, 15);
 }
 
@@ -962,20 +1076,32 @@ void __cdecl Mark_MenuAsset(menuDef_t *menu)
 
 void __cdecl DB_DynamicCloneMenu(XAssetHeader from, XAssetHeader to, int32_t swag)
 {
-    windowDef_t *toWindow; // [esp+14h] [ebp-18h]
-    int32_t toIndex; // [esp+18h] [ebp-14h]
-    int32_t fromIndex; // [esp+1Ch] [ebp-10h]
-    windowDef_t *fromWindow; // [esp+24h] [ebp-8h]
+    menuDef_t *fromMenu = from.menu;
+    menuDef_t *toMenu = to.menu;
 
-    to.xmodelPieces[6].pieces = from.xmodelPieces[6].pieces;
-    for (toIndex = 0; toIndex < (int)to.xmodelPieces[13].pieces; ++toIndex)
+    if (!fromMenu || !toMenu)
+        return;
+
+    toMenu->window.dynamicFlags[0] = fromMenu->window.dynamicFlags[0];
+    if (!toMenu->items || toMenu->itemCount <= 0)
+        return;
+
+    for (int32_t toIndex = 0; toIndex < toMenu->itemCount; ++toIndex)
     {
-        toWindow = *(windowDef_t **)(to.xmodelPieces[23].numpieces + 4 * toIndex);
-        if (toWindow->name)
+        itemDef_s *toItem = toMenu->items[toIndex];
+        if (!toItem)
+            continue;
+
+        windowDef_t *toWindow = &toItem->window;
+        if (toWindow->name && fromMenu->items && fromMenu->itemCount > 0)
         {
-            for (fromIndex = 0; fromIndex < (int)from.xmodelPieces[13].pieces; ++fromIndex)
+            for (int32_t fromIndex = 0; fromIndex < fromMenu->itemCount; ++fromIndex)
             {
-                fromWindow = *(windowDef_t **)(from.xmodelPieces[23].numpieces + 4 * fromIndex);
+                itemDef_s *fromItem = fromMenu->items[fromIndex];
+                if (!fromItem)
+                    continue;
+
+                windowDef_t *fromWindow = &fromItem->window;
                 if (fromWindow->name && !strcmp(fromWindow->name, toWindow->name))
                 {
                     toWindow->dynamicFlags[0] = fromWindow->dynamicFlags[0];
@@ -986,6 +1112,7 @@ void __cdecl DB_DynamicCloneMenu(XAssetHeader from, XAssetHeader to, int32_t swa
         DB_RemoveWindowFocus(toWindow);
     }
 }
+
 
 void __cdecl DB_RemoveWindowFocus(windowDef_t *window)
 {
@@ -1307,13 +1434,13 @@ LABEL_39:
         }
         return assetEntry->asset.header;
     }
-    Sys_LockWrite(&db_hashCritSect);
+    DB_HashLockWrite();
     assetEntry = &DB_FindXAssetEntry(type, name)->entry;
     if (assetEntry)
     {
         if (!assetEntry->asset.header.xmodelPieces)
             MyAssertHandler(".\\database\\db_registry.cpp", 2774, 0, "%s", "assetEntry->asset.header.data");
-        Sys_UnlockWrite(&db_hashCritSect);
+        DB_HashUnlockWrite();
         goto returnAsset;
     }
     DB_LogMissingAsset(type, name);
@@ -1323,15 +1450,29 @@ LABEL_39:
     }
     if (type == ASSET_TYPE_LOCALIZE_ENTRY || type == ASSET_TYPE_RAWFILE)
     {
-        Sys_UnlockWrite(&db_hashCritSect);
+        DB_HashUnlockWrite();
         return 0;
     }
     else
     {
         newEntry = DB_CreateDefaultEntry(type, (char*)name);
-        Sys_UnlockWrite(&db_hashCritSect);
+        DB_HashUnlockWrite();
         return newEntry->asset.header;
     }
+}
+
+bool __cdecl DB_XAssetExists(XAssetType type, const char *name)
+{
+    if (type < 0 || type >= ASSET_TYPE_COUNT || !name)
+        return false;
+    InterlockedIncrement(&db_hashCritSect.readCount);
+    while (db_hashCritSect.writeCount)
+        NET_Sleep(0);
+    const bool exists = DB_FindXAssetEntry(type, name) != nullptr;
+    if (db_hashCritSect.readCount <= 0)
+        MyAssertHandler(".\\database\\db_registry.cpp", __LINE__, 0, "%s", "db_hashCritSect.readCount > 0");
+    InterlockedDecrement(&db_hashCritSect.readCount);
+    return exists;
 }
 
 void __cdecl DB_Sleep(uint32_t msec)
@@ -1617,12 +1758,23 @@ int32_t g_defaultAssetCount;
 XAssetEntry *__cdecl DB_CreateDefaultEntry(XAssetType type, char *name)
 {
     XAsset asset; // [esp+Ch] [ebp-Ch] BYREF
+    {
+        static int s_defEntryLog = 0;
+        if (s_defEntryLog < 30 && name)
+        {
+            ++s_defEntryLog;
+            char dbuf[256];
+            size_t nlen = strlen(name);
+            snprintf(dbuf, sizeof(dbuf), "DEF-ENTRY[%d]: type=%d namelen=%u name=%.120s ret=%p\n",
+                     s_defEntryLog, (int)type, (unsigned)nlen, name, __builtin_return_address(0));
+        }
+    }
     XAssetEntry *newEntry; // [esp+14h] [ebp-4h]
 
     asset.header = DB_FindXAssetDefaultHeaderInternal(type);
     if (!asset.header.data)
     {
-        Sys_UnlockWrite(&db_hashCritSect);
+        DB_HashUnlockWrite();
         if (type == ASSET_TYPE_CLIPMAP || type == ASSET_TYPE_CLIPMAP_PVS)
             Com_Error(
                 ERR_DROP,
@@ -1646,7 +1798,7 @@ XAssetEntry *__cdecl DB_CreateDefaultEntry(XAssetType type, char *name)
         newEntry->asset.header.sound->head = NULL;
     }
     newEntry->nextHash = db_hashTable[DB_HashForName(name, type)];
-    db_hashTable[DB_HashForName(name, type)] = ((char *)newEntry - (char *)g_assetEntryPool) >> 4;
+    db_hashTable[DB_HashForName(name, type)] = static_cast<uint32_t>(reinterpret_cast<XAssetEntryPoolEntry *>(newEntry) - g_assetEntryPool);
     DB_SetXAssetName(&newEntry->asset, SL_ConvertToString(SL_GetString(name, 4)));
     newEntry->inuse = 1;
     return newEntry;
@@ -1659,7 +1811,7 @@ XAssetEntryPoolEntry *__cdecl DB_AllocXAssetEntry(XAssetType type, uint8_t zoneI
     freeHead = g_freeAssetEntryHead;
     if (!g_freeAssetEntryHead)
     {
-        Sys_UnlockWrite(&db_hashCritSect);
+        DB_HashUnlockWrite();
         Com_Error(ERR_DROP, "Could not allocate asset - increase XASSET_ENTRY_POOL_SIZE");
     }
     g_freeAssetEntryHead = freeHead->next;
@@ -1679,7 +1831,7 @@ XAssetHeader __cdecl DB_AllocXAssetHeader(XAssetType type)
     header.data = DB_AllocXAssetHeaderHandler[type](DB_XAssetPool[type]).data;
     if (!header.data)
     {
-        Sys_UnlockWrite(&db_hashCritSect);
+        DB_HashUnlockWrite();
         Com_PrintError(CON_CHANNEL_ERROR, "Exceeded limit of %d '%s' assets.\n", g_poolSize[type], g_assetNames[type]);
         DB_EnumXAssets(type, (void(__cdecl *)(XAssetHeader, void *))DB_PrintAssetName, &type, 1);
         Com_Error(ERR_DROP, "Exceeded limit of %d '%s' assets.\n", g_poolSize[type], g_assetNames[type]);
@@ -1716,7 +1868,27 @@ XAssetHeader __cdecl DB_FindXAssetDefaultHeaderInternal(XAssetType type)
     for (assetEntryIndex = db_hashTable[DB_HashForName(name, type)]; ; assetEntryIndex = assetEntry->entry.nextHash)
     {
         if (!assetEntryIndex)
+        {
+            if (type == ASSET_TYPE_TECHNIQUE_SET)
+            {
+                XAssetEntryPoolEntry *fb = DB_FindXAssetEntry(type, "sm2/default");
+                if (!fb) fb = DB_FindXAssetEntry(type, "2d");
+                if (!fb)
+                {
+                    for (uint32_t i = 1; i < 0x8000; ++i)
+                    {
+                        if (g_assetEntryPool[i].entry.inuse && g_assetEntryPool[i].entry.asset.type == type)
+                        {
+                            fb = &g_assetEntryPool[i];
+                            break;
+                        }
+                    }
+                }
+                if (fb)
+                    return fb->entry.asset.header;
+            }
             return 0;
+        }
         assetEntry = &g_assetEntryPool[assetEntryIndex];
         if (assetEntry->entry.asset.type == type)
         {
@@ -1885,9 +2057,9 @@ XAssetHeader __cdecl DB_AddXAsset(XAssetType type, XAssetHeader header)
 
     newEntry.entry.asset.type = type;
     newEntry.entry.asset.header = header;
-    Sys_LockWrite(&db_hashCritSect);
+    DB_HashLockWrite();
     existingEntry = DB_LinkXAssetEntry(&newEntry, 0);
-    Sys_UnlockWrite(&db_hashCritSect);
+    DB_HashUnlockWrite();
     DB_SyncLostDevice();
     return existingEntry->entry.asset.header;
 }
@@ -1958,7 +2130,7 @@ XAssetEntryPoolEntry *__cdecl DB_LinkXAssetEntry(XAssetEntryPoolEntry *newEntry,
         iassert(existingEntry->entry.zoneIndex != newEntry->entry.zoneIndex);
         if (!*g_defaultAssetName[type] && type != ASSET_TYPE_RAWFILE && type != ASSET_TYPE_MAP_ENTS)
         {
-            Sys_UnlockWrite(&db_hashCritSect);
+            DB_HashUnlockWrite();
             Com_Error(
                 ERR_DROP,
                 "Attempting to override asset '%s' from zone '%s' with zone '%s'",
@@ -2172,11 +2344,11 @@ void DB_PostLoadXZone()
 
             {
                 DB_ArchiveAssets();
-                Sys_LockWrite(&db_hashCritSect);
+                DB_HashLockWrite();
                 for (i = 0; i < g_copyInfoCount; ++i)
                     DB_LinkXAssetEntry((XAssetEntryPoolEntry *)g_copyInfo[i], 1);
                 g_copyInfoCount = 0;
-                Sys_UnlockWrite(&db_hashCritSect);
+                DB_HashUnlockWrite();
                 Material_DirtyTechniqueSetOverrides();
                 Material_OverrideTechniqueSets();
                 DB_UnarchiveAssets();
@@ -2222,11 +2394,15 @@ void __cdecl DB_SyncXAssets()
     R_BeginRemoteScreenUpdate();
     Sys_SyncDatabase();
     R_EndRemoteScreenUpdate();
+#if defined(__SWITCH__)
+    if (g_switchRetailLoadFailed.load(std::memory_order_acquire))
+        Com_Error(ERR_FATAL, "Required retail zone load failed: %s", DB_SwitchRetailLoadFailure());
+#endif
     DB_PostLoadXZone();
 }
 
 cmd_function_s DB_LoadZone_f_VAR;
-void __cdecl DB_LoadXAssets(XZoneInfo *zoneInfo, uint32_t zoneCount, int32_t sync)
+static void DB_LoadXAssetsInternal(XZoneInfo *zoneInfo, uint32_t zoneCount, int32_t sync)
 {
     uint32_t j; // [esp+4h] [ebp-14h]
     uint32_t ja; // [esp+4h] [ebp-14h]
@@ -2238,16 +2414,15 @@ void __cdecl DB_LoadXAssets(XZoneInfo *zoneInfo, uint32_t zoneCount, int32_t syn
     iassert(Sys_IsMainThread());
     iassert(zoneCount);
 
-    if (!g_zoneInited)
-    {
-        g_zoneInited = 1;
-        DB_Init();
-        Cmd_AddCommandInternal("loadzone", DB_LoadZone_f, &DB_LoadZone_f_VAR);
-    }
+    DB_InitializeRegistry();
 
     unloadedZone = 0;
     Material_ClearShaderUploadList();
     DB_SyncXAssets();
+#if defined(__SWITCH__)
+    // The preceding request must finish before its failure storage is reused.
+    DB_SwitchClearRetailLoadFailure();
+#endif
     
     iassert(!g_archiveBuf);
 
@@ -2264,7 +2439,7 @@ void __cdecl DB_LoadXAssets(XZoneInfo *zoneInfo, uint32_t zoneCount, int32_t syn
                     unloadedZone = 1;
                     DB_SyncExternalAssets();
                     DB_ArchiveAssets();
-                    Sys_LockWrite(&db_hashCritSect);
+                    DB_HashLockWrite();
                 }
                 DB_UnloadXZone(zoneIndex, 1);
             }
@@ -2282,7 +2457,7 @@ void __cdecl DB_LoadXAssets(XZoneInfo *zoneInfo, uint32_t zoneCount, int32_t syn
             DB_UnloadXAssetsMemoryForZone(zoneInfo[ja].freeFlags, DB_ZONE_COMMON);
             DB_UnloadXAssetsMemoryForZone(zoneInfo[ja].freeFlags, DB_ZONE_COMMON_LOC);
         }
-        Sys_UnlockWrite(&db_hashCritSect);
+        DB_HashUnlockWrite();
         DB_UnarchiveAssets();
     }
     if (sync)
@@ -2297,6 +2472,15 @@ void __cdecl DB_LoadXAssets(XZoneInfo *zoneInfo, uint32_t zoneCount, int32_t syn
     }
 }
 
+void __cdecl DB_LoadXAssets(XZoneInfo *zoneInfo, uint32_t zoneCount, int32_t sync)
+{
+    DB_LoadXAssetsInternal(zoneInfo, zoneCount, sync);
+#if defined(__SWITCH__)
+    if (sync && g_switchRetailLoadFailed.load(std::memory_order_acquire))
+        Com_Error(ERR_FATAL, "Required retail zone load failed: %s", DB_SwitchRetailLoadFailure());
+#endif
+}
+
 void DB_Init()
 {
     for (XAssetType type = (XAssetType)0; type < ASSET_TYPE_COUNT; ++type)
@@ -2308,6 +2492,257 @@ void DB_Init()
         g_assetEntryPool[i].next = &g_assetEntryPool[i + 1];
 
     g_assetEntryPool[0x7FFF].next = NULL;
+}
+
+void __cdecl DB_InitializeRegistry()
+{
+    if (g_zoneInited)
+        return;
+
+    g_zoneInited = true;
+    DB_Init();
+    Cmd_AddCommandInternal("loadzone", DB_LoadZone_f, &DB_LoadZone_f_VAR);
+}
+
+bool __cdecl DB_RetailZoneBegin(const char *name, int32_t flags, const uint32_t blockSizes[9],
+                                uint32_t *nativeArenaBytes, uint32_t *zoneIndex,
+                                XZoneMemory **zoneMemory, void **nativeArenaMemory)
+{
+    if (!name || !name[0] || !blockSizes || !nativeArenaBytes || *nativeArenaBytes == 0 ||
+        !zoneIndex || !zoneMemory || !nativeArenaMemory || g_zoneCount >= 32)
+        return false;
+    DB_InitializeRegistry();
+
+    uint32_t index = 0;
+    for (uint32_t i = 1; i < 32; ++i)
+    {
+        if (!g_zones[i].name[0])
+        {
+            index = i;
+            break;
+        }
+    }
+    if (!index)
+        return false;
+
+    XZone &zone = g_zones[index];
+    std::memset(&zone, 0, sizeof(zone));
+    I_strncpyz(zone.name, name, sizeof(zone.name));
+    zone.flags = flags;
+    // Slot (re)init: drop any policy the previous occupant recorded so a
+    // reused slot never misdescribes the new zone.  The success path notes
+    // the real policy via DB_RetailZoneNoteLoadPolicy.
+    g_retailZoneBounded[index] = false;
+    zone.allocType = DB_GetZoneAllocType(flags);
+    g_zoneHandles[g_zoneCount++] = static_cast<uint8_t>(index);
+    // g_zoneIndex is left over from the last normal fastfile load, so only
+    // the explicit retail nesting depth determines whether it is a parent.
+    g_retailZoneParent[index] = g_retailZoneDepth ? g_zoneIndex : 0;
+    g_retailZoneDepth++;
+    g_zoneIndex = index;
+    g_loadingZone = true;
+
+    uint32_t sizes[9];
+    std::memcpy(sizes, blockSizes, sizeof(sizes));
+    PMem_BeginAlloc(zone.name, zone.allocType);
+    DB_AllocXZoneMemory(sizes, zone.name, &zone.mem, zone.allocType);
+    // The native arena is the zone's last allocation: reserve up to the
+    // wanted size (clamped to what the pool has left, so a zone that needs
+    // more fails loudly in the walker instead of aborting here), and the
+    // walker trims the unused tail once the zone has loaded
+    // (DB_RetailZoneTrimNativeArena).
+    uint32_t arenaBytes = *nativeArenaBytes;
+#if defined(__SWITCH__)
+    const uint32_t freeBytes = PMem_GetFreeAmount();
+    const uint32_t freeArena = freeBytes > 32u ? (freeBytes - 16u) & ~15u : 0u;
+    if (arenaBytes > freeArena)
+    {
+        Com_Printf(16, "DB_RetailZoneBegin: %s native arena clamped %u -> %u (PMem free %u)\n",
+                   zone.name, arenaBytes, freeArena, freeBytes);
+        arenaBytes = freeArena;
+    }
+    if (arenaBytes < 16u)
+        arenaBytes = 16u; // PMem_Alloc fails loudly: the pool is exhausted
+#endif
+    void *arenaMemory = PMem_Alloc(arenaBytes, 16, 4, zone.allocType);
+    PMem_EndAlloc(zone.name, zone.allocType);
+    *nativeArenaBytes = arenaBytes;
+
+    *zoneIndex = index;
+    *zoneMemory = &zone.mem;
+    *nativeArenaMemory = arenaMemory;
+    return true;
+}
+
+bool DB_RetailZoneTrimNativeArena(uint32_t zoneIndex, void *nativeArenaMemory,
+                                  uint32_t reservedBytes, uint32_t keepBytes)
+{
+#if defined(__SWITCH__)
+    if (!zoneIndex || zoneIndex >= 32 || !g_zones[zoneIndex].name[0] || keepBytes > reservedBytes)
+        return false;
+    keepBytes = (keepBytes + 15u) & ~15u;
+    if (keepBytes > reservedBytes)
+        keepBytes = reservedBytes;
+    return PMem_ShrinkLastAlloc(nativeArenaMemory, reservedBytes, keepBytes,
+                                g_zones[zoneIndex].allocType);
+#else
+    (void)zoneIndex;
+    (void)nativeArenaMemory;
+    (void)reservedBytes;
+    (void)keepBytes;
+    return false;
+#endif
+}
+
+uint32_t __cdecl DB_RetailZoneFindLive(const char *name, bool bounded)
+{
+    if (!name || !name[0])
+        return 0;
+    for (uint32_t i = 1; i < 32; ++i)
+    {
+        if (g_zones[i].name[0] && !std::strcmp(g_zones[i].name, name) &&
+            g_retailZoneBounded[i] == bounded)
+            return i;
+    }
+    return 0;
+}
+
+void __cdecl DB_RetailZoneNoteLoadPolicy(uint32_t zoneIndex, bool bounded)
+{
+    if (zoneIndex < 32)
+        g_retailZoneBounded[zoneIndex] = bounded;
+}
+
+XAssetHeader __cdecl DB_RetailZoneRegister(XAssetType type, XAssetHeader header,
+                                            uint32_t zoneIndex)
+{
+    XAssetHeader empty{};
+    if (zoneIndex == 0 || zoneIndex != g_zoneIndex || zoneIndex >= 32 ||
+        !g_zones[zoneIndex].name[0] || type < 0 || type >= ASSET_TYPE_COUNT || !header.data)
+        return empty;
+    // This bounded retail load runs on the caller/database thread and
+    // needs the same immediate override behavior as DB_LoadXAssets(sync=1).
+    // Preserve the surrounding loader state for the normal asynchronous path.
+    const int32_t oldSync = g_sync;
+    g_sync = 1;
+    XAssetHeader registered = DB_AddXAsset(type, header);
+    g_sync = oldSync;
+#ifdef KISAK_MP
+    if (type == ASSET_TYPE_CLIPMAP_PVS)
+        g_retailClipMapZone = zoneIndex;
+#else
+    if (type == ASSET_TYPE_CLIPMAP)
+        g_retailClipMapZone = zoneIndex;
+#endif
+    return registered;
+}
+
+bool __cdecl DB_RetailZoneEnd(uint32_t zoneIndex)
+{
+    if (zoneIndex == 0 || zoneIndex >= 32 || zoneIndex != g_zoneIndex ||
+        !g_zones[zoneIndex].name[0] || g_retailZoneDepth == 0)
+        return false;
+
+    // drop deferred weapon sound slots owned by this zone before its
+    // memory is released, so no later resolve pass can write through a
+    // dangling native slot pointer. Deferred comma-material aliases have the
+    // same owner-zone slot lifetime and are purged the same way.
+    RetailWeaponZoneUnloaded(zoneIndex);
+    RetailMaterialZoneUnloaded(zoneIndex);
+
+    int32_t sorted = -1;
+    for (int32_t i = 0; i < g_zoneCount; ++i)
+    {
+        if (g_zoneHandles[i] == zoneIndex)
+        {
+            sorted = i;
+            break;
+        }
+    }
+    if (sorted < 0)
+        return false;
+
+    // Use the exact production unload path while holding the same registry
+    // lock as DB_ShutdownXAssets.  Assets are removed/restored before PMem is
+    // released, so no pooled header can retain a pointer into dead zone data.
+    DB_HashLockWrite();
+    DB_UnloadXZone(zoneIndex, false);
+    DB_UnloadXZoneMemory(&g_zones[zoneIndex]);
+    for (int32_t i = sorted; i + 1 < g_zoneCount; ++i)
+        g_zoneHandles[i] = g_zoneHandles[i + 1];
+    --g_zoneCount;
+    const uint32_t parent = g_retailZoneParent[zoneIndex];
+    g_retailZoneParent[zoneIndex] = 0;
+    g_retailZoneBounded[zoneIndex] = false;
+    if (g_retailClipMapZone == zoneIndex)
+        g_retailClipMapZone = 0;
+    std::memset(&g_zones[zoneIndex], 0, sizeof(g_zones[zoneIndex]));
+    --g_retailZoneDepth;
+    g_zoneIndex = parent;
+    g_loadingZone = g_retailZoneDepth != 0;
+    DB_HashUnlockWrite();
+    return true;
+}
+
+MaterialTechniqueSet *__cdecl DB_RegisterMaterialTechniqueSet(MaterialTechniqueSet *techniqueSet)
+{
+    if (!techniqueSet)
+    {
+        MyAssertHandler(".\\database\\db_registry.cpp", __LINE__, 0, "%s", "techniqueSet");
+        return nullptr;
+    }
+
+    DB_InitializeRegistry();
+
+    XAssetHeader header;
+    header.techniqueSet = techniqueSet;
+    // Keep this adapter limited to registry ownership.  The original
+    // remap/upload calls belong to the renderer's later resource seam.
+    return DB_AddXAsset(ASSET_TYPE_TECHNIQUE_SET, header).techniqueSet;
+}
+
+Material *__cdecl DB_RegisterMaterial(Material *material)
+{
+    if (!material)
+    {
+        MyAssertHandler(".\\database\\db_registry.cpp", __LINE__, 0, "%s", "material");
+        return nullptr;
+    }
+
+    DB_InitializeRegistry();
+
+    XAssetHeader header;
+    header.material = material;
+    // Registry ownership only: dependency resolution (technique set, images)
+    // happened while widening, and D3D resources belong to the renderer seam.
+    return DB_AddXAsset(ASSET_TYPE_MATERIAL, header).material;
+}
+
+GfxImage *__cdecl DB_RegisterImage(GfxImage *image)
+{
+    if (!image)
+    {
+        MyAssertHandler(".\\database\\db_registry.cpp", __LINE__, 0, "%s", "image");
+        return nullptr;
+    }
+
+    DB_InitializeRegistry();
+
+    XAssetHeader header;
+    header.image = image;
+    // Registry ownership only: the texture itself was already created and
+    // uploaded through the engine image path (r_image*.cpp, dx.device).
+    return DB_AddXAsset(ASSET_TYPE_IMAGE, header).image;
+}
+
+XAssetHeader DB_FindXAssetHeaderNoDefault(XAssetType type, const char *name)
+{
+    if (!name || !*name)
+        return XAssetHeader{nullptr};
+    XAssetEntryPoolEntry *entry = DB_FindXAssetEntry(type, name);
+    if (!entry)
+        return XAssetHeader{nullptr};
+    return entry->entry.asset.header;
 }
 
 void __cdecl DB_InitPoolHeader(XAssetType type)
@@ -2339,14 +2774,6 @@ void __cdecl DB_LoadXZone(XZoneInfo *zoneInfo, uint32_t zoneCount)
             I_strncpyz(g_zoneInfo[zoneInfoCount].name, zoneName, 64);
             Com_Printf(CON_CHANNEL_SYSTEM, "Loading fastfile %s\n", g_zoneInfo[zoneInfoCount].name);
             g_zoneInfo[zoneInfoCount++].flags = zoneInfo[j].allocFlags;
-            if (zoneInfoCount)
-            {
-                //g_loadingAssets = zoneInfoCount;
-                Sys_WakeDatabase2();
-                Sys_WakeDatabase();
-                //g_zoneInfoCount = zoneInfoCount;
-                Sys_NotifyDatabase();
-            }
         }
     }
     if (zoneInfoCount)
@@ -2412,6 +2839,13 @@ void DB_TryLoadXFile()
             MyAssertHandler(".\\database\\db_registry.cpp", 3764, 0, "%s", "!g_loadingZone");
         for (j = 0; j < zoneInfoCount; ++j)
         {
+#if defined(__SWITCH__)
+            if (g_switchRetailLoadFailed.load(std::memory_order_acquire))
+            {
+                --g_loadingAssets;
+                continue;
+            }
+#endif
             if (!DB_TryLoadXFileInternal(g_zoneInfo[j].name, g_zoneInfo[j].flags))
                 --g_loadingAssets;
         }
@@ -2640,6 +3074,175 @@ char __cdecl DB_ShouldLoadFromModDir(const char *zoneName)
     return 1;
 }
 
+#if defined(__SWITCH__)
+// APM CPU boost owner (switch_thread.cpp). Declared here rather than via its
+// header because that header rejects non-Switch/SP builds and this file is
+// also compiled by the host proofs.
+void Switch_CpuBoostAcquire();
+void Switch_CpuBoostRelease();
+
+std::atomic<bool> g_switchRetailLoadFailed{false};
+static char g_switchRetailLoadFailure[256] = {};
+
+const char *DB_SwitchRetailLoadFailure()
+{
+    return g_switchRetailLoadFailure;
+}
+
+void DB_SwitchClearRetailLoadFailure()
+{
+    g_switchRetailLoadFailed.store(false, std::memory_order_release);
+    g_switchRetailLoadFailure[0] = '\0';
+}
+
+static void DB_SwitchRecordRetailLoadFailure(const char *message)
+{
+    I_strncpyz(g_switchRetailLoadFailure, message ? message : "retail zone load failed",
+               sizeof(g_switchRetailLoadFailure));
+    // This is failure evidence, not a PASS. Flush before notifying the main
+    // thread so an abort cannot turn a failed load into silence.
+    if (FILE *file = fopen("sdmc:/switch/kisakcod/FAIL_RETAIL_ZONE_LOAD.txt", "w"))
+    {
+        fprintf(file, "FAIL:RETAIL_ZONE_LOAD %s\n", g_switchRetailLoadFailure);
+        fflush(file);
+        fclose(file);
+    }
+    g_switchRetailLoadFailed.store(true, std::memory_order_release);
+}
+
+// The menu-reachable production link: redirect the normal zone-load
+// entry point to the real retail-zone walker instead of the Win32-only
+// CreateFileA/DB_LoadXFile/DB_LoadXFileInternal chain (trapped fatally in
+// db_file_load.cpp on this platform).  RetailWalkLoadZoneAssets performs the
+// zone's entire real lifecycle itself (DB_RetailZoneBegin through directory
+// dispatch), including the g_zones[]/g_zoneIndex/g_zoneHandles/g_zoneCount
+// bookkeeping DB_TryLoadXFileInternal otherwise does inline below, so this
+// branch only has to restore the two flags the original function itself
+// clears once a zone finishes loading (g_loadingZone/g_mayRecoverLostAssets)
+// -- everything else about the zone's real state came from the same
+// DB_RetailZoneBegin this function's normal body calls.
+int32_t __cdecl DB_TryLoadXFileInternal(char *zoneName, int32_t zoneFlags)
+{
+    // The whole zone load (retail walk decode, delayed-image sweep, image
+    // materialize) is CPU-bound; hold the APM fast-load clock for all of it.
+    // RAII so every failure return releases it.
+    struct CpuBoostScope
+    {
+        CpuBoostScope() { Switch_CpuBoostAcquire(); }
+        ~CpuBoostScope() { Switch_CpuBoostRelease(); }
+    } cpuBoostScope;
+    Com_Printf(0, "Trying to load file %s with flags %x\n", zoneName, zoneFlags);
+    char retailPath[256];
+    I_strncpyz(retailPath, "zone/english/", sizeof(retailPath));
+    I_strncat(retailPath, sizeof(retailPath), zoneName);
+    I_strncat(retailPath, sizeof(retailPath), ".ff");
+
+    RetailWalkLoadZoneResult result{};
+    // Load-phase profile (one unconditional line per zone, so a device
+    // log without com_diagMarkers still shows where the load screen goes):
+    // decode = the zone's walk/widen, delayed = R_DelayLoadImage sweep,
+    // images = the textureless-image materialization sweep.
+    const int loadPhaseStart = Sys_Milliseconds();
+    // Retail DB_TryLoadXFileInternal: every zone load re-arms the loadbar,
+    // tracked only for a game zone (the mission load the briefing shows).
+    DB_ResetZoneSize((zoneFlags & DB_ZONE_GAME) != 0);
+    const RetailWalkLoadZoneResultCode code = RetailWalkLoadZoneAssets(retailPath, &result);
+    const int loadPhaseDecoded = Sys_Milliseconds();
+    Com_Printf(0, "DB_TryLoadXFileInternal: '%s' code=%d, assets=%u, img=%u, mat=%u, ts=%u, font=%u, loc=%u, failOrd=%u, failType=%u\n",
+        retailPath, (int)code, result.assetCount, result.registeredImageCount, result.registeredMaterialCount,
+        result.registeredTechniqueSetCount, result.registeredFontCount, result.registeredLocalizeCount,
+        result.failedOrdinal, result.failedType);
+    if (code == RETAIL_WALK_LOAD_OK)
+    {
+        g_loadingZone = 0;
+        g_mayRecoverLostAssets = 1;
+        g_anyFastFileLoaded = true;
+        --g_loadingAssets;
+        // The original DB_LoadXFileInternal tail: right after the zone's
+        // assets are in, sweep images still flagged delayLoadPixels and load
+        // their pixels through R_DelayLoadImage -> Image_LoadFromFile
+        // (images/<name>.iwi via FS/IWD). Killhouse's sky cube
+        // sp_killhouse_ft (iw_03.iwd) is exactly this shape: the wire
+        // declares a zero-size loadDef and delays the pixels to here.
+        // No-op while no D3D device exists (R_DelayLoadImage's guard).
+        DB_LoadDelayedImages();
+        const int loadPhaseDelayed = Sys_Milliseconds();
+        // The original Load_Texture also loads, at zone-load time, every
+        // named image whose loadDef carries no inline pixels and is NOT
+        // flagged delayLoadPixels (r_image.cpp's third branch:
+        // Image_LoadFromFile from images/<name>.iwi).  The retail widen path
+        // never runs Load_Texture for those, and the delayed sweep above
+        // only takes flagged images, so a level zone's 2D disk images
+        // (killhouse: compass_map_killhouse, the hud_* weapon icons,
+        // m203_reticle...) stayed textureless until something sampled them
+        // -- the in-game pause menu's compass draw then died in
+        // R_SetSampler ("has no live D3D texture").  Materialize whatever
+        // is still textureless now; live images are skipped.
+        {
+            extern void R_MaterializeAllImages();
+            R_MaterializeAllImages();
+        }
+        const int loadPhaseImages = Sys_Milliseconds();
+        {
+            // Device shader creation inside decode_ms (r_material.cpp); the
+            // rest of decode_ms is the wire walk and widening.
+            extern void R_TakeShaderCreateStats(uint32_t *count, uint64_t *micros);
+            uint32_t shaderCount = 0;
+            uint64_t shaderUs = 0;
+            R_TakeShaderCreateStats(&shaderCount, &shaderUs);
+            Com_Printf(0, "KILLHOUSE_LOAD_SHADERS zone=%s created=%u create_ms=%llu\n", zoneName,
+                       shaderCount, static_cast<unsigned long long>(shaderUs / 1000u));
+            // Any shaders this zone missed the pack for were translated and
+            // appended to its in-memory delta (deko9_resources.cpp); write
+            // that back here -- once per zone load, never per shader, never
+            // under the device lock.
+            // A no-op when nothing new compiled.
+            extern void Deko9_FlushShaderPack();
+            Deko9_FlushShaderPack();
+        }
+        Com_Printf(0, "KILLHOUSE_LOAD_PHASE zone=%s assets=%u decode_ms=%d delayed_images_ms=%d materialize_ms=%d total_ms=%d\n",
+                   zoneName, result.assetCount, loadPhaseDecoded - loadPhaseStart,
+                   loadPhaseDelayed - loadPhaseDecoded, loadPhaseImages - loadPhaseDelayed,
+                   loadPhaseImages - loadPhaseStart);
+        Com_Printf(0, "DB_TryLoadXFileInternal: finished zone '%s', remaining loading assets=%u\n", zoneName, g_loadingAssets);
+        return 1;
+    }
+    // Abort already retired the transaction; release the enclosing queue's
+    // loading state too. DB_TryLoadXFile decrements the request count.
+    g_loadingZone = 0;
+    g_mayRecoverLostAssets = 1;
+    if (code == RETAIL_WALK_LOAD_OPEN_FAILED)
+    {
+        // Matches the original function's own "_load" zone convention: an
+        // optional secondary zone that may legitimately not exist is a
+        // warning, not a fatal error; every other missing zone is fatal.
+        if (strstr(zoneName, "_load"))
+        {
+            Com_PrintWarning(10, "WARNING: Could not find zone '%s'\n", retailPath);
+            return 0;
+        }
+        // DB_TryLoadXFile() owns the loading counter and completion signal.
+        // Calling Com_Error from DB_Thread enters its setjmp recovery path,
+        // which is a debugger break/abort on Switch and leaves the normal
+        // boot unable to observe the failed zone. Return failure so the
+        // caller performs the ordinary decrement and completion bookkeeping.
+        Com_PrintError(10, "ERROR: Could not find zone '%s'\n", retailPath);
+        DB_SwitchRecordRetailLoadFailure(retailPath);
+        return 0;
+    }
+    Com_PrintError(10,
+        "ERROR: Switch retail zone '%s' load stopped at directory ordinal %u (asset type %u): %s\n",
+        retailPath, result.failedOrdinal, result.failedType,
+        code == RETAIL_WALK_LOAD_UNSUPPORTED_ASSET ?
+            "no installed decoder for this asset type yet" :
+            "zone session/directory could not be established");
+    char failure[256];
+    snprintf(failure, sizeof(failure), "%s code=%d ordinal=%u type=%u", retailPath,
+             (int)code, result.failedOrdinal, result.failedType);
+    DB_SwitchRecordRetailLoadFailure(failure);
+    return 0;
+}
+#else
 int32_t __cdecl DB_TryLoadXFileInternal(char *zoneName, int32_t zoneFlags)
 {
     const char *v3; // eax
@@ -2658,7 +3261,7 @@ int32_t __cdecl DB_TryLoadXFileInternal(char *zoneName, int32_t zoneFlags)
     iassert(!g_zoneInfoCount);
     if (I_stricmp(zoneName, "mp_patch"))
     {
-        if (*(_BYTE *)fs_gameDirVar->current.integer && DB_ShouldLoadFromModDir(zoneName))
+        if (fs_gameDirVar->current.string[0] && DB_ShouldLoadFromModDir(zoneName))
         {
             DB_BuildOSPath_Mod(zoneName, 256, filename);
             zoneFile = CreateFileA(filename, 0x80000000, 1u, 0, 3u, 0x60000000u, 0);
@@ -2780,6 +3383,7 @@ int32_t __cdecl DB_TryLoadXFileInternal(char *zoneName, int32_t zoneFlags)
         return 1;
     }
 }
+#endif // defined(__SWITCH__)
 
 void __cdecl DB_BuildOSPath(const char *zoneName, uint32_t size, char *filename)
 {
@@ -2909,7 +3513,7 @@ LABEL_4:
                 DB_FreeXAssetEntry((XAssetEntryPoolEntry *)assetEntry);
                 if (*g_defaultAssetName[asset.type])
                 {
-                    Sys_UnlockWrite(&db_hashCritSect);
+                    DB_HashUnlockWrite();
                     asset.header = DB_FindXAssetDefaultHeaderInternal(asset.type);
                     Sys_Error("Could not load default asset for asset type '%s'", g_assetNames[asset.type]);
                 }
@@ -2924,11 +3528,15 @@ LABEL_4:
     }
 }
 
+// B7: releases interned weapon hideTags/notetrack SL refs
+// (db_retail_decode_weapon.cpp; declared in db_retail_decode_weapon.h).
+void RetailWeaponFree(WeaponDef *weapon);
+
 void(__cdecl *DB_RemoveXAssetHandler[ASSET_TYPE_COUNT])(XAssetHeader) =
 {
   NULL,
   NULL,
-  NULL,
+  (void(*)(XAssetHeader)) & XAnimFree,
   NULL,
   NULL,
   (void(*)(XAssetHeader)) & Material_ReleaseTechniqueSet,
@@ -2943,22 +3551,22 @@ void(__cdecl *DB_RemoveXAssetHandler[ASSET_TYPE_COUNT])(XAssetHeader) =
   NULL,
   NULL,
   &DB_RemoveGfxWorld,
-  NULL,
-  NULL,
-  NULL,
-  NULL,
-  NULL,
-  NULL,
-  NULL,
-  NULL,
-  NULL,
-  NULL,
-  NULL,
-  NULL,
-  NULL,
-  NULL,
-  NULL,
-  NULL
+  NULL, // 0x11 LIGHT_DEF
+  NULL, // 0x12 UI_MAP
+  NULL, // 0x13 FONT
+  NULL, // 0x14 MENULIST
+  NULL, // 0x15 MENU
+  NULL, // 0x16 LOCALIZE_ENTRY
+  (void(*)(XAssetHeader)) &RetailWeaponFree, // 0x17 WEAPON: releases interned hideTags/notetrack SL refs (B7)
+  NULL, // 0x18 SNDDRIVER_GLOBALS
+  NULL, // 0x19 FX
+  NULL, // 0x1A IMPACT_FX
+  NULL, // 0x1B AITYPE
+  NULL, // 0x1C MPTYPE
+  NULL, // 0x1D CHARACTER
+  NULL, // 0x1E XMODELALIAS
+  NULL, // 0x1F RAWFILE
+  NULL // 0x20 STRINGTABLE
 }; // idb
 
 void __cdecl DB_RemoveXAsset(XAsset *asset)
@@ -2984,6 +3592,16 @@ void __cdecl DB_ReleaseXAssets()
             g_assetEntryPool[assetEntryIndex].entry.inuse = 0;
         }
     }
+    // A memoized lookup skips DB_FindXAssetHeader's `inuse = 1`.
+    DB_BumpLookupGeneration();
+}
+
+uint32_t DB_AssetLookupGeneration()
+{
+    // Reorder logging (DB_RegisteredReorderAsset) must see every lookup.
+    if (s_dbReorder.entryCount)
+        return 0;
+    return s_dbLookupGeneration.load(std::memory_order_acquire);
 }
 
 void __cdecl DB_ShutdownXAssets()
@@ -2994,7 +3612,7 @@ void __cdecl DB_ShutdownXAssets()
     DB_SyncXAssets();
     DB_SyncExternalAssets();
     iassert(!db_hashCritSect.writeCount);
-    Sys_LockWrite(&db_hashCritSect);
+    DB_HashLockWrite();
     for (i = g_zoneCount - 1; i >= 0; --i)
         DB_UnloadXZone(g_zoneHandles[i], 0);
     DB_FreeDefaultEntries();
@@ -3002,7 +3620,52 @@ void __cdecl DB_ShutdownXAssets()
     for (ia = g_zoneCount - 1; ia >= 0; --ia)
         DB_UnloadXZoneMemory(&g_zones[g_zoneHandles[ia]]);
     g_zoneCount = 0;
-    Sys_UnlockWrite(&db_hashCritSect);
+    DB_HashUnlockWrite();
+}
+
+// Retire the retail zone that registered the resident CLIPMAP asset (if any),
+// so the next CM_LoadMap re-decodes it.  CM_Shutdown zeroes the global `cm`,
+// but Com_Restart keeps retail zone memory resident; without this a same-map
+// re-spawn takes the reload-idempotency skip (DB_RetailZoneFindLive) and
+// CM_InitThreadData memcpys cm.box_brush (null) -> Data Abort.  Scoped to the
+// clipmap's own zone so the shared/common zones stay resident.
+void __cdecl DB_RetailZoneRetireClipMapZone()
+{
+    const uint32_t zoneIndex = g_retailClipMapZone;
+    if (!zoneIndex)
+        return;
+    g_retailClipMapZone = 0;
+    if (zoneIndex >= 32 || !g_zones[zoneIndex].name[0])
+        return;
+
+    if (!Sys_IsMainThread())
+        MyAssertHandler(".\\database\\db_registry.cpp", __LINE__, 0, "%s", "Sys_IsMainThread()");
+
+    DB_SyncXAssets();
+    DB_SyncExternalAssets();
+    DB_HashLockWrite();
+    int32_t sorted = -1;
+    for (int32_t i = 0; i < g_zoneCount; ++i)
+    {
+        if (g_zoneHandles[i] == zoneIndex)
+        {
+            sorted = i;
+            break;
+        }
+    }
+    if (sorted >= 0)
+    {
+        // Same order as DB_RetailZoneEnd: remove assets before releasing PMem.
+        DB_UnloadXZone(zoneIndex, false);
+        DB_UnloadXZoneMemory(&g_zones[zoneIndex]);
+        for (int32_t i = sorted; i + 1 < g_zoneCount; ++i)
+            g_zoneHandles[i] = g_zoneHandles[i + 1];
+        --g_zoneCount;
+        g_retailZoneParent[zoneIndex] = 0;
+        g_retailZoneBounded[zoneIndex] = false;
+        std::memset(&g_zones[zoneIndex], 0, sizeof(g_zones[zoneIndex]));
+    }
+    DB_HashUnlockWrite();
 }
 
 void __cdecl DB_FreeXZoneMemory(XZoneMemory *zoneMem)
@@ -3022,6 +3685,15 @@ void __cdecl DB_UnloadXZoneMemory(XZone *zone)
     DB_FreeXZoneMemory(&zone->mem);
     Com_Printf(CON_CHANNEL_SYSTEM, "Unloaded fastfile %s\n", zone->name);
     PMem_Free(zone->name, zone->allocType);
+    // Any load policy recorded for this retail slot dies with the zone, so
+    // a later occupant never inherits it (see DB_RetailZoneFindLive).
+    const uint32_t slot = static_cast<uint32_t>(zone - g_zones);
+    if (slot < 32)
+    {
+        g_retailZoneBounded[slot] = false;
+        if (g_retailClipMapZone == slot)
+            g_retailClipMapZone = 0;
+    }
     zone->name[0] = 0;
 }
 

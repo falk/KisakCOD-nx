@@ -3,6 +3,18 @@
 // q_shared.h -- included first by ALL program modules.
 // A user mod should never modify this file
 
+// Plain `char` is signed on the retail Windows/x86 baseline and on every host
+// test, and the decompiled engine relies on that: usercmd_s.forwardmove /
+// rightmove / upmove, playerState movementDir, and the msg delta readers are
+// plain `char`.  AArch64 GCC defaults to unsigned char, which turns a negative
+// movement byte (left stick pulled back or strafed left) into 128..255, so the
+// player moves forward/right instead and negative-value branches compile away.
+// The Switch targets compile with -fsigned-char (cmake/switch.cmake); fail loudly
+// if a target ever loses that flag instead of silently inverting gameplay.
+#if defined(__SWITCH__) && defined(__CHAR_UNSIGNED__)
+#error "Switch engine code requires -fsigned-char: plain char must be signed to match the retail/x86 baseline (see cmake/switch.cmake)"
+#endif
+
 #ifdef _WIN32
 #pragma warning(disable : 4018)     // signed/unsigned mismatch
 //#pragma warning(disable : 4032)		//formal parameter 'number' has different type when promoted
@@ -39,6 +51,7 @@
 #include <ctype.h>
 #include <cfloat> // FLT_MAX
 #include <cstdint>
+#include <climits>
 
 // this is the define for determining if we have an asm version of a C function
 #if (defined _M_IX86 || defined __i386__) && !defined __sun__  && !defined __LCC__
@@ -93,6 +106,12 @@ static ID_INLINE int BigLong(int l) { return LongSwap(l); }
 #define	PATH_SEP '\\'
 
 #endif // WIN32
+
+#ifndef LittleShort
+#define LittleShort(x) (x)
+#define LittleLong(x) (x)
+#define LittleFloat(x) (x)
+#endif
 
 #define PI_DIV_180		0.017453292519943295769236907684886
 #define INV_PI_DIV_180	57.295779513082320876798154814105
@@ -481,7 +500,7 @@ typedef   signed short  sint16;
 typedef unsigned short  uint16;
 typedef __int32				int32;
 typedef unsigned __int32 uint32;
-typedef signed long			sint32;
+typedef int                 sint32; // was `signed long`: 8 bytes under LP64, and the name promises 32
 typedef ll              int64;
 typedef ll              sint64;
 typedef ull             uint64;
@@ -586,7 +605,7 @@ typedef ull             uint64;
 #define __SPAIR128__(high, low) (((int128) (high) << 64) | (uint64)(low))
 #define __PAIR16__(high, low)   (((uint16) (high) <<  8) | (uint8) (low))
 #define __PAIR32__(high, low)   (((uint32) (high) << 16) | (uint16)(low))
-#define __PAIR64__(high, low)   (((uint64) (high) << 32) | (uint32)(low))
+#define __PAIR64__(high, low)   (((uint64) (high) << 32) | (uint32)(intptr_t)(low))
 #define __PAIR128__(high, low)  (((uint128)(high) << 64) | (uint64)(low))
 
 // rotate left
@@ -672,27 +691,27 @@ enum DvarFlags : uint16
 
 union DvarValue 
 {                
-	DvarValue()
+	DvarValue() : vector{} // all 16 bytes defined, not just the member written
 	{
 		integer = 0;
 	}
-	DvarValue(int i)
+	DvarValue(int i) : vector{} // all 16 bytes defined, not just the member written
 	{
 		integer = i;
 	}
-	DvarValue(bool b)
+	DvarValue(bool b) : vector{} // all 16 bytes defined, not just the member written
 	{
 		enabled = b;
 	}
-	DvarValue(float f)
+	DvarValue(float f) : vector{} // all 16 bytes defined, not just the member written
 	{
 		value = f;
 	}
-	DvarValue(const char *str)
+	DvarValue(const char *str) : vector{} // all 16 bytes defined, not just the member written
 	{
 		string = str;
 	}
-	DvarValue(char *str)
+	DvarValue(char *str) : vector{} // all 16 bytes defined, not just the member written
 	{
 		string = str;
 	}
@@ -727,17 +746,17 @@ struct DvarLimits_Vector
 union DvarLimits
 {
 	// LWSS: KISAKTODO double check this...
-	DvarLimits()
+	DvarLimits() : enumeration{} // LP64: enumeration is the 16-byte member
 	{
 		integer.min = INT_MIN;
 		integer.max = INT_MAX;
 	}
-	DvarLimits(uint64 val)
+	DvarLimits(uint64 val) : enumeration{} // LP64: enumeration is the 16-byte member
 	{
 		integer.max = HIDWORD(val);
 		integer.min = LODWORD(val);
 	}
-	DvarLimits(int min, int max)
+	DvarLimits(int min, int max) : enumeration{} // LP64: enumeration is the 16-byte member
 	{
 		integer.min = min; 
 		integer.max = max;
@@ -967,9 +986,20 @@ struct trace_t // sizeof=0x2C
 };
 
 // win_shared
-uint32_t __cdecl Sys_Milliseconds();
-uint32_t __cdecl Sys_MillisecondsRaw();
+// Real implementations live in switch_platform.c (a C translation unit) on
+// Switch, so this declaration needs C linkage there too, or the C++ callers
+// throughout this codebase (which see this header, not switch_platform.h's
+// own #ifndef __cplusplus-guarded copy) look for a mangled C++ symbol that
+// never exists.
+#if defined(__SWITCH__) && defined(__cplusplus)
+extern "C" {
+#endif
+uint32_t __cdecl Sys_Milliseconds(void);
+uint32_t __cdecl Sys_MillisecondsRaw(void);
 void __cdecl Sys_SnapVector(float *v);
+#if defined(__SWITCH__) && defined(__cplusplus)
+}
+#endif
 
 // com_shared
 struct qtime_s // sizeof=0x24
@@ -1058,7 +1088,9 @@ struct StringTable // sizeof=0x10
 	int rowCount;
 	const char **values;
 };
+#if UINTPTR_MAX == UINT32_MAX
 static_assert(sizeof(StringTable) == 16);
+#endif
 
 const char *__cdecl StringTable_GetColumnValueForRow(const StringTable *table, int row, int column);
 const char *__cdecl StringTable_Lookup(

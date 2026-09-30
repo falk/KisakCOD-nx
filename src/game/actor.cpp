@@ -135,14 +135,9 @@ void __cdecl SentientInfo_Clear(sentient_info_t *pInfo)
 
     iassert(pInfo);
 
-    v2 = pInfo;
-    v3 = 10;
-    do
-    {
-        *(unsigned int *)&v2->VisCache.bVisible = 0;
-        v2 = (sentient_info_t *)((char *)v2 + 4);
-        --v3;
-    } while (v3);
+    // LP64: zero the whole struct; the 10-word loop was the ILP32 size and
+    // stopped before pLastKnownNode here.
+    memset(pInfo, 0, sizeof(*pInfo));
 }
 
 void __cdecl SentientInfo_ForceCopy(sentient_info_t *pTo, const sentient_info_t *pFrom)
@@ -601,8 +596,8 @@ void __cdecl Actor_Pain(
     int v18; // r8
     double v19; // fp1
     double v20; // fp31
-    long double v21; // fp2
-    long double v22; // fp2
+    double v21; // fp2
+    double v22; // fp2
     unsigned __int16 HitLocationString; // r3
     WeaponDef *WeaponDef; // r30
     sentient_s *sentient; // r4
@@ -705,8 +700,8 @@ void __cdecl Actor_Die(
     int v17; // r8
     double v18; // fp1
     double v19; // fp31
-    long double v20; // fp2
-    long double v21; // fp2
+    double v20; // fp2
+    double v21; // fp2
     unsigned __int16 HitLocationString; // r3
     WeaponDef *WeaponDef; // r29
 
@@ -1030,7 +1025,7 @@ bool __cdecl Actor_ShouldMoveAwayFromCloseEnt(actor_s *self)
 void __cdecl Actor_UpdateProneInformation(actor_s *self, int bDoProneCheck)
 {
     double v7; // fp31
-    long double v8; // fp2
+    double v8; // fp2
     double v9; // fp28
     double v10; // fp29
     double v11; // fp26
@@ -1402,12 +1397,16 @@ gentity_s *__cdecl Actor_IsKnownEnemyInRegion(
         return 0;
     v8 = 0;
     v9 = 0;
-    for (i = self->sentientInfo[0].vLastKnownPos; ; i += 10)
+    // LP64: index sentientInfo by struct; the decompiled loop stepped a
+    // float pointer by 10 (the ILP32 sizeof(sentient_info_t)) and read
+    // lastKnownPosTime two words below it.
+    for (;; )
     {
+        i = self->sentientInfo[v9].vLastKnownPos;
         v11 = &level.sentients[v9];
         if (!level.sentients[v9].inuse)
             goto LABEL_21;
-        v12 = *((unsigned int *)i - 2);
+        v12 = self->sentientInfo[v9].lastKnownPosTime;
         if (!v12)
             goto LABEL_21;
         if (level.time - v12 > 10000)
@@ -2097,7 +2096,7 @@ void __cdecl Path_UpdateMovementDelta(actor_s *self, double fMoveDist)
 {
     path_t *pPath; // r30
     int iHitEntnum; // r4
-    long double lookAheadLen; // fp2
+    double lookAheadLen; // fp2
     double calculatedLen; // fp12
     int moveHistoryIndex; // r29
     float vWishDir[3];
@@ -3308,11 +3307,11 @@ void __cdecl Actor_EntInfo(gentity_s *self, float *source)
     {
         if (enemy)
         {
-            const sentient_info_t *info = &actor->sentientInfo[enemy - level.sentients];
-            if (info->VisCache.bVisible)
+            const sentient_info_t *sentientInfo = &actor->sentientInfo[enemy - level.sentients];
+            if (sentientInfo->VisCache.bVisible)
             {
                 v12 = colorGreen;
-                if (level.time - info->VisCache.iLastUpdateTime > 250)
+                if (level.time - sentientInfo->VisCache.iLastUpdateTime > 250)
                     v12 = colorYellow;
             }
             else
@@ -4798,15 +4797,9 @@ int __cdecl SP_actor(gentity_s *ent)
             MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\game\\actor.cpp", 307, 0, "%s", "!actor->scriptGoal.volume");
         Actor_SetGoalRadius(&v3->scriptGoal, 0.0);
         Actor_SetGoalHeight(&v3->scriptGoal, 0.0);
-        p_codeGoal = &v3->codeGoal;
-        v14 = 7;
-        do
-        {
-            p_codeGoal->pos[0] = p_scriptGoal->pos[0];
-            p_scriptGoal = (actor_goal_s *)((char *)p_scriptGoal + 4);
-            p_codeGoal = (actor_goal_s *)((char *)p_codeGoal + 4);
-            --v14;
-        } while (v14);
+        // LP64: struct copy; the 7-word loop was the ILP32 sizeof(actor_goal_s)
+        // and dropped the volume pointer here.
+        v3->codeGoal = v3->scriptGoal;
         v3->keepClaimedNode = 0;
         v3->keepClaimedNodeInGoal = 0;
         v3->noDodgeMove = 0;
@@ -6010,4 +6003,3 @@ void __cdecl Actor_PostThink(actor_s *self)
             Actor_NodeClaimRevoked(self, 1000);
     }
 }
-

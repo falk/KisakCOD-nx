@@ -14,8 +14,24 @@ int isHandlingAssert;
 char assertMessage[4096];
 int lastAssertType;
 
+// Monotonic count of every reported assertion.  A checkpoint that must not
+// proceed through a failed assertion samples this.
+static int s_assertCount;
+int Assert_GetCount(void)
+{
+    return s_assertCount;
+}
+
 void(__cdecl* AssertCallback)(const char*);
 
+// Every function in this block exists only to serve MyAssertHandler's
+// KISAK_PURE (interactive assert dialog/clipboard/stack-trace) and
+// KISAK_RADIANT branches below.  Neither is defined by this build
+// (KISAK_SP only), so these are genuinely unreachable dead code here, not a
+// Switch-specific exclusion: DoStackTrace's only caller is already
+// commented out in common.cpp, confirming the whole chain is dead already
+// on every platform this build targets.
+#if defined(KISAK_PURE) || defined(KISAK_RADIANT)
 BOOL CopyMessageToClipboard()
 {
     HWND DesktopWindow; // eax
@@ -532,6 +548,18 @@ int __cdecl LoadMapFiles(char* msg)
 
 char g_module[MAX_PATH];
 
+#if defined(__SWITCH__)
+// This raw x86 EBP-chain walk (already marked "broken right now" upstream)
+// cannot exist on AArch64: no MSVC __asm, no EBP frame-pointer chain
+// convention.  A real Switch stack trace needs AArch64 unwind-table walking,
+// which is separate work; this stays a truthful empty trace until then.
+int __cdecl DoStackTrace(char* msg, int nIgnore)
+{
+    (void)nIgnore;
+    g_assertAddressCount = 0;
+    return LoadMapFiles(msg);
+}
+#else
 #include <intrin.h>
 
 // KISAKX64
@@ -563,6 +591,7 @@ int __cdecl DoStackTrace(char* msg, int nIgnore)
     }
     return LoadMapFiles(msg);
 }
+#endif
 
 void __cdecl BuildAssertMessage(const char* expr, const char* filename, int line, int type, int skipLevels, char* message)
 {
@@ -641,10 +670,12 @@ void __cdecl FixWindowsDesktop()
     SetDeviceGammaRamp(hdc, ramp);
     ReleaseDC(hwndDesktop, hdc);
 }
+#endif
 
 bool __cdecl QuitOnError();
 void MyAssertHandler(const char *filename, int line, int type, const char *fmt, ...)
 {
+    ++s_assertCount;
 #ifdef KISAK_PURE
     char shouldBreak; // [esp+3h] [ebp-5h]
     va_list va; // [esp+20h] [ebp+18h] BYREF
@@ -686,32 +717,35 @@ void MyAssertHandler(const char *filename, int line, int type, const char *fmt, 
     if (shouldBreak)
         DebugBreak();
 #else
-
-#ifdef KISAK_RADIANT
-    // Editor builds keep asserts NON-FATAL, matching the shipped CoD4Radiant. Its Assert
-    // (0x49cea0 -> sub_49CD50) pops an Abort/Retry/Ignore box and CONTINUES on Ignore, which is
-    // exactly what let the original survive the water-material / texture-browser asserts. We
-    // record every failing assert (file:line + text) to %TEMP%\radiant_firstlight.log, then fall
-    // through and continue. The previous port did an unconditional __debugbreak() below, which
-    // silently terminates the editor when no debugger is attached ("the editor just closes").
+    char m[1024];
+    va_list va;
+    va_start(va, fmt);
+    _vsnprintf(m, sizeof(m), fmt ? fmt : "", va);
+    va_end(va);
+    m[1023] = 0;
+    char assertBuf[1280];
+    snprintf(assertBuf, sizeof(assertBuf), "ASSERT FAIL %s:%d (type %d): %s\n",
+             filename ? filename : "?", line, type, m);
+    // Switch_BootLog is a filtered bring-up narration sink (default off); an
+    // assertion is not narration, so it must never be dropped by that filter.
+    // Sys_Print is the same visible path PASS:/FAIL:/KILLHOUSE_* use.
+    Sys_Print(assertBuf);
+#ifdef __SWITCH__
+    // The file:line above is the *retail* source position the decompiled call
+    // site carries, so it does not name a site in this tree.  The return address
+    // does: symbolize it against the matching build's KisakCOD-sp ELF with
+    //   aarch64-none-elf-addr2line -f -C -e bin/KisakCOD-sp <addr>
     {
-        char m[1024];
-        va_list va;
-        va_start( va, fmt );
-        _vsnprintf( m, sizeof( m ), fmt ? fmt : "", va );
-        va_end( va );
-        m[1023] = 0;
-        char tmp[MAX_PATH], p2[MAX_PATH];
-        GetTempPathA( sizeof( tmp ), tmp );
-        _snprintf( p2, sizeof( p2 ), "%sradiant_firstlight.log", tmp );
-        FILE *f = fopen( p2, "a" );
-        if ( f )
-        {
-            fprintf( f, "ASSERT FAIL %s:%d (type %d): %s\n", filename ? filename : "?", line, type, m );
-            fclose( f );
-        }
+        char raBuf[96];
+        snprintf(raBuf, sizeof(raBuf), "ASSERT RA0=%p\n", __builtin_return_address(0));
+        Sys_Print(raBuf);
     }
+    // on Switch the handler used to return, so the caller kept
+    // running with the failed invariant. A debug assertion's contract is to
+    // stop; the movement checkpoint's Assert_GetCount() sample stays as the
+    // secondary gate, but no code after an assertion may execute. abort()
+    // ends the guest loudly instead of continuing into undefined state.
+    abort();
 #endif
-
 #endif
 }

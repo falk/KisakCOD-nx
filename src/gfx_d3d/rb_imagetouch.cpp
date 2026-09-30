@@ -6,22 +6,25 @@
 #include "rb_state.h"
 #include "r_utils.h"
 
-int __cdecl RB_CompareTouchImages(int *e0, int *e1)
+// LP64: the elements are GfxImage pointers; the decompiled form read them
+// through int* (truncating to 32 bits) and used the ILP32 field offsets
+// (+11 semantic, +16 cardMemory.platform[0]).
+int __cdecl RB_CompareTouchImages(GfxImage *const *e0, GfxImage *const *e1)
 {
-    int image; // [esp+0h] [ebp-Ch]
-    int image_4; // [esp+4h] [ebp-8h]
+    const GfxImage *image; // [esp+0h] [ebp-Ch]
+    const GfxImage *image_4; // [esp+4h] [ebp-8h]
 
     image = *e0;
     image_4 = *e1;
-    if (!*(_BYTE *)(*e1 + 11))
+    if (!image_4->semantic)
         return -1;
-    if (!*(_BYTE *)(image + 11))
+    if (!image->semantic)
         return 1;
-    if (*(_DWORD *)(image_4 + 16) != *(_DWORD *)(image + 16))
-        return *(_DWORD *)(image_4 + 16) - *(_DWORD *)(image + 16);
-    if (*(uint8_t *)(image + 11) == *(uint8_t *)(image_4 + 11))
+    if (image_4->cardMemory.platform[0] != image->cardMemory.platform[0])
+        return image_4->cardMemory.platform[0] - image->cardMemory.platform[0];
+    if (image->semantic == image_4->semantic)
         return 0;
-    return *(uint8_t *)(image + 11) - *(uint8_t *)(image_4 + 11);
+    return image->semantic - image_4->semantic;
 }
 
 void __cdecl RB_TouchImage(GfxImage *image)
@@ -79,7 +82,7 @@ void __cdecl RB_TouchAllImages()
     if (tess.indexCount)
         RB_EndTessSurface();
     R_GetImageList(&imageList);
-    qsort(imageList.image, imageList.count, 4u, (int(__cdecl *)(const void *, const void *))RB_CompareTouchImages);
+    qsort(imageList.image, imageList.count, sizeof(imageList.image[0]), (int(__cdecl *)(const void *, const void *))RB_CompareTouchImages);
     v6 = 0;
     for (i = 0; i < imageList.count && imageList.image[i]->semantic; ++i)
     {

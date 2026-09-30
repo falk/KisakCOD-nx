@@ -36,7 +36,7 @@ LoadedSound *__cdecl SND_LoadFromBuffer(void *buffer, const char *soundName)
     {
         if (info.data_len)
         {
-            loadSnd = (LoadedSound*)Hunk_Alloc(0x2Cu, "SND_LoadFromBuffer", 15);
+            loadSnd = (LoadedSound*)Hunk_Alloc(sizeof(LoadedSound), "SND_LoadFromBuffer", 15); // LP64: was ILP32 0x2C
             loadSnd->name = soundName;
             qmemcpy(&loadSnd->sound, &info, 0x24u);
             SND_SetData(&loadSnd->sound, (void*)info.data_ptr);
@@ -90,7 +90,7 @@ LoadedSound *__cdecl SND_LoadFromBuffer(void *buffer, uint32_t bufferSize, const
     drwav_uint64 framesRead = drwav_read_pcm_frames_s16(&wav, frameCount, pcm);
     drwav_uninit(&wav);
 
-    LoadedSound *loadSnd = (LoadedSound *)Hunk_Alloc(0x2Cu, "SND_LoadFromBuffer", 15);
+    LoadedSound *loadSnd = (LoadedSound *)Hunk_Alloc(sizeof(LoadedSound), "SND_LoadFromBuffer", 15); // LP64: was ILP32 0x2C
     loadSnd->name = soundName;
     loadSnd->sound.info.format = 1; // PCM
     loadSnd->sound.info.data_ptr = NULL; // filled in by SND_SetData below

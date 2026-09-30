@@ -39,6 +39,8 @@ int __cdecl Scr_CompareCanonicalStrings(uint32_t *arg1, uint32_t *arg2)
 
 void __cdecl Scr_ArchiveCanonicalStrings()
 {
+    // Diagnostic entry/exit markers scoping which script phase runs.
+    Com_Printf(0, "SCRIPT_PROBE archive begin count=%u\n", scrVarPub.canonicalStrCount);
     char v0; // [esp+13h] [ebp-35h]
     char *v1; // [esp+18h] [ebp-30h]
     const char *v2; // [esp+1Ch] [ebp-2Ch]
@@ -59,7 +61,12 @@ void __cdecl Scr_ArchiveCanonicalStrings()
             len += strlen(SL_ConvertToString(stringValue)) + 1;
     }
     scrEvaluateGlob.archivedCanonicalStringsBuf = (char *)Hunk_AllocDebugMem(len);
-    scrEvaluateGlob.archivedCanonicalStrings = (ArchivedCanonicalStringInfo *)Hunk_AllocDebugMem(8 * scrVarPub.canonicalStrCount);
+    // LP64: ArchivedCanonicalStringInfo holds a real pointer (8 bytes), so
+    // it is 16 bytes under LP64, not the ILP32 8 this size/width assumed --
+    // the array was allocated at half size and qsort scrambled it (same
+    // class as the CaseStatementInfo fix in this slice).
+    scrEvaluateGlob.archivedCanonicalStrings = (ArchivedCanonicalStringInfo *)Hunk_AllocDebugMem(
+        sizeof(ArchivedCanonicalStringInfo) * scrVarPub.canonicalStrCount);
     scrEvaluateGlob.canonicalStringLookup = (int *)Hunk_AllocDebugMem(4 * scrVarPub.canonicalStrCount + 4);
     i = 0;
     lena = 0;
@@ -90,7 +97,7 @@ void __cdecl Scr_ArchiveCanonicalStrings()
     qsort(
         scrEvaluateGlob.archivedCanonicalStrings,
         scrVarPub.canonicalStrCount,
-        8u,
+        sizeof(ArchivedCanonicalStringInfo),
         (int(__cdecl *)(const void *, const void *))CompareCanonicalStrings);
     for (ia = 0; ia < (int)scrVarPub.canonicalStrCount; ++ia)
     {
@@ -111,6 +118,7 @@ void __cdecl Scr_ArchiveCanonicalStrings()
         scrEvaluateGlob.canonicalStringLookup[scrEvaluateGlob.archivedCanonicalStrings[ia].canonicalStr] = ia;
     }
     *scrEvaluateGlob.canonicalStringLookup = 0;
+    Com_Printf(0, "SCRIPT_PROBE archive end\n");
 }
 
 int __cdecl CompareCanonicalStrings(const char **arg1, const char **arg2)
@@ -440,7 +448,11 @@ void __cdecl Scr_CompilePrimitiveExpression(sval_u *expr)
         break;
     case ENUM_string:
     case ENUM_istring:
-        *expr = debugger_string(expr->node[0].type, (char *)SL_ConvertToString(*(uint32_t *)(expr->type + 4)));
+        // LP64: `expr` points at a value holding the literal-node pointer;
+        // the string ID lives in that node's slot 1.  The old
+        // `*(uint32_t *)(expr->type + 4)` spelling hid a truncated base
+        // pointer plus an ILP32 4-byte slot stride.  ILP32-identical.
+        *expr = debugger_string(expr->node[0].type, (char *)SL_ConvertToString(expr->node[1].stringValue));
         break;
     case ENUM_variable:
         Scr_CompileVariableExpression(&expr->node[1]);
@@ -504,8 +516,9 @@ void __cdecl Scr_CompileVariableExpression(sval_u *expr)
     switch (expr->node[0].type)
     {
     case ENUM_local_variable:
-        *(uint32_t *)(expr->type + 4) = Scr_CompileCanonicalString(*(uint32_t *)(expr->type + 4));
-        if (*(uint32_t *)(expr->type + 4))
+        // LP64: name ID is slot 1 of the pointed-to node (see above).
+        expr->node[1].stringValue = Scr_CompileCanonicalString(expr->node[1].stringValue);
+        if (expr->node[1].stringValue)
         {
             tempVariableId.block = (scr_block_s*)AllocValue();
             *expr = debugger_node4(ENUM_local_variable, expr->node[1], 0, 0, tempVariableId);
@@ -522,8 +535,9 @@ void __cdecl Scr_CompileVariableExpression(sval_u *expr)
         break;
     case ENUM_field_variable:
         Scr_CompilePrimitiveExpressionFieldObject(&expr->node[1]);
-        *(uint32_t *)(expr->type + 8) = Scr_CompileCanonicalString(*(uint32_t *)(expr->type + 8));
-        if (*(uint32_t *)(expr->type + 8))
+        // LP64: field-name ID is slot 2 (see above).
+        expr->node[2].stringValue = Scr_CompileCanonicalString(expr->node[2].stringValue);
+        if (expr->node[2].stringValue)
             *expr = debugger_node3(ENUM_field_variable, expr->node[1], expr->node[2], 0);
         else
             *expr = debugger_node0(ENUM_unknown_field);
@@ -533,7 +547,7 @@ void __cdecl Scr_CompileVariableExpression(sval_u *expr)
         *expr = debugger_node1(ENUM_self_field, expr->node[1]);
         break;
     case ENUM_object:
-        s = SL_ConvertToString(*(uint32_t *)(expr->type + 4));
+        s = SL_ConvertToString(expr->node[1].stringValue);
         if (*s == 116)
         {
             idValue.intValue = atoi(s + 1);
@@ -623,26 +637,31 @@ void __cdecl Scr_CompilePrimitiveExpressionList(sval_u *exprlist)
     int i; // [esp+10h] [ebp-10h]
     sval_u expr[3]; // [esp+14h] [ebp-Ch]
 
-    expr_count = GetExpressionCount((sval_u)exprlist->type);
+    // LP64: debugger expression lists are pointer-bearing header values like
+    // their normal-compiler counterparts ( walked as exprlist.node[0].node
+    // there).  Reading the header through narrow `.type` keeps only the low
+    // 4 of 8 pointer bytes; copy the full value instead.  ILP32-identical:
+    // the union is 4 bytes there.
+    expr_count = GetExpressionCount(*exprlist);
     if (expr_count == 1)
     {
-        nodea = *(sval_u **)exprlist->type;
+        nodea = exprlist->node;
         Scr_CompileExpression(nodea->node);
-        exprlist->type = nodea->node->type;
+        *exprlist = *nodea->node;
     }
     else if (expr_count == 3)
     {
         i = 0;
-        for (node = *(sval_u **)exprlist->type; node; node = node[1].node)
+        for (node = exprlist->node; node; node = node[1].node)
         {
             Scr_CompileExpression(node->node);
-            expr[i++] = (sval_u)node->node->type;
+            expr[i++] = *node->node;
         }
-        exprlist->type = debugger_node3(ENUM_vector, expr[0], expr[1], expr[2]).type;
+        *exprlist = debugger_node3(ENUM_vector, expr[0], expr[1], expr[2]);
     }
     else
     {
-        exprlist->type = debugger_node0(ENUM_bad_expression).type;
+        *exprlist = debugger_node0(ENUM_bad_expression);
     }
 }
 
@@ -658,7 +677,7 @@ char __cdecl Scr_CompileCallExpression(sval_u *expr)
             return 1;
         }
     }
-    else if (type == ENUM_method && Scr_CompileMethod(&expr->node[1], &expr->node[2], (sval_u *)(expr->type + 12)))
+    else if (type == ENUM_method && Scr_CompileMethod(&expr->node[1], &expr->node[2], &expr->node[3]))
     {
         *expr = debugger_node3(
             ENUM_method,
@@ -700,7 +719,10 @@ char __cdecl Scr_CompileFunction(sval_u *func_name, sval_u *params)
     const char *pName; // [esp+8h] [ebp-8h] BYREF
     int type; // [esp+Ch] [ebp-4h] BYREF
 
-    name = Scr_GetBuiltin((sval_u)func_name->type);
+    // LP64: func_name points at the debugger function-name subtree whose full
+    // value is pointer-bearing; `(sval_u)...->type` keeps only its low half.
+    // Full copy is ILP32-identical (4-byte union there).
+    name = Scr_GetBuiltin(*func_name);
     if (!name)
         return 0;
     pName = SL_ConvertToString(name);
@@ -718,13 +740,16 @@ void __cdecl Scr_CompileCallExpressionList(sval_u *exprlist)
     sval_u *node; // [esp+8h] [ebp-8h]
     sval_u expr; // [esp+Ch] [ebp-4h]
 
-    expr.type = debugger_node0(ENUM_NOP).type;
-    for (node = *(sval_u **)exprlist->type; node; node = node[1].node)
+    // LP64: same full-value rule as Scr_CompilePrimitiveExpressionList above:
+    // the list header, the prepended arg values, and the prepend result are
+    // all pointer-bearing; narrow `.type` round-trips drop their high halves.
+    expr = debugger_node0(ENUM_NOP);
+    for (node = exprlist->node; node; node = node[1].node)
     {
         Scr_CompileExpression(node->node);
-        expr.type = debugger_prepend_node((sval_u)node->node->type, expr).type;
+        expr = debugger_prepend_node(*node->node, expr);
     }
-    exprlist->type = expr.type;
+    *exprlist = expr;
 }
 
 char __cdecl Scr_CompileMethod(sval_u *expr, sval_u *func_name, sval_u *params)
@@ -734,7 +759,10 @@ char __cdecl Scr_CompileMethod(sval_u *expr, sval_u *func_name, sval_u *params)
     const char *pName; // [esp+8h] [ebp-8h] BYREF
     int type; // [esp+Ch] [ebp-4h] BYREF
 
-    name = Scr_GetBuiltin((sval_u)func_name->type);
+    // LP64: func_name points at the debugger function-name subtree whose full
+    // value is pointer-bearing; `(sval_u)...->type` keeps only its low half.
+    // Full copy is ILP32-identical (4-byte union there).
+    name = Scr_GetBuiltin(*func_name);
     if (!name)
         return 0;
     pName = SL_ConvertToString(name);
@@ -765,7 +793,7 @@ void __cdecl Scr_CompileTextInternal(const char *text, ScriptExpression_t *scrip
     char *start; // [esp+28h] [ebp-14h]
     char *end; // [esp+2Ch] [ebp-10h]
     HunkUser *user; // [esp+30h] [ebp-Ch]
-    uint32_t *expr; // [esp+38h] [ebp-4h]
+    sval_u *expr; // [esp+38h] [ebp-4h]
 
     if (!strcmp(text, "<locals>"))
     {
@@ -792,9 +820,14 @@ void __cdecl Scr_CompileTextInternal(const char *text, ScriptExpression_t *scrip
         else
         {
             scrCompilePub.developer_statement = 3;
-            expr = (uint32_t *)scriptExpr->parseData.type;
-            scriptExpr->parseData.type = (Enum_t)*(uint32_t *)(scriptExpr->parseData.type + 4);
-            if (*expr == 65)
+            // LP64: the user=2 parse yields node1(ENUM_expression/ENUM_statement,
+            // payload) -- a 2-slot, pointer-bearing wrapper.  Reading it through
+            // narrow `.type` keeps only the wrapper pointer's low half (and the
+            // manual +4 byte offset assumes ILP32 4-byte slots on top).  Walk it
+            // natively: tag via node[0], payload via node[1].  ILP32-identical.
+            expr = scriptExpr->parseData.node;
+            scriptExpr->parseData = expr[1];
+            if (expr[0].type == ENUM_expression)
             {
                 varUsagePos = scrVarPub.varUsagePos;
                 if (!scrVarPub.varUsagePos)
@@ -807,7 +840,7 @@ void __cdecl Scr_CompileTextInternal(const char *text, ScriptExpression_t *scrip
             }
             else
             {
-                if (*expr != 83)
+                if (expr[0].type != ENUM_statement)
                     MyAssertHandler(".\\script\\scr_evaluate.cpp", 2142, 0, "%s", "expr.node[0].type == ENUM_statement");
                 user = Hunk_UserCreate(0x10000, "Scr_CompileTextInternal", 0, 0, 0);
                 TempMemoryReset(user);
@@ -1158,18 +1191,20 @@ void __cdecl Scr_EvalVariableExpression(sval_u expr, uint32_t localId, VariableV
         }
         break;
     case 0x51:
-        if (*(uint32_t *)(expr.type + 4) && Scr_IsThreadAlive(*(uint32_t *)(expr.type + 4)))
+        // LP64: thread/local ID is slot 1 of the pointed-to node (same
+        // convention as the surrounding expr.node[k] accesses).
+        if (expr.node[1].idValue && Scr_IsThreadAlive(expr.node[1].idValue))
         {
-            value->u.intValue = *(uint32_t *)(expr.type + 4);
+            value->u.intValue = expr.node[1].idValue;
             value->type = VAR_POINTER;
             AddRefToObject(value->u.intValue);
         }
         else
         {
-            if (*(uint32_t *)(expr.type + 4))
+            if (expr.node[1].idValue)
             {
-                RemoveRefToObject(*(uint32_t *)(expr.type + 4));
-                *(uint32_t *)(expr.type + 4) = 0;
+                RemoveRefToObject(expr.node[1].idValue);
+                expr.node[1].idValue = 0;
             }
             value->type = VAR_UNDEFINED;
             Scr_Error("thread not active");
@@ -1180,7 +1215,7 @@ void __cdecl Scr_EvalVariableExpression(sval_u expr, uint32_t localId, VariableV
         Scr_Error("bad expression");
         break;
     case 0x57:
-        Scr_GetValue(*(uint32_t *)(expr.type + 4), value);
+        Scr_GetValue(expr.node[1].idValue, value);
         break;
     default:
         return;
@@ -1381,8 +1416,12 @@ void __cdecl Scr_EvalFunction(sval_u func_name, sval_u params, uint32_t localId,
             g_script_error_level,
             33);
 
+    // LP64: the builtin address is stored full-width in `.block` by
+    // Scr_CompileFunction above (`func_name->block = (scr_block_s*)func`);
+    // calling through narrow `.type` drops its high half.  ILP32-identical:
+    // every union member is 4 bytes there.
     if (!setjmp(g_script_error[g_script_error_level]))
-        ((void (*)(void))func_name.type)();
+        ((void (*)(void))func_name.block)();
     if (g_script_error_level < 0)
         MyAssertHandler(
             ".\\script\\scr_evaluate.cpp",
@@ -1414,8 +1453,10 @@ void __cdecl Scr_PreEvalBuiltin(sval_u params, uint32_t localId)
     if (scrVmPub.top > scrVmPub.maxstack)
         MyAssertHandler(".\\script\\scr_evaluate.cpp", 1581, 0, "%s", "scrVmPub.top <= scrVmPub.maxstack");
     index = 0;
-    for (node = *(sval_u **)params.type; node; node = node[1].node)
-        Scr_EvalExpression((sval_u)node->type, localId, &scrVmPub.top[-index++]);
+    // LP64: params elements are full pointer-bearing expression values;
+    // traverse from the full header value and pass each element whole.
+    for (node = params.node; node; node = node[1].node)
+        Scr_EvalExpression(*node, localId, &scrVmPub.top[-index++]);
     scrVmPub.outparamcount = expr_count;
     if (!scrVarPub.evaluate)
         MyAssertHandler(".\\script\\scr_evaluate.cpp", 1593, 0, "%s", "scrVarPub.evaluate");
@@ -1493,7 +1534,9 @@ void __cdecl Scr_EvalMethod(sval_u expr, sval_u func_name, sval_u params, uint32
         }
         entref = Scr_GetEntityIdRef(objectId.stringValue);
         RemoveRefToObject(objectId.stringValue);
-        ((void(__cdecl *)(uint32_t))func_name.type)(entref.entnum); // KISAKTODO: fubar'd union 'entref'
+        // LP64: same full-width `.block` rule as Scr_EvalFunction above;
+        // Scr_CompileMethod stores the method address there.
+        ((void(__cdecl *)(uint32_t))func_name.block)(entref.entnum); // KISAKTODO: fubar'd union 'entref'
     }
     if (g_script_error_level < 0)
         MyAssertHandler(
@@ -1782,9 +1825,10 @@ bool __cdecl Scr_RefCall(sval_u params)
     bool exprRemoved; // [esp+7h] [ebp-1h]
 
     exprRemoved = 0;
-    for (node = *(sval_u **)params.type; node; node = node[1].node)
+    // LP64: same full-value rule as Scr_PreEvalBuiltin above.
+    for (node = params.node; node; node = node[1].node)
     {
-        if (Scr_RefExpression((sval_u)node->type))
+        if (Scr_RefExpression(*node))
             exprRemoved = 1;
     }
     return exprRemoved;

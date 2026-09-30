@@ -215,7 +215,8 @@ void __cdecl BG_RegisterShockVolumeDvars()
         iassert(channelName);
         iassert(strlen(channelName->name) < SND_MAX_ENTCHANNEL_NAMELENGTH);
 
-        sprintf_s(bgShockChannelNames[i], 80, "bg_shock_volume_%s", channelName->name);        
+        Com_sprintf(bgShockChannelNames[i], sizeof(bgShockChannelNames[i]),
+            "bg_shock_volume_%s", channelName->name);
         min.value.max = 1.0;
         min.value.min = 0.0;
         bg_shock_volume[i] = Dvar_RegisterFloat(bgShockChannelNames[i], 0.5, min, DVAR_CHEAT, "");
@@ -1400,7 +1401,7 @@ bool __cdecl BG_PlayerHasRoomForEntAllAmmoTypes(const entityState_s *ent, const 
     return !weapDef->altWeaponIndex || BG_GetMaxPickupableAmmo(ps, weapDef->altWeaponIndex);
 }
 
-void __cdecl BG_EvaluateTrajectory(const trajectory_t *tr, int32_t atTime, float *result)
+void __cdecl BG_EvaluateTrajectoryMoving(const trajectory_t *tr, int32_t atTime, float *result)
 {
     float v3; // [esp+Ch] [ebp-7Ch]
     float v4; // [esp+14h] [ebp-74h]
@@ -1934,7 +1935,7 @@ bool __cdecl BG_CheckProneValid(
         bFirstTraceHit = 1;
         fFirstTraceDist = (prone_feet_dist - 6.0) * trace.fraction + 6.0;
         v19 = fSize + 2.0;
-        if (fFirstTraceDist < (double)v19)
+        if (fFirstTraceDist < v19)
             return 0;
         if (fFirstTraceDist < fTraceHeight * 0.699999988079071 + 18.0)
         {
@@ -2111,7 +2112,7 @@ void __cdecl BG_GetPlayerViewOrigin(const playerState_s *ps, float *origin, int3
     AddLeanToPosition(origin, ps->viewangles[1], ps->leanf, 16.0, 20.0);
 
     v3 = ps->origin[2] + 8.0;
-    if (origin[2] < (double)v3)
+    if (origin[2] < v3)
         origin[2] = ps->origin[2] + 8.0;
 }
 
@@ -2346,4 +2347,3 @@ int __cdecl BG_GetMaxSprintTime(const playerState_s *ps)
     else
         return (int)maxSprintTime;
 }
-

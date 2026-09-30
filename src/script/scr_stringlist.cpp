@@ -1,4 +1,12 @@
 #include <universal/q_shared.h>
+
+// Weak: host script harnesses link this file without qcommon/common.cpp;
+// there (and in release) the developer-only bookkeeping stays off.
+bool Com_StartupFlagSet(const char *name) __attribute__((weak));
+static bool ScrDebugBookkeeping()
+{
+	return Com_StartupFlagSet && Com_StartupFlagSet("developer_script");
+}
 #include "scr_stringlist.h"
 
 #include <string.h> // strlen()
@@ -68,7 +76,11 @@ void SL_Init()
 	}
 
 	scrStringGlob.hashTable[0].u.prev = prev;
-	SL_InitCheckLeaks();
+	// Retail release keeps no per-string debug refcounts: every addref/remove
+	// then pays 2 extra atomics and a 256 KB table write. Developer scripting
+	// (+set developer_script 1 on the command line) keeps the leak check.
+	if (ScrDebugBookkeeping())
+		SL_InitCheckLeaks();
 	scrStringGlob.inited = 1;
 	Sys_LeaveCriticalSection(CRITSECT_SCRIPT_STRING);
 }

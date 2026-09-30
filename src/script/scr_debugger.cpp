@@ -1159,11 +1159,9 @@ void __cdecl Scr_ConnectElementChildren(Scr_WatchElement_s *parentElement)
 
 void __cdecl Scr_SortElementChildren(Scr_WatchElement_s *parentElement)
 {
-    uint32_t v1; // [esp+0h] [ebp-14h]
     int newIndex; // [esp+4h] [ebp-10h]
-    int newIndexa; // [esp+4h] [ebp-10h]
     Scr_WatchElement_s *newElements; // [esp+8h] [ebp-Ch]
-    uint32_t *elementList; // [esp+Ch] [ebp-8h]
+    Scr_WatchElement_s **elementList; // [esp+Ch] [ebp-8h]
     int count; // [esp+10h] [ebp-4h]
 
     if (!scrDebuggerGlob.debugger_inited_system)
@@ -1172,42 +1170,40 @@ void __cdecl Scr_SortElementChildren(Scr_WatchElement_s *parentElement)
         MyAssertHandler(".\\script\\scr_debugger.cpp", 5635, 0, "%s", "Scr_IsSortWatchElement( parentElement )");
     count = parentElement->childCount;
     newElements = parentElement->childArrayHead;
-    elementList = Scr_AllocDebugMem(4 * count, "Scr_SortElementChildren");
+    // LP64: the decompiled list held 32-bit element addresses (4-byte
+    // qsort stride) and linked them through the ILP32 `next` offset 96;
+    // above 4 GiB that truncated every element pointer.  Sort native
+    // pointers and link through the named member.
+    elementList = (Scr_WatchElement_s **)Scr_AllocDebugMem(sizeof(*elementList) * count, "Scr_SortElementChildren");
     for (newIndex = 0; newIndex < count; ++newIndex)
-        elementList[newIndex] = (uint32_t)&newElements[newIndex];
-    qsort(elementList, count, 4u, (int(__cdecl *)(const void *, const void *))CompareThreadElements);
-    for (newIndexa = 0; newIndexa < count; ++newIndexa)
-    {
-        if (newIndexa >= count - 1)
-            v1 = 0;
-        else
-            v1 = elementList[newIndexa + 1];
-        *(uint32_t *)(elementList[newIndexa] + 96) = v1;
-    }
-    parentElement->childHead = (Scr_WatchElement_s *)*elementList;
+        elementList[newIndex] = &newElements[newIndex];
+    qsort(elementList, count, sizeof(*elementList), (int(__cdecl *)(const void *, const void *))CompareThreadElements);
+    for (newIndex = 0; newIndex < count; ++newIndex)
+        elementList[newIndex]->next = newIndex >= count - 1 ? nullptr : elementList[newIndex + 1];
+    parentElement->childHead = *elementList;
     Scr_FreeDebugMem(elementList);
 }
 
-int __cdecl CompareThreadElements(int *arg1, int *arg2)
+int __cdecl CompareThreadElements(Scr_WatchElement_s **arg1, Scr_WatchElement_s **arg2)
 {
-    int elements; // [esp+8h] [ebp-8h]
-    int elements_4; // [esp+Ch] [ebp-4h]
+    // LP64: ILP32 offsets 72/76/48 were bufferIndex/sourcePos/fieldName.
+    const Scr_WatchElement_s *elements = *arg1;
+    const Scr_WatchElement_s *elements_4 = *arg2;
 
-    elements = *arg1;
-    elements_4 = *arg2;
-    if (scrParserPub.sourceBufferLookup[*(uint32_t *)(*arg1 + 72)].sortedIndex != scrParserPub.sourceBufferLookup[*(uint32_t *)(*arg2 + 72)].sortedIndex)
-        return scrParserPub.sourceBufferLookup[*(uint32_t *)(*arg1 + 72)].sortedIndex
-        - scrParserPub.sourceBufferLookup[*(uint32_t *)(*arg2 + 72)].sortedIndex;
-    if (*(uint32_t *)(elements + 76) == *(uint32_t *)(elements_4 + 76))
-        return *(uint32_t *)(elements + 48) - *(uint32_t *)(elements_4 + 48);
-    return *(uint32_t *)(elements + 76) - *(uint32_t *)(elements_4 + 76);
+    if (scrParserPub.sourceBufferLookup[elements->bufferIndex].sortedIndex
+        != scrParserPub.sourceBufferLookup[elements_4->bufferIndex].sortedIndex)
+        return scrParserPub.sourceBufferLookup[elements->bufferIndex].sortedIndex
+            - scrParserPub.sourceBufferLookup[elements_4->bufferIndex].sortedIndex;
+    if (elements->sourcePos == elements_4->sourcePos)
+        return elements->fieldName - elements_4->fieldName;
+    return elements->sourcePos - elements_4->sourcePos;
 }
 
 Scr_WatchElement_s *__cdecl Scr_CreateWatchElement(char *text, Scr_WatchElement_s **prevElem, const char *name)
 {
     Scr_WatchElement_s *element; // [esp+0h] [ebp-4h]
 
-    element = (Scr_WatchElement_s *)Scr_AllocDebugMem(100, name);
+    element = (Scr_WatchElement_s *)Scr_AllocDebugMem(sizeof(Scr_WatchElement_s), name); // LP64: was ILP32 100
     memset((uint8_t *)element, 0, sizeof(Scr_WatchElement_s));
     element->valueText = CopyString((char *)"");
     element->refText = CopyString(text);
@@ -1379,7 +1375,6 @@ bool __cdecl Scr_RefToVariable(uint32_t id, int isObject)
     Scr_WatchElementNode_s **pElementNode; // [esp+0h] [ebp-1Ch]
     Scr_WatchElementNode_s *elementNodeNext; // [esp+4h] [ebp-18h]
     Scr_WatchElementDoubleNode_t *breakpoints; // [esp+8h] [ebp-14h]
-    uint32_t *elementNodec; // [esp+Ch] [ebp-10h]
     Scr_WatchElementNode_s *elementNode; // [esp+Ch] [ebp-10h]
     Scr_WatchElementNode_s *elementNodea; // [esp+Ch] [ebp-10h]
     Scr_WatchElementNode_s *elementNodeb; // [esp+Ch] [ebp-10h]
@@ -1406,7 +1401,7 @@ bool __cdecl Scr_RefToVariable(uint32_t id, int isObject)
     {
         if (!scrDebuggerGlob.add)
             return 0;
-        breakpoints = (Scr_WatchElementDoubleNode_t *)Scr_AllocDebugMem(8, "Scr_RefToVariable1");
+        breakpoints = (Scr_WatchElementDoubleNode_t *)Scr_AllocDebugMem(sizeof(Scr_WatchElementDoubleNode_t), "Scr_RefToVariable1"); // LP64: was ILP32 8
         breakpoints->list = 0;
         breakpoints->removedList = 0;
         scrDebuggerGlob.variableBreakpoints[ida] = breakpoints;
@@ -1423,10 +1418,12 @@ bool __cdecl Scr_RefToVariable(uint32_t id, int isObject)
     {
         if (*pElementNode)
             return 0;
-        elementNodec = Scr_AllocDebugMem(8, "Scr_RefToVariable2");
-        *elementNodec = (uint32_t)scrDebuggerGlob.currentElement;
-        elementNodec[1] = (uint32_t)breakpoints->list;
-        breakpoints->list = (Scr_WatchElementNode_s *)elementNodec;
+        // LP64: was an 8-byte ILP32 node filled through two uint32 words.
+        Scr_WatchElementNode_s *node =
+            (Scr_WatchElementNode_s *)Scr_AllocDebugMem(sizeof(Scr_WatchElementNode_s), "Scr_RefToVariable2");
+        node->element = scrDebuggerGlob.currentElement;
+        node->next = breakpoints->list;
+        breakpoints->list = node;
     }
     else
     {
@@ -1566,8 +1563,11 @@ void __cdecl Scr_InitDebuggerMain()
             MyAssertHandler(".\\script\\scr_debugger.cpp", 7941, 0, "%s", "!scrDebuggerGlob.debugger_inited_main");
         if (!Sys_IsRemoteDebugClient())
         {
-            scrDebuggerGlob.variableBreakpoints = (Scr_WatchElementDoubleNode_t **)Hunk_AllocDebugMem(393216);// , "scrDebuggerGlob.variableBreakpoints");
-            memset((uint8_t *)scrDebuggerGlob.variableBreakpoints, 0, 0x60000u);
+            constexpr int kVariableBreakpointCount = 0x18000;
+            constexpr int kVariableBreakpointBytes =
+                kVariableBreakpointCount * static_cast<int>(sizeof(*scrDebuggerGlob.variableBreakpoints));
+            scrDebuggerGlob.variableBreakpoints = (Scr_WatchElementDoubleNode_t **)Hunk_AllocDebugMem(kVariableBreakpointBytes);// , "scrDebuggerGlob.variableBreakpoints");
+            memset((uint8_t *)scrDebuggerGlob.variableBreakpoints, 0, kVariableBreakpointBytes);
             scrDebuggerGlob.assignHead = 0;
             scrDebuggerGlob.assignHeadCodePos = 0;
             scrDebuggerGlob.disableBreakpoints = 0;
@@ -1614,6 +1614,10 @@ void __cdecl Scr_ShutdownDebuggerMain()
 
 void __cdecl Scr_InitDebugger()
 {
+    // Diagnostic markers scoping which script phase runs.
+    Com_Printf(0, "SCRIPT_PROBE initdebugger developer=%d loading=%d inited=%d programLen=%u\n",
+               scrVarPub.developer ? 1 : 0, scrCompilePub.script_loading ? 1 : 0,
+               scrDebuggerGlob.debugger_inited ? 1 : 0, scrCompilePub.programLen);
     if (scrVarPub.developer && scrCompilePub.script_loading)
     {
         if (scrDebuggerGlob.debugger_inited)
@@ -1664,13 +1668,26 @@ void __cdecl Scr_SetSelectionComp(UI_Component *comp)
     }
 }
 
+void __cdecl Scr_InitDebuggerBootState()
+{
+    scrDebuggerGlob.breakpointPos.bufferIndex = (uint32_t)-1;
+    scrDebuggerGlob.atBreakpoint = 0;
+}
+
 void __cdecl Scr_InitDebuggerSystem()
 {
+    // Step markers for the savegame load's script shutdown: this function runs
+    // only on that path (Scr_LoadShutdown), it is developer-gated, and the load
+    // is the first thing that has ever run it -- so a death inside it says
+    // which of its steps is at fault.
+    extern bool scrLoadDiagEnabled;
     if (scrVarPub.developer)
     {
         if (scrDebuggerGlob.debugger_inited_system)
             MyAssertHandler(".\\script\\scr_debugger.cpp", 8088, 0, "%s", "!scrDebuggerGlob.debugger_inited_system");
         Scr_InitBreakpoints();
+        if (scrLoadDiagEnabled)
+            Com_Printf(0, "KISAK_SAVE_STAGE initedebuggersystem=breakpoints=done\n");
         if (!Sys_IsRemoteDebugClient())
         {
             scrDebuggerGlob.nextBreakpointCodePos = 0;
@@ -1680,14 +1697,22 @@ void __cdecl Scr_InitDebuggerSystem()
                 MyAssertHandler(".\\script\\scr_debugger.cpp", 8103, 0, "%s", "!scrVarPub.evaluate");
             scrVarPub.evaluate = 1;
         }
+        if (scrLoadDiagEnabled)
+            Com_Printf(0, "KISAK_SAVE_STAGE initedebuggersystem=eval=done\n");
         scrDebuggerGlob.assignBreakpointSet = 0;
         scrDebuggerGlob.breakpointPos.bufferIndex = -1;
         scrDebuggerGlob.atBreakpoint = 0;
         scrDebuggerGlob.run_debugger = 0;
         scrDebuggerGlob.scriptWatch.Init();
+        if (scrLoadDiagEnabled)
+            Com_Printf(0, "KISAK_SAVE_STAGE initedebuggersystem=watch=done\n");
         scrDebuggerGlob.gainFocusTime = 0;
         scrDebuggerGlob.scriptList.LoadScriptPos();
+        if (scrLoadDiagEnabled)
+            Com_Printf(0, "KISAK_SAVE_STAGE initedebuggersystem=scriptpos=done\n");
         scrDebuggerGlob.scriptCallStack.Init();
+        if (scrLoadDiagEnabled)
+            Com_Printf(0, "KISAK_SAVE_STAGE initedebuggersystem=callstack=done\n");
         if (Sys_IsRemoteDebugClient())
         {
             scrDebuggerGlob.atBreakpoint = 1;
@@ -1709,10 +1734,14 @@ void __cdecl Scr_InitDebuggerSystem()
         scrDebuggerGlob.scriptWatch.selectionParent = &scrDebuggerGlob.miscScrollPane;
         scrDebuggerGlob.scriptCallStack.selectionParent = &scrDebuggerGlob.miscScrollPane;
         Scr_SetSelectionComp(&scrDebuggerGlob.miscScrollPane);
+        if (scrLoadDiagEnabled)
+            Com_Printf(0, "KISAK_SAVE_STAGE initedebuggersystem=select=done\n");
         if (!Sys_IsRemoteDebugClient())
         {
             scrDebuggerGlob.scriptWatch.UpdateBreakpoints(1);
         }
+        if (scrLoadDiagEnabled)
+            Com_Printf(0, "KISAK_SAVE_STAGE initedebuggersystem=done\n");
     }
 }
 
@@ -1775,7 +1804,7 @@ void __cdecl Scr_AddAssignmentPos(char *codePos)
     if (scrCompilePub.developer_statement != 2 && scrDebuggerGlob.assignHeadCodePos != codePos)
     {
         scrDebuggerGlob.assignHeadCodePos = codePos;
-        v1 = (Scr_OpcodeList_s *)Hunk_AllocDebugMem(8);
+        v1 = (Scr_OpcodeList_s *)Hunk_AllocDebugMem(sizeof(Scr_OpcodeList_s)); // LP64: was ILP32 8
         v1->codePos = codePos;
         v1->next = scrDebuggerGlob.assignHead;
         scrDebuggerGlob.assignHead = v1;
@@ -2272,7 +2301,7 @@ void __cdecl Scr_DebugTerminateThread(int topThread)
 {
     Scr_DebugKillThread(
         scrVmPub.function_frame_start[topThread].fs.localId,
-        scrVmPub.stack[3 * topThread - 96].u.codePosValue);
+        scrVmPub.function_frame_start[topThread].fs.pos);
     if (topThread == scrVmPub.function_count)
     {
         if (!scrDebuggerGlob.kill_thread)
@@ -2289,7 +2318,7 @@ void __cdecl Scr_DebugTerminateThread(int topThread)
     }
     else
     {
-        scrVmPub.stack[3 * topThread - 96].u.intValue = (int)&g_EndPos;
+        scrVmPub.function_frame_start[topThread].fs.pos = &g_EndPos; // LP64: index the real frame, not the ILP32 3x8 alias
     }
 }
 
@@ -2721,8 +2750,9 @@ void Scr_SetChildCountRemote()
     sameType = Sys_ReadDebugSocketInt() != 0;
     oldElements = parentElement->childArrayHead;
     oldChildCount = parentElement->childCount;
-    newElements = (Scr_WatchElement_s *)Scr_AllocDebugMem(100 * count, "Scr_SetChildCountRemote");
-    memset((uint8_t *)newElements, 0, 100 * count);
+    // LP64: sizeof(Scr_WatchElement_s) is not the ILP32 100.
+    newElements = (Scr_WatchElement_s *)Scr_AllocDebugMem(sizeof(Scr_WatchElement_s) * count, "Scr_SetChildCountRemote");
+    memset((uint8_t *)newElements, 0, sizeof(Scr_WatchElement_s) * count);
     oldIndex = 0;
     newIndex = 0;
     for (nameIndex = 0; nameIndex < count; ++nameIndex)

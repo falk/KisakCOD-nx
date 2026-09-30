@@ -14,6 +14,8 @@
 #include <script/scr_animtree.h>
 #include "actor_corpse.h"
 
+#include <cstddef>
+
 void __cdecl LocalToWorldOriginAndAngles(
     const float (*matrix)[3],
     const float *trans,
@@ -40,7 +42,7 @@ void __cdecl CalcDeltaOriginAndAngles(
     float *origin,
     float *angles)
 {
-    long double v8; // fp4
+    double v8; // fp4
     double v9; // fp2
     double v10; // fp1
     double yaw; // fp1
@@ -331,7 +333,16 @@ void __cdecl G_ReduceOriginError(float *origin, float *originError, double maxCh
 void __cdecl G_ReduceAnglesError(float *angles, float *anglesError, double maxChange)
 {
     float *v4; // r31
-    int v5; // r30
+    // LP64: this holds a POINTER DIFFERENCE, not a count. `angles` is a stack
+    // array in G_Animscripted_Think and `anglesError` lives inside a gentity on
+    // the heap, so on 64-bit the delta is tens of gigabytes and an int truncates
+    // it to garbage -- `(char *)v4 + v5` then lands on a wild address. That is
+    // the hardware Data Abort: fault address 0, with the reported address
+    // 0x231812d224 carrying the heap pointer's high bits and the stack
+    // pointer's low 32. Harmless where every guest pointer fits in 32 bits
+    // (some emulators load the NRO low, hardware loads it far above 4 GiB),
+    // so only hardware shows it.
+    ptrdiff_t v5; // r30
     int v6; // r29
     double v7; // fp0
 

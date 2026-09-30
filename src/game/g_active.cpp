@@ -588,7 +588,7 @@ void __cdecl ClientThink_real(gentity_s *ent)
     gclient_s *client; // r30
     usercmd_s *p_cmd; // r25
     unsigned int v5; // r11
-    long double v7; // fp2
+    double v7; // fp2
     int eventSequence; // r28
     double v9; // fp0
     int integer; // r11
@@ -869,6 +869,46 @@ void __cdecl ClientEndFrame(gentity_s *ent)
     {
         Player_UpdateLookAtEntity(ent);
         Player_UpdateCursorHints(ent);
+        // USE_HINT diag (user report: no "pick up weapon" prompt): log the
+        // server-side hint whenever it changes, plus a periodic count of the
+        // use candidates around the player, so a missing prompt can be placed
+        // on the server (no candidate / no hint) or on the cgame draw path.
+        if (ent->s.number == 0)
+        {
+            extern const dvar_t *com_diagMarkers;
+            static int s_lastHint = -1;
+            static int s_lastHintEnt = -1;
+            static int s_lastPeriodic;
+            if (com_diagMarkers && com_diagMarkers->current.enabled)
+            {
+                const gclient_s *client = ent->client;
+                if (client->ps.cursorHint != s_lastHint
+                    || client->ps.cursorHintEntIndex != s_lastHintEnt)
+                {
+                    s_lastHint = client->ps.cursorHint;
+                    s_lastHintEnt = client->ps.cursorHintEntIndex;
+                    Com_Printf(0, "USE_HINT change hint=%d string=%d ent=%d weapon=%d time=%d\n",
+                               client->ps.cursorHint, client->ps.cursorHintString,
+                               client->ps.cursorHintEntIndex, client->ps.weapon, level.time);
+                }
+                if (level.time - s_lastPeriodic >= 1000)
+                {
+                    useList_t useList[142];
+                    int count;
+                    s_lastPeriodic = level.time;
+                    count = Player_GetUseList(ent, useList, client->ps.cursorHintEntIndex);
+                    Com_Printf(0, "USE_HINT list count=%d hint=%d ent=%d origin=(%g %g %g)",
+                               count, client->ps.cursorHint, client->ps.cursorHintEntIndex,
+                               client->ps.origin[0], client->ps.origin[1], client->ps.origin[2]);
+                    for (int i = 0; i < count && i < 4; ++i)
+                        Com_Printf(0, " [%d:type=%d item=%d score=%g cls=%d]",
+                                   useList[i].ent->s.number, useList[i].ent->s.eType,
+                                   useList[i].ent->s.index.item, useList[i].score,
+                                   useList[i].ent->classname);
+                    Com_Printf(0, "\n");
+                }
+            }
+        }
     }
     P_DamageFeedback(ent);
     ent->client->ps.moveSpeedScaleMultiplier = ent->client->pers.moveSpeedScaleMultiplier;

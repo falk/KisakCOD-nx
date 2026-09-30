@@ -46,7 +46,7 @@ void __cdecl XModelReadSurface_BuildCollisionTree(
     uint32_t leafEnd; // [esp+B8h] [ebp-E0h]
     float nodeMaxs[3]; // [esp+BCh] [ebp-DCh] BYREF
     uint32_t allocSize; // [esp+C8h] [ebp-D0h]
-    uint32_t alignedAddr; // [esp+CCh] [ebp-CCh]
+    uintptr_t alignedAddr; // [esp+CCh] [ebp-CCh] -- LP64: must not truncate
     unsigned __int8 *alloced; // [esp+D0h] [ebp-C8h]
     float combinedVolume; // [esp+D4h] [ebp-C4h]
     float thisVolume; // [esp+D8h] [ebp-C0h]
@@ -76,10 +76,53 @@ void __cdecl XModelReadSurface_BuildCollisionTree(
     iassert(!surface->deformed);
     iassert(vertListIndex >= 0 && vertListIndex < surface->vertListCount);
     vertList = &surface->vertList[vertListIndex];
-    tree = (XSurfaceCollisionTree*)Alloc(40);
+    if (vertList->triCount == 0 ||
+        static_cast<uint32_t>(vertList->triOffset) + vertList->triCount > 0x8000u)
+    {
+        // The retail leaf stores a 15-bit absolute triangle index, so a
+        // vertList that is empty or reaches past 0x8000 cannot be encoded.
+        // Leave the tree null (callers must treat that as "no candidates")
+        // instead of building a tree the visitor cannot index safely.
+        Com_Printf(0, "XModelReadSurface_BuildCollisionTree: triOffset=%u triCount=%u not "
+                      "encodable as 15-bit leaves; no tree\n",
+                   (unsigned)vertList->triOffset, (unsigned)vertList->triCount);
+        return;
+    }
+    // LP64: sizeof, not the retail 40 -- the two pointers widen the struct to
+    // 56 bytes, and Alloc(40) let leafCount/leafs overrun the next heap chunk.
+    tree = (XSurfaceCollisionTree*)Alloc(sizeof(XSurfaceCollisionTree));
     vertList->collisionTree = tree;
     iassert(surface->triCount > 0);
-    memset(&options, 0, 12);
+    // Validate every triangle index before touching vertices: a shared-span
+    // surface whose index array does not belong to this vertex array would
+    // otherwise read wild vertices.  Leave the tree null and name the gap.
+    {
+        const uint32_t triBegin = vertList->triOffset;
+        const uint32_t triEnd = triBegin + vertList->triCount;
+        for (uint32_t t = triBegin; t != triEnd; ++t)
+        {
+            const uint16_t i0 = surface->triIndices[3 * t];
+            const uint16_t i1 = surface->triIndices[3 * t + 1];
+            const uint16_t i2 = surface->triIndices[3 * t + 2];
+            if (i0 >= surface->vertCount || i1 >= surface->vertCount || i2 >= surface->vertCount)
+            {
+                static uint32_t s_indexGapLog = 0;
+                if (s_indexGapLog < 8)
+                {
+                    ++s_indexGapLog;
+                    Com_Printf(0, "XModelReadSurface_BuildCollisionTree: index out of range "
+                                  "(vertCount=%u tri=%u i=%u,%u,%u); no tree\n",
+                               (unsigned)surface->vertCount, (unsigned)t, i0, i1, i2);
+                }
+                vertList->collisionTree = nullptr;
+                return;
+            }
+        }
+    }
+    // LP64: the retail memset covered items(4)+itemCount(4)+itemSize(4) on
+    // ILP32; zero the whole struct so itemSize/itemCount are defined (this
+    // caller pre-fills leaf bounds and wants no item payload copy).
+    memset(&options, 0, sizeof(options));
     options.mins = 0;
     options.maxs = 0;
     options.maintainValidBounds = 1;
@@ -88,124 +131,44 @@ void __cdecl XModelReadSurface_BuildCollisionTree(
     options.minItemsPerLeaf = 1;
     options.maxItemsPerLeaf = 16;
     ClearBounds(globalMins, globalMaxs);
-    tree->leafs = 0;
-    generateLeafsPass = 0;
-    allocedLeafCount = 0;
     triBeginIndex = vertList->triOffset;
     triEndIndex = triBeginIndex + vertList->triCount;
-    while (1)
+    // One triangle per leaf.  The retail leaf stores a 15-bit absolute
+    // triangle index (bit 15 marks a two-triangle leaf); the decompiled merge
+    // pass could flag the same leaf twice (r_xsurface_load_obj.cpp:288 assert),
+    // and this code path never ran on this port before.  A flat leaf list is
+    // valid, simple, and BuildAabbTree below still supplies the hierarchy.
+    leafCount = vertList->triCount;
+    tree->leafs = (XSurfaceCollisionLeaf*)Alloc(2 * leafCount);
+    tree->leafCount = leafCount;
+    options.mins = (float(*)[3])malloc(12 * leafCount);
+    options.maxs = (float(*)[3])malloc(12 * leafCount);
+    options.items = tree->leafs;
+    options.itemCount = leafCount;
+    options.itemSize = 2;
+    allocedLeafCount = leafCount;
     {
-        leafCount = 0;
-        ClearBounds(prevMins, prevMaxs);
-        lastMergeable = 0;
-        for (triIndex = triBeginIndex; triIndex != triEndIndex; ++triIndex)
+        uint32_t leaf = 0;
+        for (triIndex = triBeginIndex; triIndex != triEndIndex; ++triIndex, ++leaf)
         {
             ClearBounds(triMins, triMaxs);
             AddPointToBounds(surface->verts0[surface->triIndices[3 * triIndex]].xyz, triMins, triMaxs);
             AddPointToBounds(surface->verts0[surface->triIndices[3 * triIndex + 1]].xyz, triMins, triMaxs);
             AddPointToBounds(surface->verts0[surface->triIndices[3 * triIndex + 2]].xyz, triMins, triMaxs);
             ExpandBounds(triMins, triMaxs, globalMins, globalMaxs);
-            merge = 0;
-            if (lastMergeable)
-            {
-                Vec3Sub(prevMaxs, prevMins, tmp);
-                prevVolume = tmp[0] * tmp[1] * tmp[2];
-                Vec3Sub(triMaxs, triMins, tmp);
-                thisVolume = tmp[0] * tmp[1] * tmp[2];
-                ExpandBounds(triMins, triMaxs, prevMins, prevMaxs);
-                Vec3Sub(prevMaxs, prevMins, tmp);
-                combinedVolume = tmp[0] * tmp[1] * tmp[2];
-                if (combinedVolume <= prevVolume + thisVolume)
-                    merge = 1;
-            }
-            if (merge)
-            {
-                if (generateLeafsPass)
-                {
-                    if (!leafCount)
-                        MyAssertHandler(".\\r_xsurface_load_obj.cpp", 284, 0, "%s", "leafCount > 0");
-                    if (leafCount - 1 >= allocedLeafCount)
-                        MyAssertHandler(".\\r_xsurface_load_obj.cpp", 285, 0, "%s", "(leafCount - 1) < allocedLeafCount");
-                    v19 = options.mins[leafCount - 1];
-                    v19[0] = prevMins[0];
-                    v19[1] = prevMins[1];
-                    v19[2] = prevMins[2];
-
-                    v18 = options.maxs[leafCount - 1];
-                    v18[0] = prevMaxs[0];
-                    v18[1] = prevMaxs[1];
-                    v18[2] = prevMaxs[2];
-
-                    if (tree->leafs[leafCount - 1].triangleBeginIndex >= 0x8000u)
-                        MyAssertHandler(
-                            ".\\r_xsurface_load_obj.cpp",
-                            288,
-                            0,
-                            "%s\n\t(tree->leafs[leafCount - 1].triangleBeginIndex) = %i",
-                            "(tree->leafs[leafCount - 1].triangleBeginIndex < 0x8000)",
-                            tree->leafs[leafCount - 1].triangleBeginIndex);
-                    tree->leafs[leafCount - 1].triangleBeginIndex += 0x8000;
-                }
-                lastMergeable = 0;
-            }
-            else
-            {
-                if (generateLeafsPass)
-                {
-                    if (leafCount >= allocedLeafCount)
-                        MyAssertHandler(".\\r_xsurface_load_obj.cpp", 297, 0, "%s", "leafCount < allocedLeafCount");
-                    if (triIndex >= 0x8000)
-                        MyAssertHandler(
-                            ".\\r_xsurface_load_obj.cpp",
-                            298,
-                            0,
-                            "%s",
-                            "triIndex < XSURFACE_COLLISION_LEAF_TWO_TRIANGLES");
-                    tree->leafs[leafCount].triangleBeginIndex = triIndex;
-                    if (tree->leafs[leafCount].triangleBeginIndex != triIndex)
-                        MyAssertHandler(
-                            ".\\r_xsurface_load_obj.cpp",
-                            300,
-                            0,
-                            "%s\n\t(triIndex) = %i",
-                            "(tree->leafs[leafCount].triangleBeginIndex == triIndex)",
-                            triIndex);
-                    v17 = options.mins[leafCount];
-                    v17[0] = triMins[0];
-                    v17[1] = triMins[1];
-                    v17[2] = triMins[2];
-
-                    v16 = options.maxs[leafCount];
-                    v16[0] = triMaxs[0];
-                    v16[1] = triMaxs[1];
-                    v16[2] = triMaxs[2];
-                }
-                ++leafCount;
-                lastMergeable = 1;
-
-                prevMins[0] = triMins[0];
-                prevMins[1] = triMins[1];
-                prevMins[2] = triMins[2];
-
-                prevMaxs[0] = triMaxs[0];
-                prevMaxs[1] = triMaxs[1];
-                prevMaxs[2] = triMaxs[2];
-            }
+            tree->leafs[leaf].triangleBeginIndex = (uint16_t)triIndex;
+            iassert(tree->leafs[leaf].triangleBeginIndex == triIndex);
+            float *leafMins = options.mins[leaf];
+            leafMins[0] = triMins[0];
+            leafMins[1] = triMins[1];
+            leafMins[2] = triMins[2];
+            float *leafMaxs = options.maxs[leaf];
+            leafMaxs[0] = triMaxs[0];
+            leafMaxs[1] = triMaxs[1];
+            leafMaxs[2] = triMaxs[2];
         }
-        if (generateLeafsPass)
-            break;
-        generateLeafsPass = 1;
-        tree->leafs = (XSurfaceCollisionLeaf*)Alloc(2 * leafCount);
-        tree->leafCount = leafCount;
-        options.mins = (float(*)[3])malloc(12 * leafCount);
-        options.maxs = (float(*)[3])malloc(12 * leafCount);
-        options.items = tree->leafs;
-        options.itemCount = leafCount;
-        options.itemSize = 2;
-        allocedLeafCount = leafCount;
+        iassert(leaf == leafCount);
     }
-    if (leafCount != allocedLeafCount)
-        MyAssertHandler(".\\r_xsurface_load_obj.cpp", 313, 0, "%s", "leafCount == allocedLeafCount");
     tree->trans[0] = -globalMins[0];
     tree->trans[1] = -globalMins[1];
     tree->trans[2] = -globalMins[2];
@@ -218,7 +181,7 @@ void __cdecl XModelReadSurface_BuildCollisionTree(
     allocSize = 16 * nodeCount + 15;
     v3 = (unsigned char*)Alloc(allocSize);
     alloced = v3;
-    alignedAddr = (uintptr_t)(v3 + 15) & 0xFFFFFFF0;
+    alignedAddr = (uintptr_t)(v3 + 15) & ~(uintptr_t)0xF;
     tree->nodes = (XSurfaceCollisionNode*)alignedAddr;
     if (((uintptr_t)tree->nodes & 0xF) != 0)
         MyAssertHandler(".\\r_xsurface_load_obj.cpp", 352, 0, "%s", "!(reinterpret_cast< uint32_t >( tree->nodes ) & 0x0F)");
@@ -1024,7 +987,7 @@ void __cdecl XModelLoadCollData(
 
     if (model->numCollSurfs)
     {
-        model->collSurfs = (XModelCollSurf_s *)AllocColl(44 * model->numCollSurfs);
+        model->collSurfs = (XModelCollSurf_s *)AllocColl(sizeof(XModelCollSurf_s) * model->numCollSurfs);
         for (int i = 0; i < model->numCollSurfs; ++i)
         {
             XModelCollSurf_s *surf = &model->collSurfs[i];
@@ -1650,7 +1613,7 @@ static XModel *__cdecl XModelCreateDefault(void *(__cdecl *Alloc)(int))
 {
     XModel *model; // [esp+0h] [ebp-4h]
 
-    model = (XModel *)Alloc(332);
+    model = (XModel *)Alloc(sizeof(XModel)); // LP64: not the retail 332
     XModelMakeDefault(model);
     return model;
 }

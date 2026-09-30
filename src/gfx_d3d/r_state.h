@@ -246,10 +246,24 @@ const GfxImage *__cdecl R_OverrideGrayscaleImage(const dvar_s *dvar);
 void __cdecl R_SetLightmap(GfxCmdBufContext context, uint32_t lmapIndex);
 void __cdecl R_SetReflectionProbe(GfxCmdBufContext context, uint32_t reflectionProbeIndex);
 void __cdecl R_ChangeDepthRange(GfxCmdBufState *state, GfxDepthRangeType depthRangeType);
+void R_GetDepthRangeValues(GfxDepthRangeType depthRangeType, float *nearValue, float *farValue);
 void __cdecl R_HW_SetViewport(IDirect3DDevice9 *device, const GfxViewport *viewport, float nearValue, float farValue);
 int __cdecl R_BeginMaterial(GfxCmdBufState *state, const Material *material, MaterialTechniqueType techType);
 void __cdecl R_ClearAllStreamSources(GfxCmdBufPrimState *state);
 void __cdecl R_DrawIndexedPrimitive(GfxCmdBufPrimState *state, const GfxDrawPrimArgs *args);
+// One triangle-list range of the bound index buffer (static world index
+// buffer draws, r_pretess.h). Same layout as deko9's Deko9IndexRange.
+struct GfxIndexRange
+{
+    uint32_t firstIndex;
+    uint32_t triCount;
+    int32_t baseVertex;
+};
+// Exactly one DrawIndexedPrimitive(ranges[i].baseVertex, vertexCount,
+// ranges[i].firstIndex, ranges[i].triCount) per range with
+// the state unchanged; on deko3d recorded as one state application plus one
+// deko3d draw per range (Deko9_DrawIndexedRanges).
+void R_DrawIndexedRanges(GfxCmdBufPrimState *state, int vertexCount, const GfxIndexRange *ranges, uint32_t count);
 void __cdecl R_ChangeState_0(GfxCmdBufState *state, uint32_t stateBits0);
 void __cdecl R_HW_SetAlphaTestEnable(IDirect3DDevice9 *device, __int16 stateBits0);
 void __cdecl R_HW_SetColorMask(IDirect3DDevice9 *device, uint32_t stateBits0);

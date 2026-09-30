@@ -128,3 +128,43 @@ uint8_t __cdecl R_GetPrimaryLightForModel(
     const GfxLightRegion *lightRegions);
 
 GfxModelLightingPatch *__cdecl R_BackEndDataAllocAndClearModelLightingPatch(GfxBackEndData *frontEndDataOut);
+
+// apply probe: bounded, always-on measurement of what the real
+// R_LightGridLookup + R_GetLightingAtPoint actually resolved for one named
+// static model's lighting origin, so the production log can show the
+// world-position -> cell step and the primary/sun term instead of only the
+// resulting model-lighting texel.  R_SetStaticModelLighting brackets its own
+// R_CalcModelLighting call with Begin/End; the record is read back there and
+// emitted as KILLHOUSE_LIGHTGRID_APPLY, bounded to the named-slot limit.
+struct R_LightGridApplyProbe
+{
+    uint32_t active;
+    uint32_t recorded;
+    uint32_t entryIndex; // model-lighting destination entry being watched
+    uint32_t rawCaptured;      // R_LightGridLookup's pre-suppression quad
+    uint32_t rawDefaultGridEntry;
+    uint32_t rawPos[3];
+    uint32_t rawEntryIndex[8]; // entry - lightGrid->entries, or ~0u
+    uint16_t rawColors[8];
+    uint8_t rawPrimary[8];
+    uint8_t rawNeedsTrace[8];
+    uint32_t defaultGridEntry;
+    uint32_t chosenPrimary;  // raw R_LightGridLookup return
+    uint32_t mappedPrimary;  // after the 255 -> sun and region remap
+    uint32_t visibleMilli;   // primaryVisibleWeight * 1000
+    uint32_t occludedMilli;  // primaryOccludedWeight * 1000
+    uint32_t sampleCount;
+    uint32_t hasLightRegions;
+    uint32_t sunPrimaryLightIndex;      // lightGrid->sunPrimaryLightIndex
+    uint32_t worldSunPrimaryLightIndex; // rgp.world->sunPrimaryLightIndex
+    uint32_t primaryLightCount;         // rgp.world->primaryLightCount
+    uint32_t comPrimaryLightCount;      // Com_GetPrimaryLightCount()
+    uint32_t cornerEntryIndex[8];       // entry - lightGrid->entries, or ~0u
+    uint16_t cornerColors[8];
+    uint8_t cornerPrimary[8];
+    uint8_t cornerNeedsTrace[8];
+    uint32_t cornerWeightMilli[8];
+};
+void __cdecl R_LightGridApplyProbeBegin(uint32_t entryIndex);
+void __cdecl R_LightGridApplyProbeEnd(void);
+const R_LightGridApplyProbe *__cdecl R_LightGridApplyProbeRead(void);

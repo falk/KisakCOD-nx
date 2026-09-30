@@ -31,7 +31,7 @@ UILocalVarContext *__cdecl UILocalVar_Find(UILocalVarContext *context, const cha
     uint32_t hash; // [esp+0h] [ebp-4h] BYREF
 
     if (UILocalVar_FindLocation(context, name, &hash))
-        return (UILocalVarContext *)((char *)context + 12 * hash);
+        return (UILocalVarContext *)&context->table[hash]; // LP64: was byte stride 12 (ILP32 sizeof(UILocalVar))
     else
         return 0;
 }
@@ -75,7 +75,7 @@ UILocalVarContext *__cdecl UILocalVar_FindOrCreate(UILocalVarContext *context, c
     uint32_t hash; // [esp+4h] [ebp-4h] BYREF
 
     if (UILocalVar_FindLocation(context, name, &hash))
-        return (UILocalVarContext *)((char *)context + 12 * hash);
+        return (UILocalVarContext *)&context->table[hash]; // LP64: was byte stride 12 (ILP32 sizeof(UILocalVar))
     var = &context->table[hash];
     var->name = CopyString(name);
     var->type = UILOCALVAR_INT;
@@ -147,7 +147,11 @@ char *__cdecl UILocalVar_GetString(const UILocalVar *var, char *stringBuf, uint3
         {
             if (var->type != UILOCALVAR_STRING)
                 MyAssertHandler(".\\ui\\ui_localvars.cpp", 184, 0, "var->type == UILOCALVAR_STRING\n\t%i, %i", var->type, 2);
-            return (char *)var->u.integer;
+            // LP64: u.integer is only the low 32 bits of the pointer; reading
+            // the string through it sign-extends (ldrsw) and faults for heap
+            // addresses with the high low-word bit set. Return the full
+            // pointer instead.
+            return (char *)var->u.string;
         }
     }
     else
@@ -186,6 +190,6 @@ void __cdecl UILocalVar_SetString(UILocalVar *var, char *s)
     if (var->type == UILOCALVAR_STRING)
         FreeString(var->u.string);
     var->type = UILOCALVAR_STRING;
-    var->u.integer = (int)CopyString(s);
+    var->u.string = CopyString(s);
 }
 

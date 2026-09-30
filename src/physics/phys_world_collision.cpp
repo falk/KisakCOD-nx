@@ -4,6 +4,11 @@
 #include "ode/common.h"
 #include "ode/collision_kernel.h"
 #include <ode/objects.h>
+
+// The brush geom classes write a GeomStateBrush prefix into dxUserGeom's
+// user_data and read it back as BrushInfo; both must fit and line up.
+static_assert(sizeof(BrushInfo) <= sizeof(((dxUserGeom *)nullptr)->user_data), "BrushInfo must fit dxUserGeom::user_data");
+static_assert(offsetof(GeomStateBrush, momentsOfInertia) == offsetof(BrushInfo, centerOfMass), "GeomStateBrush/BrushInfo prefix mismatch");
 #include <universal/assertive.h>
 #include <qcommon/qcommon.h>
 #include <qcommon/threads.h>
@@ -290,45 +295,46 @@ void __cdecl CM_TestGeomInLeafBrushNode(cLeaf_t *leaf, const objInfo *input, Res
 
 void __cdecl Phys_TestGeomInBrush(const cbrush_t *brush, uint32_t *userData)
 {
+    // LP64: userData is the caller's InputOutput; index it by struct.  The
+    // decompiled form read Output as userData[1] (4 bytes) and the objInfo
+    // type/brush at the ILP32 byte offsets 52/140.
+    const InputOutput *io = (const InputOutput *)userData;
+    const objInfo *input = io->Input;
     Results *results; // [esp+68h] [ebp-8h]
 
-    results = (Results *)userData[1];
+    results = io->Output;
     if (results->contactCount < results->maxContacts)
     {
-        switch (*(uint32_t *)(*userData + 52))
+        switch (input->type)
         {
         case 1:
         {
             PROF_SCOPED("Phys_BoxBrushColl");
-            Phys_CollideBoxWithBrush(brush, (const objInfo *)*userData, results);
+            Phys_CollideBoxWithBrush(brush, input, results);
             break;
         }
         case 2:
         {
             PROF_SCOPED("Phys_BrushBrushColl");
-            Phys_CollideOrientedBrushModelWithBrush(brush, (const objInfo *)*userData, results);
+            Phys_CollideOrientedBrushModelWithBrush(brush, input, results);
             break;
         }
         case 3:
         {
             PROF_SCOPED("Phys_BrushBrushColl");
-            Phys_CollideOrientedBrushWithBrush(
-                *(const cbrush_t **)(*userData + 140),
-                brush,
-                (const objInfo *)*userData,
-                results);
+            Phys_CollideOrientedBrushWithBrush(input->u.brush, brush, input, results);
             break;
         }
         case 4:
         {
             PROF_SCOPED("Phys_CylinderBrushColl");
-            Phys_CollideCylinderWithBrush(brush, (const objInfo *)*userData, results);
+            Phys_CollideCylinderWithBrush(brush, input, results);
             break;
         }
         case 5:
         {
             PROF_SCOPED("Phys_CapsuleBrushColl");
-            Phys_CollideCapsuleWithBrush(brush, (const objInfo *)*userData, results);
+            Phys_CollideCapsuleWithBrush(brush, input, results);
             break;
         }
         default:
@@ -691,7 +697,7 @@ void __cdecl Phys_InitBrushmodelGeomClass()
     gclass.isPlaceable = true;
     gclass.collider = Phys_GetColliderNull;
     gclass.aabb = Phys_GetBrushmodelAABB;
-    gclass.bytes = 16;
+    gclass.bytes = sizeof(BrushInfo); // LP64: 24, the ILP32 literal was 16
     classID = dCreateGeomClass(&gclass);
     if (classID != 11)
         MyAssertHandler(
@@ -749,7 +755,7 @@ void __cdecl Phys_InitBrushGeomClass()
     gclass.isPlaceable = true;
     gclass.collider = Phys_GetColliderNull;
     gclass.aabb = Phys_GetBrushAABB;
-    gclass.bytes = 16;
+    gclass.bytes = sizeof(BrushInfo); // LP64: 24, the ILP32 literal was 16
     classID = dCreateGeomClass(&gclass);
     if (classID != 12)
         MyAssertHandler(

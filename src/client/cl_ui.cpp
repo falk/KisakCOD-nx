@@ -32,6 +32,7 @@ int __cdecl CL_ShutdownUI()
     return 1;
 }
 
+
 void __cdecl CL_InitUI()
 {
     int remoteScreenUpdateNesting; // r3

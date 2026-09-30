@@ -15,7 +15,9 @@ void __cdecl R_ProcessCmd_UpdateFxSpotLight(FxCmd *cmd)
 
 void __cdecl R_ProcessCmd_UpdateFxNonDependent(FxCmd *cmd)
 {
+    
     FX_UpdateNonDependent(cmd);
+    
     Sys_SetUpdateNonDependentEffectsEvent();
 }
 

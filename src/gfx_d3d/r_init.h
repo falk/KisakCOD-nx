@@ -30,7 +30,13 @@ struct vidConfig_t // sizeof=0x30 — subset needed by r_init; matches client_mp
 #include "r_image.h"
 #include "r_fog.h"
 
+#ifdef __SWITCH__
+// The vendored d3d9-headers provide the windef handle types (HWND__,
+// _D3DPRESENT_PARAMETERS_) the renderer declarations use on Horizon.
+#include <windows.h>
+#else
 #include <Windows.h>
+#endif
 #include <d3d9.h>
 
 enum GfxRenderer : __int32
@@ -355,7 +361,10 @@ struct __declspec(align(8)) DxGlobals // sizeof=0x2CE0 (game) / 0x2D20 (radiant:
     int anisotropyFor4x;
     int mipFilterMode;
     uint32_t mipBias;               // ...
-    IDirect3DQuery9 *swapFence;         // ...
+    IDirect3DQuery9 *swapFence;         // ... (unused: the swap wait is native, RB_BackendTimeout)
+    // deko9 native frame pacing: the frame the GPU sync waits for
+    // (R_InsertGpuFence), replacing dx.flushGpuQuery's event query.
+    uint64_t gpuSyncFrame;
     // padding byte
     // padding byte
     // padding byte
@@ -393,6 +402,13 @@ void R_ReleaseForShutdownOrReset();
 void __cdecl R_UnloadWorld();
 void __cdecl R_BeginRegistration(vidConfig_t *vidConfigOut);
 void R_Init();
+#ifdef __SWITCH__
+// Synchronize the deko3d backend's submission/GPU lifetime before Switch
+// tears down or reloads renderer-owned assets. This is separate from
+// R_SyncRenderThread(), which only drains the engine's frontend/backend
+// command handoff.
+void R_SwitchWaitForGpuIdle();
+#endif
 #ifdef KISAK_RADIANT
 // Editor multi-window renderer bring-up (implementation at end of r_init.cpp).
 char __cdecl R_InitRendererForWindow(HWND hWnd);
@@ -453,6 +469,10 @@ void __cdecl R_MakeDedicated(const GfxConfiguration *config);
 void __cdecl R_UpdateGpuSyncType();
 
 int R_IsHiDef();
+
+void R_MaterializeAllImages();
+// Required retail resources: reject actual substitutions, permit authored stock images.
+bool R_MaterializeImageStrict(GfxImage *image);
 
 extern DxGlobals dx;
 extern r_global_permanent_t rgp;

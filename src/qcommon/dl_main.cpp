@@ -8,7 +8,7 @@
 
 #include <universal/com_files.h>
 
-int __cdecl DL_VPrintf(const char *fmt, char *argptr)
+int __cdecl DL_VPrintf(const char *fmt, va_list argptr)
 {
     char msg[1028]; // [esp+10h] [ebp-408h] BYREF
 

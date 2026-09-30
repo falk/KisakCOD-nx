@@ -1,5 +1,7 @@
 #include <universal/q_shared.h>
 #include "rb_pixelcost.h"
+#include "r_init.h"
+#include <deko9/deko9_native.h>
 #include "rb_sky.h"
 #include <universal/timing.h>
 #include "r_state.h"
@@ -27,9 +29,9 @@ struct $F77C05005AAF2867FE3D26D91A48F99E // sizeof=0x10030
     // padding byte
     // padding byte
     // padding byte
-    long double msecOverhead;           // ...
+    double msecOverhead;           // ...
     unsigned __int64 timeBegin;         // ...
-    long double msecElapsed;            // ...
+    double msecElapsed;            // ...
     int frameIndex;                     // ...
     int expectedCount;                  // ...
     int recordCount;                    // ...
@@ -267,8 +269,11 @@ void __cdecl R_HW_FinishGpu()
 {
     R_AcquireGpuFenceLock();
     R_FinishGpuFence();
-    R_InsertGpuFence();
-    R_FinishGpuFence();
+    // Retail drained the GPU with an event query issued here. The engine's
+    // GPU-sync fence is now a frame id of deko9's frame ring (lagging the
+    // recording frame, R_InsertGpuFence), so the drain this timing needs is
+    // explicit: submit the open list and wait until the GPU is idle.
+    Deko9_WaitForGpuIdle(dx.device);
     R_ReleaseGpuFenceLock();
 }
 

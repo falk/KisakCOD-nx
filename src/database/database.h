@@ -1,15 +1,24 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <atomic>
 
 #include <zlib/zlib.h>
 
 #include <xanim/xanim.h>
 #include <xanim/xmodel.h>
+#include <universal/fast_critical_section.h>
+#ifndef __SWITCH__
 #include <win32/win_local.h>
+#endif
 #
 
 extern bool g_anyFastFileLoaded;
+#if defined(__SWITCH__)
+extern std::atomic<bool> g_switchRetailLoadFailed;
+const char *DB_SwitchRetailLoadFailure();
+void DB_SwitchClearRetailLoadFailure();
+#endif
 
 enum $D93A52C218787A3ED865FD745137F4B3 : int32_t
 {
@@ -56,6 +65,8 @@ char *__cdecl DB_ReferencedFFNameList();
 void __cdecl Hunk_OverrideDataForFile(int32_t type, const char *name, void *data);
 void __cdecl DB_GetIndexBufferAndBase(uint8_t zoneHandle, void *indices, void **ib, int32_t *baseIndex);
 void __cdecl DB_GetVertexBufferAndOffset(uint8_t zoneHandle, _BYTE *verts, void **vb, int32_t *vertexOffset);
+// Zone block-7/8 sizes for pre-draw bounds checks.
+bool __cdecl DB_GetZoneGeometrySizes(uint8_t zoneHandle, uint32_t *vertBytes, uint32_t *indexBytes);
 void __cdecl DB_EndRecoverLostDevice();
 void __cdecl DB_BeginRecoverLostDevice();
 void __cdecl Load_PhysPresetAsset(XAssetHeader *physPreset);
@@ -116,6 +127,9 @@ void __cdecl DB_EnumXAssets_FastFile(
     bool includeOverride);
 bool __cdecl DB_IsMinimumFastFileLoaded();
 XAssetHeader __cdecl DB_FindXAssetHeader(XAssetType type, const char *name);
+// Unlike DB_FindXAssetHeader, this is safe for a negative lookup: the latter
+// may synthesize a default for missing asset types such as Font.
+bool __cdecl DB_XAssetExists(XAssetType type, const char *name);
 void __cdecl DB_Update();
 void __cdecl DB_SetInitializing(bool inUse);
 bool __cdecl DB_IsXAssetDefault(XAssetType type, const char *name);
@@ -123,6 +137,69 @@ int32_t __cdecl DB_GetAllXAssetOfType_FastFile(XAssetType type, XAssetHeader *as
 void __cdecl DB_UpdateDebugZone();
 void __cdecl DB_SyncXAssets();
 void __cdecl DB_LoadXAssets(XZoneInfo *zoneInfo, uint32_t zoneCount, int32_t sync);
+// Initializes the existing asset pools and registry exactly once.  This is a
+// narrow entry point for widened (LP64) asset loaders; it does not load a
+// zone or touch renderer resources.
+void __cdecl DB_InitializeRegistry();
+// Retail SP zone lifetime.  These helpers are the sole bridge from the
+// widened reader to the real XZone/asset registry.  A load receives a
+// nonzero zone slot and must end it explicitly on success or abort.
+// *nativeArenaBytes is the arena size wanted on entry and the size reserved
+// on return: the reservation is clamped to the free pool, so a zone that
+// needs more fails loudly with out_of_arena instead of aborting in PMem.
+bool DB_RetailZoneBegin(const char *name, int32_t flags, const uint32_t blockSizes[9],
+                        uint32_t *nativeArenaBytes, uint32_t *zoneIndex,
+                        XZoneMemory **zoneMemory, void **nativeArenaMemory);
+// After a successful load: return the unused tail of the zone's native arena
+// (reserved - keepBytes) to the pool. Only possible while the arena is still
+// the pool's last allocation; returns false (nothing changed) otherwise.
+bool DB_RetailZoneTrimNativeArena(uint32_t zoneIndex, void *nativeArenaMemory,
+                                  uint32_t reservedBytes, uint32_t keepBytes);
+XAssetHeader DB_RetailZoneRegister(XAssetType type, XAssetHeader header, uint32_t zoneIndex);
+bool DB_RetailZoneEnd(uint32_t zoneIndex);
+// Retail reload idempotency (PMem retention fix): retail zones begin with
+// flags=0, so no freeFlags unload ever retires them -- every R_Init reload
+// of an already-resident graphics zone used to leak a full zone's PMem
+// (blocks + native arena) until `PMem_Alloc: Need more bytes of ram`
+// aborted the run.  A zone's bytes are deterministic from its file, so
+// reloading a resident zone is pure waste; RetailWalkLoadZoneAssets skips
+// it when a live zone with the same name AND the same load policy is
+// found.  Policy matters because bounded (first-BSP-frame) loads register
+// only the world closure while full loads register everything: serving a
+// bounded-partial zone to a full request would drop RawFiles the caller
+// needs.  Returns the live slot, or 0 when no usable resident exists.
+uint32_t DB_RetailZoneFindLive(const char *name, bool bounded);
+// Records which policy a successfully loaded retail zone used.  Called by
+// RetailWalkLoadZoneAssets on success only; cleared whenever the slot is
+// (re)initialized or retired so a reused slot never misdescribes its zone.
+void DB_RetailZoneNoteLoadPolicy(uint32_t zoneIndex, bool bounded);
+// Retires the retail zone that owns the resident CLIPMAP asset so the next
+// CM_LoadMap re-decodes it.  Com_Restart zeroes `cm` (CM_Shutdown) but keeps
+// retail zone memory; the reload-idempotency skip would otherwise hand back
+// the stale zeroed clipmap.  Call from Com_Restart after CM_Shutdown.
+void DB_RetailZoneRetireClipMapZone();
+// Publishes the zone's block-7 (vertex) and block-8 (index) bytes to the D3D
+// geometry buffers DB_AllocXZoneMemory created for this zone, then unlocks
+// them.  The normal DB_LoadXFileInternal path does this incrementally while
+// streaming (DB_SetStreamIndex -> DB_CloneStreamData into
+// XZoneMemory::lockedVertexData/lockedIndexData) and unlocks once in
+// DB_FinishGeometryBlocks; the retail walker streams block 7/8 straight into
+// blocks[7]/blocks[8].data instead, so the same publish happens once here at
+// the end of a successful load.  Without it the buffers
+// DB_GetVertexBufferAndOffset/DB_GetIndexBufferAndBase hand the static-model
+// draw path stay uninitialized and still mapped.
+void __cdecl DB_RetailZoneUploadGeometryBuffers(uint32_t zoneIndex);
+// Registers a widened runtime technique set in the existing database.  Shader
+// remapping/upload is intentionally left to the renderer integration seam.
+MaterialTechniqueSet *__cdecl DB_RegisterMaterialTechniqueSet(MaterialTechniqueSet *techniqueSet);
+// Registers a widened runtime material in the existing database.  Technique
+// set and image dependencies must already be registered; renderer resources
+// are owned by the later renderer seam.
+Material *__cdecl DB_RegisterMaterial(Material *material);
+// Registers a runtime-loaded GfxImage in the existing database after the
+// engine image path created its D3D texture.
+GfxImage *__cdecl DB_RegisterImage(GfxImage *image);
+XAssetHeader DB_FindXAssetHeaderNoDefault(XAssetType type, const char *name);
 void __cdecl DB_InitThread();
 void __cdecl DB_ReleaseXAssets();
 void __cdecl DB_ShutdownXAssets();
@@ -217,6 +294,12 @@ void __cdecl DB_ConvertOffsetToPointer(uint32_t *data);
 void __cdecl Load_XStringCustom(char **str);
 void __cdecl Load_TempStringCustom(char **str);
 
+// db_file_load: the original zone-load tail (DB_LoadXFileInternal runs it
+// right after Load_DelayStream) -- sweeps every registered image asset and
+// loads the pixels of anything still flagged delayLoadPixels through
+// R_DelayLoadImage -> Image_LoadFromFile (images/<name>.iwi via FS/IWD).
+void __cdecl DB_LoadDelayedImages();
+
 // db_stringtable_load
 void __cdecl Load_ScriptStringCustom(uint16_t *var);
 void __cdecl Mark_ScriptStringCustom(uint16_t *var);
@@ -255,5 +338,10 @@ extern uint32_t g_streamPosStackIndex;
 extern XAsset *varXAsset;
 
 extern FastCriticalSection db_hashCritSect;
+
+// Changes whenever a by-name registry lookup may return something else
+// (db_registry.cpp); 0 while reorder logging needs every lookup. For
+// NamePtrCache memos of DB_FindXAssetHeader results.
+uint32_t DB_AssetLookupGeneration();
 
 extern ScriptStringList *varScriptStringList;

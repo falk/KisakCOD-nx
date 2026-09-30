@@ -364,18 +364,14 @@ bool __cdecl Actor_IsSuppressed(actor_s *self)
 
 int __cdecl Actor_IsMoveSuppressed(actor_s *self)
 {
-    int v2; // r10
-    int *i; // r11
-
     if (!self)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\game\\actor_suppression.cpp", 374, 0, "%s", "self");
-    v2 = 0;
-    for (i = &self->Suppressant[0].movementOnly; !*(i - 5) || !*i; i += 6)
+    for (int i = 0; i < 4; ++i)
     {
-        if (++v2 >= 4)
-            return 0;
+        if (self->Suppressant[i].iTime && self->Suppressant[i].movementOnly)
+            return 1;
     }
-    return 1;
+    return 0;
 }
 
 int __cdecl Actor_IsSuppressionWaiting(actor_s *self)
@@ -495,4 +491,3 @@ void __cdecl Actor_ClearAllSuppressionFromEnemySentient(sentient_s *pSuppressor)
             Actor_DissociateSuppressor(i, pSuppressor);
     }
 }
-

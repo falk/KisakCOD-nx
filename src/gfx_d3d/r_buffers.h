@@ -15,6 +15,11 @@ void __cdecl R_InitDynamicIndexBufferState(GfxIndexBufferState *ib, int indexCou
 void __cdecl R_InitDynamicIndices(GfxDynamicIndices *ib, int indexCount);
 void __cdecl R_ShutdownDynamicIndices(GfxDynamicIndices *ib);
 void __cdecl R_CreateDynamicBuffers();
+// Frame arena: the dynamicVB/
+// dynamicIB rings' `used` must restart at 0 at back-end frame start (not
+// only on ring wrap) so every frame's R_SetVertexData/R_SetIndexData window
+// is a fresh Deko9_FrameAlloc span -- called from RB_BeginFrame.
+void __cdecl R_ResetDynamicVbIbRings();
 void __cdecl R_CreateParticleCloudBuffer();
 void __cdecl R_UnlockVertexBuffer(IDirect3DVertexBuffer9* handle);
 void *__cdecl R_LockVertexBuffer(IDirect3DVertexBuffer9 *handle, int offset, int bytes, int lockFlags);

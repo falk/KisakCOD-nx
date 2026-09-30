@@ -10,6 +10,22 @@
 #include <universal/com_files.h>
 #include <client/client.h>
 
+#if defined(__SWITCH__)
+// No platform clipboard on Horizon.  Unlike cl_keys.cpp's Field_Paste (a
+// reachable core text-input feature, which fails loudly), these are only
+// reached from the DevGui script-watch copy/paste convenience commands, so a
+// silent no-op is the correct "unsupported" behavior here.
+static char *Sys_GetClipboardData()
+{
+    return nullptr;
+}
+
+static int Sys_SetClipboardData(const char *)
+{
+    return 0;
+}
+#endif
+
 #ifdef KISAK_MP
 #include <client_mp/client_mp.h>
 #elif KISAK_SP
@@ -1305,7 +1321,9 @@ void __thiscall Scr_ScriptWatch::SortHitBreakpointsTop()
     if (Sys_IsRemoteDebugClient())
     {
         scrDebuggerGlob.gainFocusTime = Sys_Milliseconds() + 500;
+#if defined(_WIN32)
         SetForegroundWindow(g_wv.hWnd);
+#endif
     }
     scrDebuggerGlob.atBreakpoint = 1;
     hitBreakpoint = 0;
@@ -1635,7 +1653,9 @@ void __thiscall Scr_ScriptCallStack::UpdateStack()
         {
             if (i)
             {
-                codePos = (char*)scrVmPub.stack[3 * (scrVmPub.function_count - i) - 96].u.intValue;
+                // LP64: index the real function frame, not the ILP32 3x8 alias
+                // into the value stack (which lands before scrVmPub.stack now).
+                codePos = (char*)scrVmPub.function_frame_start[scrVmPub.function_count - i].fs.pos;
                 index = scrVmPub.function_frame_start[scrVmPub.function_count - i].fs.localId == 0;
             }
             else
@@ -2331,9 +2351,10 @@ void Scr_ScriptWatch::EvaluateWatchChildren(Scr_WatchElement_s *parentElement)
             qsort(&names[hardcodedCount], count - hardcodedCount, 4u, (int(__cdecl *)(void const *, void const *))compare);
             oldElements = parentElement->childArrayHead;
             oldChildCount = parentElement->childCount;
-            newElements = (Scr_WatchElement_s*)Scr_AllocDebugMem(100 * count, "Scr_ScriptWatch::EvaluateWatchChildren3");
-            memset(newElements, 0, 100 * count);
-            newElementOldRef = (Scr_WatchElement_s**)Scr_AllocDebugMem(4 * count, "Scr_ScriptWatch::EvaluateWatchChildren");
+            // LP64: size the element and pointer arrays natively (ILP32 100 / 4).
+            newElements = (Scr_WatchElement_s*)Scr_AllocDebugMem(sizeof(Scr_WatchElement_s) * count, "Scr_ScriptWatch::EvaluateWatchChildren3");
+            memset(newElements, 0, sizeof(Scr_WatchElement_s) * count);
+            newElementOldRef = (Scr_WatchElement_s**)Scr_AllocDebugMem(sizeof(Scr_WatchElement_s *) * count, "Scr_ScriptWatch::EvaluateWatchChildren");
             v9 = oldElements && parentElement->objectType == oldObjectType;
             sameType = v9;
             elementChanged = 0;
@@ -2696,9 +2717,13 @@ void Scr_ScriptList::Init()
     qsort(
         &scriptWindowsNames[1],
         this->numLines - 1,
-        4u,
+        sizeof(scriptWindowsNames[1]),
         (int(__cdecl *)(const void *, const void *))ConDrawInput_CompareStrings);
-    this->scriptWindows = (Scr_ScriptWindow **)Scr_AllocDebugMem(4 * this->numLines, "Scr_ScriptList::Init2");
+    // LP64: pointer array (8 bytes/element), not the ILP32 4 (same class
+    // as the canonical-string archive fix in this slice: half-sized array
+    // plus a narrow qsort width over pointer-bearing elements).
+    this->scriptWindows = (Scr_ScriptWindow **)Scr_AllocDebugMem(
+        sizeof(*this->scriptWindows) * this->numLines, "Scr_ScriptList::Init2");
     memset(&info, 0, sizeof(info));
     Hunk_CheckTempMemoryHighClear();
     Scr_AddSourceBuffer(0, (char *)"scriptdebugger/help.txt", 0, 0);
@@ -2783,7 +2808,6 @@ void Scr_ScriptList::LoadScriptPos()
         for (i = 0; i < this->numLines; ++i)
         {
             comp = this->scriptWindows[i];
-            //if (!strcmp(Scr_ScriptWindow::GetFilename(comp), filename))
             if (!strcmp(comp->GetFilename(), filename))
             {
                 if (selectedLine < -1 || selectedLine >= comp->numLines)
@@ -2860,6 +2884,15 @@ void Scr_AbstractScriptList::Shutdown()
         Scr_FreeDebugMem(this->scriptWindows);
         this->scriptWindows = 0;
     }
+    // A shut-down list has to look exactly like a fresh one (Init zeroes both).
+    // Scr_ShutdownDebugger frees the window array from Scr_ShutdownSystem, which
+    // G_LoadMainState runs before Scr_LoadPre, while the load's tail used to run
+    // Scr_InitDebuggerSystem -> Scr_ScriptList::LoadScriptPos: a walker that
+    // indexes the array numLines times and calls a virtual on every entry.  With
+    // numLines left behind, that walk read a freed array and a savegame load
+    // died inside it.  Both sides are fixed: this state, and the load
+    // tail that reached it.
+    this->numLines = 0;
 }
 
 void Scr_AbstractScriptList::Draw(
@@ -3012,6 +3045,9 @@ void Scr_AbstractScriptList::AddEntry(Scr_ScriptWindow *scriptWindow, bool selec
         selectedLine = this->selectedLine;
     else
         selectedLine = this->numLines;
+    // LP64: scriptWindows is a Scr_ScriptWindow* array (8 bytes/element),
+    // not the ILP32 4 this byte arithmetic assumed (same class as the
+    // Init width fix above; AddEntry runs per script inside Init).
     newIndex = selectedLine;
     for (i = 0; i < this->numLines; ++i)
     {
@@ -3019,25 +3055,30 @@ void Scr_AbstractScriptList::AddEntry(Scr_ScriptWindow *scriptWindow, bool selec
         {
             if (selectedLine <= i)
             {
-                memmove(&this->scriptWindows[selectedLine + 1], &this->scriptWindows[selectedLine], 4 * (i - selectedLine));
+                memmove(&this->scriptWindows[selectedLine + 1], &this->scriptWindows[selectedLine],
+                        sizeof(*this->scriptWindows) * (i - selectedLine));
             }
             else
             {
                 newIndex = selectedLine - 1;
-                memmove(&this->scriptWindows[i], &this->scriptWindows[i + 1], 4 * (selectedLine - 1 - i));
+                memmove(&this->scriptWindows[i], &this->scriptWindows[i + 1],
+                        sizeof(*this->scriptWindows) * (selectedLine - 1 - i));
             }
             goto found_0;
         }
     }
     newNumLines = this->numLines + 1;
-    newScriptWindows = (unsigned char*)Scr_AllocDebugMem(4 * newNumLines, "Scr_AbstractScriptList::AddEntry");
+    newScriptWindows = (unsigned char*)Scr_AllocDebugMem(
+        sizeof(*this->scriptWindows) * newNumLines, "Scr_AbstractScriptList::AddEntry");
     if (this->scriptWindows)
     {
-        memcpy(newScriptWindows, this->scriptWindows, 4 * selectedLine);
+        memcpy(newScriptWindows, this->scriptWindows,
+               sizeof(*this->scriptWindows) * selectedLine);
         memcpy(
-            &newScriptWindows[4 * selectedLine + 4],
+            &newScriptWindows[sizeof(*this->scriptWindows) * selectedLine +
+                              sizeof(*this->scriptWindows)],
             &this->scriptWindows[selectedLine],
-            4 * (this->numLines - selectedLine));
+            sizeof(*this->scriptWindows) * (this->numLines - selectedLine));
         Scr_FreeDebugMem(this->scriptWindows);
     }
     this->scriptWindows = (Scr_ScriptWindow**)newScriptWindows;

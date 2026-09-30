@@ -7,6 +7,7 @@ void __cdecl Scr_InitAllocNode();
 void __cdecl Scr_ShutdownAllocNode();
 sval_u *__cdecl Scr_AllocNode(int size);
 sval_u __cdecl node0(Enum_t type);
+sval_u __cdecl node_value_pair(const sval_u &value, const sval_u &metadata);
 sval_u __cdecl node1(Enum_t type, sval_u val2);
 sval_u __cdecl node2(Enum_t type, sval_u val1, sval_u val2);
 sval_u __cdecl node3(Enum_t type, sval_u val1, sval_u val2, sval_u val3);
@@ -54,9 +55,9 @@ inline sval_u __cdecl node8(int type, sval_u val1, sval_u val2, sval_u val3, sva
 }
 
 
-sval_u linked_list_end(sval_u val);
-sval_u prepend_node(sval_u val1, sval_u val2);
-sval_u append_node(sval_u val1, sval_u val2);
+sval_u linked_list_end(const sval_u &val);
+sval_u prepend_node(const sval_u &val1, sval_u &val2);
+sval_u append_node(sval_u &val1, const sval_u &val2);
 
 void __cdecl Scr_ClearDebugExpr(debugger_sval_s *debugExprHead);
 sval_u *__cdecl Scr_AllocDebugExpr(Enum_t type, int size, const char *name);

@@ -99,8 +99,8 @@ void CG_ShellShock_f()
     int v0; // r3
     const char *v1; // r3
     const char *v2; // r3
-    long double v3; // fp2
-    long double v4; // fp2
+    double v3; // fp2
+    double v4; // fp2
     shellshock_parms_t *ShellshockParms; // r3
     int v6; // [sp+50h] [-20h]
 
@@ -179,7 +179,7 @@ void CG_ModelPreviewerStepAnim_f()
 {
     int v0; // r3
     const char *v1; // r3
-    long double v2; // fp2
+    double v2; // fp2
 
     if (cgArray[0].nextSnap)
     {
@@ -300,13 +300,13 @@ void __cdecl CG_SetViewPos_f()
     int v0; // r30
     float *origin; // r31
     const char *v2; // r3
-    long double v3; // fp2
+    double v3; // fp2
     unsigned int nesting; // r7
     const char *v5; // r3
-    long double v6; // fp2
+    double v6; // fp2
     int v7; // r7
     const char *v8; // r3
-    long double v9; // fp2
+    double v9; // fp2
     float v10[20]; // [sp+50h] [-50h] BYREF
 
     if (cgArray[0].nextSnap)
@@ -325,14 +325,9 @@ void __cdecl CG_SetViewPos_f()
                 "\"cg_setviewpos\" isn't very useful when server controlled.  Use cg_ufo/cg_noclip or use \"setviewpos\"\n");
         if (Cmd_Argc() == 4 || Cmd_Argc() == 6)
         {
-            v0 = 0;
             origin = cgArray[0].predictedPlayerState.origin;
-            do
-            {
-                v2 = Cmd_Argv(++v0);
-                v3 = atof(v2);
-                *origin++ = *(double *)&v3;
-            } while ((int)origin < (int)cgArray[0].predictedPlayerState.velocity);
+            for (v0 = 0; v0 < 3; ++v0)
+                origin[v0] = (float)atof(Cmd_Argv(v0 + 1));
             nesting = cmd_args.nesting;
             if (cmd_args.nesting >= 8u)
             {
@@ -361,10 +356,10 @@ void __cdecl CG_SetViewPos_f()
                 if (cmd_args.argc[nesting] <= 4)
                     v5 = "";
                 else
-                    v5 = (const char *)*((unsigned int *)cmd_args.argv[nesting] + 4);
+                    v5 = cmd_args.argv[nesting][4];
                 v6 = atof(v5);
                 v7 = cmd_args.nesting;
-                v10[1] = *(double *)&v6;
+                v10[1] = (float)v6;
                 if (cmd_args.nesting >= 8u)
                 {
                     MyAssertHandler(
@@ -379,10 +374,10 @@ void __cdecl CG_SetViewPos_f()
                 if (cmd_args.argc[v7] <= 5)
                     v8 = "";
                 else
-                    v8 = (const char *)*((unsigned int *)cmd_args.argv[v7] + 5);
+                    v8 = cmd_args.argv[v7][5];
                 v9 = atof(v8);
                 v10[2] = 0.0;
-                v10[0] = *(double *)&v9;
+                v10[0] = (float)v9;
                 CG_SetDebugAngles(v10);
             }
         }
@@ -422,7 +417,7 @@ void __cdecl CG_SetViewOrbit_f()
     float focusZ; // fp29
     float dist; // fp28
     float degUp; // fp27
-    long double degAround; // fp2
+    double degAround; // fp2
     float len; // fp11
     float vec[3]; // [sp+50h] [-70h] BYREF // v30
     float pos[4]; // [sp+60h] [-60h] BYREF
@@ -584,4 +579,3 @@ void __cdecl CG_InitConsoleCommands()
     Cmd_AddCommandInternal("VisionSetNaked", 0, &VisionSetNaked_VAR);
     Cmd_AddCommandInternal("VisionSetNight", 0, &VisionSetNight_VAR);
 }
-

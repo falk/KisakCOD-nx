@@ -452,6 +452,8 @@ void __cdecl  SV_ServerThread(unsigned int threadContext);
 void __cdecl SV_InitServerThread();
 void __cdecl SV_ExitAfterTime();
 void SV_WakeServer();
+// Retail PC 0x5c8390: GPU sync that runs the next server frame in slices.
+int __cdecl SV_FrameRateSmoothing();
 void __cdecl SV_WaitServer();
 void __cdecl SV_InitSnapshot();
 void __cdecl SV_WaitSaveGame();
@@ -474,6 +476,8 @@ extern int com_inServerFrame;
 
 extern const dvar_t *sv_lastSaveGame;
 extern const dvar_t *sv_smp;
+extern const dvar_t *sv_smpWorkerHelp;
+extern const dvar_t *sv_framerate_smoothing;
 extern const dvar_t *sv_player_damageMultiplier;
 extern const dvar_t *sv_player_maxhealth;
 extern const dvar_t *sv_saveOnStartMap;

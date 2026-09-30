@@ -5,6 +5,7 @@
 #include <universal/q_shared.h>
 #include "server.h"
 #include "sv_public.h"
+#include "../database/db_retail_frame_evidence.h"
 #include <ui/ui.h>
 #include <database/database.h>
 #include <qcommon/cmd.h>
@@ -114,7 +115,7 @@ void __cdecl SV_ClearServer()
         if (*configstrings)
             SL_RemoveRefToString(*configstrings);
         ++configstrings;
-    } while ((int)configstrings < (int)&sv.svEntities[0].worldSector);
+    } while ((uintptr_t)configstrings < (uintptr_t)&sv.svEntities[0].worldSector); // LP64: full-width compare
     if (sv.emptyConfigString)
         SL_RemoveRefToString(sv.emptyConfigString);
     Com_Memset(&sv, 0, sizeof(server_t));
@@ -232,6 +233,26 @@ void __cdecl SV_Init()
         "True if the save device is currently available");
 #endif
     sv_cheats = Dvar_RegisterBool("sv_cheats", 1, 0x48u, "Enable server cheats");
+    // Switch: off by default.  This is the rolling demo-history save that
+    // accompanies every checkpoint autosave; retail ships it on (30) and warns
+    // in its own description that it "will cause hitches".  On the Switch that
+    // write goes to the SD card, so main routinely stalls waiting for it
+    // ("Stalling for previous demo history to save" / "Demo history save time
+    // out" / "Replay autosave failed because previous save hasn't finish") and
+    // the frame hitch is visible.  Single-player never uses the replay feature;
+    // a run that wants it (SV_SaveDemo_f) sets the dvar explicitly and the
+    // engine raises it back to 2 itself.  Do not set it to 0 from the console
+    // mid-save: sv_demo.cpp:1297 asserts if the dvar reads 0 while a history
+    // save is already in flight.
+#ifdef __SWITCH__
+    replay_autosave = Dvar_RegisterInt(
+        "replay_autosave",
+        0,
+        0,
+        0x7FFFFFFF,
+        0,
+        "Use autosaves as part of demos - will make demo access faster but will cause hitches");
+#else
     replay_autosave = Dvar_RegisterInt(
         "replay_autosave",
         30,
@@ -239,11 +260,26 @@ void __cdecl SV_Init()
         0x7FFFFFFF,
         0,
         "Use autosaves as part of demos - will make demo access faster but will cause hitches");
+#endif
     replay_asserts = Dvar_RegisterBool("replay_asserts", 1, 0, "Enable/Disable replay aborts due to inconsistency");
     SV_InitDemoSystem();
     nextmap = Dvar_RegisterString("nextmap", "", 0, "Next map to load");
     Dvar_RegisterInt("g_reloading", 0, 0, 4, 0x40u, "True if the game is currently reloading");
+#ifdef __SWITCH__
+    // the server thread is real and SV_InitSnapshot honours this
+    // dvar.  sv_smp 1 runs retail's threaded server on its own core: the world
+    // freezes under a fullscreen UI exactly like retail (the briefing movie).
+    // Switch keeps defaulting to 0 until a hardware run with `+set sv_smp 1`
+    // is green -- the only earlier hardware run of the threaded server froze.
+    // Opt in per run from kisak_diag.cfg.
+    sv_smp = Dvar_RegisterBool("sv_smp", 0, 0, "Enable server multithreading");
+    sv_smpWorkerHelp = Dvar_RegisterBool("sv_smpWorkerHelp", 1, 0,
+                                         "Threaded server processes renderer worker commands while it waits");
+#else
     sv_smp = Dvar_RegisterBool("sv_smp", 1, 0, "Enable server multithreading");
+#endif
+    // Retail PC (SV_Init 0x5c7530): default on, no flags.
+    sv_framerate_smoothing = Dvar_RegisterBool("sv_framerate_smoothing", 1, 0, "Enable framerate smoothing");
     sv_loadMyChanges = Dvar_RegisterBool("sv_loadMyChanges", 0, 0, "Load my changes fast file on devmap.");
     sv_clientFrameRateFix = Dvar_RegisterBool(
         "sv_clientFrameRateFix",
@@ -267,14 +303,7 @@ void __cdecl SV_Shutdown(const char *finalmsg)
         SaveMemory_CleanupSaveMemory();
         SaveMemory_ShutdownSaveSystem();
         SV_ClearServer();
-        v1 = &svs;
-        v2 = 10;
-        do
-        {
-            v1->initialized = 0;
-            v1 = (serverStatic_t *)((char *)v1 + 4);
-            --v2;
-        } while (v2);
+        memset(&svs, 0, sizeof(svs)); // LP64: the 10-word loop was the ILP32 layout
         Dvar_SetBool(com_sv_running, 0);
         Dvar_SetFloat(com_timescale, 1.0);
         Com_Printf(CON_CHANNEL_SERVER, "---------------------------\n");
@@ -565,7 +594,6 @@ void __cdecl SV_SpawnServer(const char *mapname, int savegame)
         PROF_SCOPED("Load collision (server)");
         CM_LoadMap(filename, &sv.checksum);
     }
-
     Com_LoadWorld(filename);
 
     SCR_UpdateLoadScreen();
@@ -612,6 +640,7 @@ void __cdecl SV_SpawnServer(const char *mapname, int savegame)
     {
         PROF_SCOPED("Check load level");
         SV_CheckLoadLevel(save);
+        
         //sv_startTime = com_frametime;
         //sv_skelTimeStamp = 49;
         
@@ -627,38 +656,48 @@ void __cdecl SV_SpawnServer(const char *mapname, int savegame)
         PROF_SCOPED("Event loop");
         Com_EventLoop();
         // KISAKTODO: more funcs here?
+        
     }
 
     SCR_UpdateLoadScreen();
+    
 
     //Cbuf_Execute_NextFrame(); ??
 
     SCR_UpdateLoadScreen();
+    
 
     Dvar_SetInt(cl_paused, 1);
+    
     SV_InitSnapshot();
+    
     saveError = 0;
     if (!savegame)
     {
         PROF_SCOPED("Save game");
         saveError = SV_SaveImmediately(mapname);
+        
     }
 
     {
         PROF_SCOPED("Register sounds");
         CG_RegisterSounds();
+        
     }
 
     R_EndRemoteScreenUpdate();
+    
 
     if (IsFastFileLoad())
         DB_SyncXAssets();
+    
 
 #ifndef KISAK_XBOX
 	ProfLoad_Deactivate();
 #endif
 
     UI_SetActiveMenu(0, UIMENU_PREGAME); // KISAKTODO: uimenu enum should be '5'
+    
 
     if (saveError)
         SV_DisplaySaveErrorUI();
@@ -668,5 +707,5 @@ void __cdecl SV_SpawnServer(const char *mapname, int savegame)
     Com_ResetFrametime();
 
     Sys_EndLoadThreadPriorities();
+    
 }
-

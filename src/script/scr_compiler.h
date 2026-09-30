@@ -37,7 +37,14 @@ struct CaseStatementInfo // sizeof=0x10
     uint32_t sourcePos;
     CaseStatementInfo *next;
 };
+// These are transient compiler-only structs, never serialized: the pointer
+// fields naturally grow the LP64 size, and no wire/save format depends on
+// the exact byte count.  Deferred rather than guessed per the LP64 debt
+// classification policy; a dedicated pass should widen or drop each
+// assertion once compiler-state porting is in scope.
+#if !defined(__SWITCH__)
 static_assert(sizeof(CaseStatementInfo) == 0x10);
+#endif
 
 struct BreakStatementInfo // sizeof=0xC
 {
@@ -45,7 +52,9 @@ struct BreakStatementInfo // sizeof=0xC
     const char *nextCodePos;
     BreakStatementInfo *next;
 };
+#if !defined(__SWITCH__)
 static_assert(sizeof(BreakStatementInfo) == 0xC);
+#endif
 
 struct ContinueStatementInfo // sizeof=0xC
 {
@@ -53,14 +62,18 @@ struct ContinueStatementInfo // sizeof=0xC
     const char *nextCodePos;
     ContinueStatementInfo *next;
 };
+#if !defined(__SWITCH__)
 static_assert(sizeof(ContinueStatementInfo) == 0xC);
+#endif
 
 struct VariableCompileValue // sizeof=0xC
 {                                       // ...
     VariableValue value;                // ...
     sval_u sourcePos;
 };
+#if !defined(__SWITCH__)
 static_assert(sizeof(VariableCompileValue) == 0xC);
+#endif
 
 #define VALUE_STACK_SIZE 32
 
@@ -104,7 +117,9 @@ struct scrCompileGlob_t // sizeof=0x1D8
     struct PrecacheEntry *precachescriptList;  // ...
     VariableCompileValue value_start[VALUE_STACK_SIZE]; // ...
 };
+#if !defined(__SWITCH__)
 static_assert(sizeof(scrCompileGlob_t) == 0x1D8);
+#endif
 
 #define SCR_FUNC_TABLE_SIZE 1024
 
@@ -125,7 +140,7 @@ struct scrCompilePub_t
     unsigned char *opcodePos;
     uint32_t programLen;
     int func_table_size;
-    int func_table[SCR_FUNC_TABLE_SIZE];
+    intptr_t func_table[SCR_FUNC_TABLE_SIZE];
 };
 
 void __cdecl Scr_CompileStatement(sval_u parseData);

@@ -238,7 +238,9 @@ struct scr_anim_s // sizeof=0x4
         const char* linkPointer;
     };
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(struct scr_anim_s) == 0x4);
+#endif
 
 struct loadAnim_t // sizeof=0x48
 {
@@ -246,7 +248,9 @@ struct loadAnim_t // sizeof=0x48
     int32_t iNameHash;
     char szAnimName[64];
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert((sizeof(struct loadAnim_t) * 512) == 36864);
+#endif
 
 struct pml_t // sizeof=0x80
 {                                       // ...
@@ -263,14 +267,18 @@ struct pml_t // sizeof=0x80
     float previous_origin[3];           // ...
     float previous_velocity[3];         // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(pml_t) == 0x80);
+#endif
 
 struct animStringItem_t // sizeof=0x8
 {                                       // ...
     const char *string;                 // ...
     int32_t hash;                           // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(animStringItem_t) == 0x8);
+#endif
 
 struct controller_info_t // sizeof=0x60
 {                                       // ...
@@ -285,7 +293,9 @@ struct animConditionTable_t // sizeof=0x8
     animScriptConditionTypes_t type;    // ...
     animStringItem_t *values;           // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(animConditionTable_t) == 0x8);
+#endif
 
 struct viewDamage_t // sizeof=0xC
 {                                       // ...
@@ -354,7 +364,7 @@ struct shellshock_parms_t_movement // sizeof=0x1
 };
 static_assert(sizeof(shellshock_parms_t_movement) == 0x1);
 
-const struct shellshock_parms_t // sizeof=0x268
+struct shellshock_parms_t // sizeof=0x268
 {                                       // ...
     shellshock_parms_t_screenblend screenBlend;
     shellshock_parms_t_view view;
@@ -377,7 +387,9 @@ struct shellshock_t // sizeof=0x20
     float viewDelta[2];
     int32_t hasSavedScreen;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(shellshock_t) == 0x20);
+#endif
 
 struct __declspec(align(8)) animation_s // sizeof=0x68
 {                                       // ...
@@ -415,7 +427,9 @@ struct animScriptCommand_t // sizeof=0x10
     int16_t animDuration[2];
     snd_alias_list_t* soundAlias;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(animScriptCommand_t) == 0x10);
+#endif
 
 enum animScriptParseMode_t : __int32
 {                                       // ...
@@ -434,14 +448,18 @@ struct animScriptItem_t // sizeof=0x100
     int32_t numCommands;
     animScriptCommand_t commands[8];
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(animScriptItem_t) == 0x100);
+#endif
 
 struct animScript_t // sizeof=0x204
 {                                       // ...
     int32_t numItems;
     animScriptItem_t* items[128];
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(animScript_t) == 0x204);
+#endif
 
 struct scr_animtree_t // sizeof=0x4
 {                                       // ...
@@ -451,7 +469,9 @@ struct scr_animtree_t // sizeof=0x4
     }
     XAnim_s* anims;                     // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(scr_animtree_t) == 0x4);
+#endif
 
 struct __declspec(align(8)) animScriptData_t // sizeof=0x9A9D0
 {                                       // ...
@@ -476,7 +496,9 @@ struct __declspec(align(8)) animScriptData_t // sizeof=0x9A9D0
     // padding byte
     // padding byte
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(animScriptData_t) == 0x9A9D0);
+#endif
 
 struct lerpFrame_t // sizeof=0x30
 {                                       // ...
@@ -491,7 +513,9 @@ struct lerpFrame_t // sizeof=0x30
     float animSpeedScale;
     int32_t oldFrameSnapshotTime;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(lerpFrame_t) == 0x30);
+#endif
 
 struct clientControllers_t // sizeof=0x60
 {                                       // ...
@@ -1154,7 +1178,9 @@ struct CEntPlayerInfo // sizeof=0xC
     // padding byte
     // padding byte
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(CEntPlayerInfo) == 0xC);
+#endif
 
 struct CEntTurretAngles // sizeof=0x8
 {                                       // ...
@@ -1224,7 +1250,9 @@ struct CEntFx // sizeof=0x8  (SP/MP Same)
     int32_t triggerTime;
     FxEffect* effect;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(CEntFx) == 0x8);
+#endif
 
 #if defined(KISAK_MP) || defined(KISAK_RADIANT) // radiant: for cpose_t
 struct GfxSkinCacheEntry // sizeof=0xC
@@ -1827,7 +1855,29 @@ bool __cdecl WeaponEntCanBeGrabbed(
     uint32_t weapIdx);
 bool __cdecl HaveRoomForAmmo(const playerState_s *ps, uint32_t weaponIndex);
 bool __cdecl BG_PlayerHasRoomForEntAllAmmoTypes(const entityState_s *ent, const playerState_s *ps);
-void __cdecl BG_EvaluateTrajectory(const trajectory_t *tr, int32_t atTime, float *result);
+// BG_EvaluateTrajectory: most calls are trajectories that evaluate to trBase;
+// those copy inline and the rest go to the out-of-line switch
+// (BG_EvaluateTrajectoryMoving, unchanged retail math). BG_TrajectoryIsBaseCopy
+// is exactly the set of trTypes that switch copies trBase for (checked by
+// switch_cm_cull_test.cpp).
+void __cdecl BG_EvaluateTrajectoryMoving(const trajectory_t *tr, int32_t atTime, float *result);
+constexpr bool BG_TrajectoryIsBaseCopy(int32_t trType)
+{
+    // TR_STATIONARY, TR_INTERPOLATE, TR_PHYSICS, TR_RAGDOLL_INTERPOLATE
+    return (uint32_t)trType < 32u && ((0x903u >> (uint32_t)trType) & 1u) != 0;
+}
+inline void BG_EvaluateTrajectory(const trajectory_t *tr, int32_t atTime, float *result)
+{
+    iassert(tr);
+    if (BG_TrajectoryIsBaseCopy(tr->trType))
+    {
+        result[0] = tr->trBase[0];
+        result[1] = tr->trBase[1];
+        result[2] = tr->trBase[2];
+        return;
+    }
+    BG_EvaluateTrajectoryMoving(tr, atTime, result);
+}
 void __cdecl BG_EvaluateTrajectoryDelta(const trajectory_t *tr, int32_t atTime, float *result);
 void __cdecl BG_AddPredictableEventToPlayerstate(entity_event_t newEvent, uint32_t eventParm, playerState_s *ps);
 void __cdecl BG_PlayerStateToEntityState(playerState_s *ps, entityState_s *s, int32_t snap, uint8_t handler);
@@ -2215,7 +2265,9 @@ struct BulletTraceResults // sizeof=0x44
     // padding byte
     int32_t depthSurfaceType;               // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(BulletTraceResults) == 0x44);
+#endif
 
 struct viewState_t // sizeof=0x24
 {                                       // ...
@@ -2229,7 +2281,9 @@ struct viewState_t // sizeof=0x24
     float fLastIdleFactor;              // ...
     int32_t*weapIdleTime;                  // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(viewState_t) == 0x24);
+#endif
 
 struct weaponState_t // sizeof=0x54
 {                                       // ...
@@ -2247,7 +2301,9 @@ struct weaponState_t // sizeof=0x54
     float swayAngles[3];                // ...
     int32_t*weapIdleTime;                  // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(weaponState_t) == 0x54);
+#endif
 
 void __cdecl TRACK_bg_weapons();
 void __cdecl BG_LoadPenetrationDepthTable();

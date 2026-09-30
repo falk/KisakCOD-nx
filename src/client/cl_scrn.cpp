@@ -6,6 +6,9 @@
 #include "cl_scrn.h"
 #include <gfx_d3d/r_font.h>
 #include <gfx_d3d/r_rendercmds.h>
+#include <universal/com_files.h>
+#include <database/database.h>
+#include <platform/switch/switch_diag_dvars.h>
 #include "client.h"
 #include <ui/ui.h>
 #include <game/g_local.h>
@@ -13,9 +16,21 @@
 #include <cgame/cg_view.h>
 #include <devgui/devgui.h>
 #include <qcommon/threads.h>
+#include <port/switch_perf.h>
+#ifdef __SWITCH__
+#include <platform/switch/switch_platform.h>
+#include <client/cl_input.h>
+extern bool Sys_IsMainThread();
+#else
 #include <win32/win_local.h>
+#endif
 #include <qcommon/cmd.h>
 #include <gfx_d3d/r_screenshot.h>
+#include <gfx_d3d/r_scene.h>
+#include <gfx_d3d/r_drawsurf.h>
+#include <gfx_d3d/rb_stats.h>
+#include <gfx_d3d/r_cinematic.h>
+#include <gfx_d3d/r_add_staticmodel.h>
 
 const char *WeaponStateNames_51[27] =
 {
@@ -118,7 +133,80 @@ void CL_DrawScreen()
 
 static void SCR_ClearScreen()
 {
-    R_AddCmdClearScreen(1, colorBlack, 1.0, 0);
+    // Loading is rendered over a solid dark field.  The old purple diagnostic
+    // clear made the status overlay look like a placeholder and, when the
+    // clear was skipped by the backend, exposed the white swapchain surface.
+    static const float s_clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    R_AddCmdClearScreen(1, s_clearColor, 1.0, 0);
+}
+
+// Quake-style loading readout for the retail fastfile boot loads. Runs in
+// the existing clear-only branches below (which is all the render thread
+// pumps while the database thread streams zones), so it needs no new frame
+// pump and never touches UI state that the DB thread may be registering.
+// Text draws only once the real console font asset exists (before that the
+// handle is a glyph-less default); the progress bar only needs the white
+// material, which always has its built-in default.
+//
+// A mission load is not one of those branches: retail starts the mission's
+// Bink movie there (CL_MapLoading_StartCinematic -> R_Cinematic_StartPlayback)
+// and the briefing menu paints it with ownerdraw 277 fullscreen.  That movie
+// *is* the loading screen -- its bottom edge already carries the game's own
+// segmented progress bar and the mission brief text -- so the readout draws
+// only while no cinematic is on screen, to avoid stacking its own bar on top
+// of the movie's. Suppressing it there also covers a movie that failed to
+// open and a load that outlasts the movie, where the readout is the only
+// feedback the port has.
+static void SCR_DrawLoadingStatus()
+{
+    if (R_Cinematic_IsStarted())
+        return;
+    uint32_t percent;
+    if (!FS_GetRetailLoadStatus(nullptr, 0, &percent))
+        return;
+    if (!cls.rendererStarted || !cls.whiteMaterial)
+        return;
+    // Keep the track opaque so an uninitialised/white surface cannot bleed
+    // through the loader while the first frame is being presented.
+    static const float s_barBack[4] = { 0.08f, 0.08f, 0.08f, 1.0f };
+    static const float s_barFront[4] = { 0.25f, 0.8f, 0.25f, 1.0f };
+    static const float s_textColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    // 2D draws use real framebuffer pixels (R_Set2D maps the viewport, not a
+    // 640x480 virtual space), so anchor to the actual display size.
+    const float barW = 360.0f;
+    const float barH = 14.0f;
+    const float barX = (cls.vidConfig.displayWidth - barW) * 0.5f;
+    const float barY = cls.vidConfig.displayHeight - 96.0f;
+    R_AddCmdDrawStretchPic(barX, barY, barW, barH, 0.0f, 0.0f, 1.0f, 1.0f, s_barBack, cls.whiteMaterial);
+    if (percent > 100u)
+        percent = 100u;
+    if (percent)
+        R_AddCmdDrawStretchPic(barX, barY, barW * percent / 100.0f, barH, 0.0f, 0.0f, 1.0f, 1.0f,
+                               s_barFront, cls.whiteMaterial);
+    // Only the percentage: the fastfile path this is derived from is a port
+    // detail, not something the game ever puts on a loading screen.
+    if (cls.consoleFont && DB_XAssetExists(ASSET_TYPE_FONT, "fonts/consoleFont"))
+    {
+        char line[128];
+        Com_sprintf(line, sizeof(line), "Loading... %u%%", percent);
+        R_AddCmdDrawText(line, 0x7FFFFFFF, cls.consoleFont, barX, barY - 24.0f, 0.6f, 0.6f, 0.0f,
+                         s_textColor, 0);
+    }
+    // Evidence for the gate above: a device log shows when the
+    // readout really reached the screen (and that it did not while a movie
+    // was playing), the same way the cinematic draw diag proves ownerdraw 277
+    // is painted.
+    static uint32_t s_readoutDraws;
+    static uint32_t s_lastReadoutReportMs;
+    ++s_readoutDraws;
+    extern const dvar_t *com_diagMarkers;
+    const uint32_t reportNow = Sys_Milliseconds();
+    if (com_diagMarkers && com_diagMarkers->current.enabled && reportNow - s_lastReadoutReportMs >= 1000)
+    {
+        s_lastReadoutReportMs = reportNow;
+        Com_Printf(0, "SCR_LOADING_READOUT draw calls=%u percent=%u cinematic=0\n", s_readoutDraws,
+                   percent);
+    }
 }
 
 void __cdecl SCR_DrawScreenField(int refreshedUI)
@@ -129,11 +217,14 @@ void __cdecl SCR_DrawScreenField(int refreshedUI)
 
     R_BeginSharedCmdList();
     R_AddCmdProjectionSet2D();
+    static const float s_uiMatColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    R_AddCmdSetMaterialColor(s_uiMatColor);
     if (!cls.uiStarted
         || (connectionState = clientUIActives[0].connectionState, clientUIActives[0].connectionState == CA_MAP_RESTART))
     {
     LABEL_2:
         SCR_ClearScreen();
+        SCR_DrawLoadingStatus();
     }
     else
     {
@@ -154,7 +245,12 @@ void __cdecl SCR_DrawScreenField(int refreshedUI)
                 goto LABEL_12;
             case CA_LOADING:
                 SCR_ClearScreen();
-                goto LABEL_14;
+                // UI_Refresh appends the fullscreen menu commands.  Draw the
+                // status last so the menu cannot cover the progress bar.
+                UI_Refresh();
+                refreshedUI = 1;
+                SCR_DrawLoadingStatus();
+                break;
             case CA_ACTIVE:
                 goto LABEL_12;
             default:
@@ -166,9 +262,15 @@ void __cdecl SCR_DrawScreenField(int refreshedUI)
         case CA_DISCONNECTED:
         case CA_LOGO:
             SCR_ClearScreen();
+            SCR_DrawLoadingStatus();
+            break;
         case CA_LOADING:
             SCR_ClearScreen();
-			UI_Refresh();
+            UI_Refresh();
+            refreshedUI = 1;
+            // Keep this after UI_Refresh for the same reason as the
+            // non-fullscreen branch above: the loader is an overlay.
+            SCR_DrawLoadingStatus();
             break;
         case CA_CINEMATIC:
         case CA_ACTIVE:
@@ -180,8 +282,11 @@ void __cdecl SCR_DrawScreenField(int refreshedUI)
         }
     LABEL_12:
         if (!refreshedUI && Key_IsCatcherActive(0, KEYCATCH_UI))
-            LABEL_14 :
+        {
+        LABEL_14:
             UI_Refresh();
+            refreshedUI = 1;
+        }
     }
 }
 
@@ -221,31 +326,182 @@ void __cdecl SCR_UpdateRumble()
 void SCR_UpdateFrame()
 {
     int refreshedUI; // r31
+#ifdef __SWITCH__
+    const uint32_t perf_begin = Sys_Milliseconds();
+#endif
 
     iassert(Sys_IsMainThread() || Sys_IsRenderThread());
-    //Profile_Begin(18);
-    //Profile_Begin(19);
+#ifdef __SWITCH__
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_RENDER_BEGIN);
+        R_BeginFrame();
+    }
+    const uint32_t perf_after_begin = Sys_Milliseconds();
+#else
     R_BeginFrame();
-    //Profile_EndInternal(0);
+#endif
     SND_InitFXSounds();
-    //Profile_Begin(20);
+#ifdef __SWITCH__
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_RENDER_CGAME);
+        refreshedUI = CL_CGameRendering();
+    }
+#else
     refreshedUI = CL_CGameRendering();
+#endif
     if (Sys_IsMainThread() && !refreshedUI)
         CL_UpdateSound();
+#ifdef __SWITCH__
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_RENDER_SCENE);
+        SCR_DrawScreenField(refreshedUI);
+    }
+#else
     SCR_DrawScreenField(refreshedUI);
+#endif
     if (clientUIActives[0].connectionState == CA_ACTIVE)
     {
-        //Profile_Begin(349);
         CG_DrawFullScreenDebugOverlays(0);
-        //Profile_EndInternal(0);
     }
+#ifdef __SWITCH__
+    const uint32_t perf_after_scene = Sys_Milliseconds();
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_RENDER_UI);
+        R_AddCmdDrawProfile();
+        Con_DrawConsole(0);
+        DevGui_Draw(0);
+    }
+#else
     R_AddCmdDrawProfile();
     Con_DrawConsole(0);
     DevGui_Draw(0);
-    //Profile_EndInternal(0);
-    //Profile_Begin(21);
-    R_EndFrame();
-    R_IssueRenderCommands(0xFFFFFFFF);
+#endif
+#ifdef __SWITCH__
+    const uint32_t perf_after_ui = Sys_Milliseconds();
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_RENDER_END);
+        R_EndFrame();
+    }
+    const uint32_t perf_after_end = Sys_Milliseconds();
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_RENDER_ISSUE);
+        R_IssueRenderCommands(0xFFFFFFFF);
+    }
+    const uint32_t perf_after_issue = Sys_Milliseconds();
+    const dvar_t *performance = Dvar_FindVar("performance");
+    if (performance && performance->type == DVAR_TYPE_BOOL && performance->current.enabled)
+    {
+        static uint32_t report_begin;
+        static uint32_t frames;
+        static uint64_t begin_sum;
+        static uint64_t scene_sum;
+        static uint64_t ui_sum;
+        static uint64_t end_sum;
+        static uint64_t issue_sum;
+        if (!report_begin)
+            report_begin = perf_begin;
+        ++frames;
+        begin_sum += perf_after_begin - perf_begin;
+        scene_sum += perf_after_scene - perf_after_begin;
+        ui_sum += perf_after_ui - perf_after_scene;
+        end_sum += perf_after_end - perf_after_ui;
+        issue_sum += perf_after_issue - perf_after_end;
+        const uint32_t elapsed = perf_after_issue - report_begin;
+        if (elapsed >= 1000)
+        {
+            const double inv_frames = 1.0 / (double)frames;
+            // Split camera-visible surfaces (types 0..14: BSP/smodel/ent lit,
+            // decal, emissive -- what's actually in frame) from shadow-pass
+            // surfaces (types 15..33: 2 sun cascades + 4 spot lights, each
+            // redrawing BSP/smodel/ent again, plus the shadow cookie) so a
+            // swing in "issue" (backend submission cost, R_IssueRenderCommands)
+            // can be attributed to which of those dominates, instead of
+            // guessed at from view direction alone.
+            long cameraSurfs = 0;
+            long shadowSurfs = 0;
+            // Which asset kind is behind the surf count, regardless of pass:
+            // BSP (world geo), smodel (placed static props -- Killhouse's
+            // shelves/crates/racks), ent (dynamic entities), or FX. Indices
+            // follow the fixed lit/decal/emissive x{sun0,sun1,spot0-3} grid
+            // in r_drawsurf.h's DrawSurfType.
+            static const int kBspIdx[] = { 0, 3, 9, 15, 18, 21, 24, 27, 30 };
+            static const int kSmodelIdx[] = { 1, 4, 10, 16, 19, 22, 25, 28, 31 };
+            static const int kEntIdx[] = { 2, 5, 11, 17, 20, 23, 26, 29, 32 };
+            long bspSurfs = 0;
+            long smodelSurfs = 0;
+            long entSurfs = 0;
+            for (int i = 0; i < DRAW_SURF_TYPE_COUNT; ++i)
+            {
+                if (i < DRAW_SURF_SUNSHADOW_0_BEGIN)
+                    cameraSurfs += scene.drawSurfCount[i];
+                else
+                    shadowSurfs += scene.drawSurfCount[i];
+            }
+            for (int idx : kBspIdx)
+                bspSurfs += scene.drawSurfCount[idx];
+            for (int idx : kSmodelIdx)
+                smodelSurfs += scene.drawSurfCount[idx];
+            for (int idx : kEntIdx)
+                entSurfs += scene.drawSurfCount[idx];
+            // Actual DrawIndexedPrimitive calls the backend just issued, per
+            // retail's own prim-stats funnels. Valid here because the backend
+            // runs inline (sys_smp_allowed=0) and RB_ResetStatTracking only
+            // clears it at the next RB_BeginFrame. A draw-surf entry is not a
+            // draw call: the cached static-model funnel issues one draw per
+            // entry, the rigid funnel one per instance in the entry.
+            int drawsCam[GFX_PRIM_STATS_COUNT];
+            int drawsShadow[GFX_PRIM_STATS_COUNT];
+            int drawsCamTotal = 0;
+            int drawsShadowTotal = 0;
+            long trisTotal = 0;
+            for (int i = 0; i < GFX_PRIM_STATS_COUNT; ++i)
+            {
+                drawsCam[i] = g_frameStatsCur.viewStats[0].primStats[i].primCount;
+                drawsShadow[i] = g_frameStatsCur.viewStats[1].primStats[i].primCount;
+                drawsCamTotal += drawsCam[i];
+                drawsShadowTotal += drawsShadow[i];
+                trisTotal += g_frameStatsCur.viewStats[0].primStats[i].triCount
+                    + g_frameStatsCur.viewStats[1].primStats[i].triCount;
+            }
+            // Per-frame average of the funnel decisions over this window.
+            static uint32_t prevFunnel[SMODEL_FUNNEL_COUNT];
+            double funnelPerFrame[SMODEL_FUNNEL_COUNT];
+            for (int i = 0; i < SMODEL_FUNNEL_COUNT; ++i)
+            {
+                funnelPerFrame[i] = (double)(g_smodelFunnelStats[i] - prevFunnel[i]) * inv_frames;
+                prevFunnel[i] = g_smodelFunnelStats[i];
+            }
+            Com_Printf(16,
+                "PERF_SMODEL cached=%.0f rigid_disabled=%.0f rigid_ineligible=%.0f "
+                "rigid_allocfail=%.0f skinned=%.0f\n",
+                funnelPerFrame[SMODEL_FUNNEL_CACHED],
+                funnelPerFrame[SMODEL_FUNNEL_RIGID_DISABLED],
+                funnelPerFrame[SMODEL_FUNNEL_RIGID_INELIGIBLE],
+                funnelPerFrame[SMODEL_FUNNEL_RIGID_ALLOC_FAIL],
+                funnelPerFrame[SMODEL_FUNNEL_SKINNED]);
+            Com_Printf(16,
+                "PERF_RENDER begin=%.1f scene=%.1f ui=%.1f end=%.1f issue=%.1f "
+                "surfs_camera=%ld surfs_shadow=%ld surfs_bsp=%ld surfs_smodel=%ld surfs_ent=%ld "
+                "draws_cam=%d(world=%d smc=%d smr=%d xm=%d bm=%d fx=%d hud=%d) draws_shadow=%d(smc=%d smr=%d) tris=%ld\n",
+                (double)begin_sum * inv_frames,
+                (double)scene_sum * inv_frames,
+                (double)ui_sum * inv_frames,
+                (double)end_sum * inv_frames,
+                (double)issue_sum * inv_frames,
+                cameraSurfs, shadowSurfs, bspSurfs, smodelSurfs, entSurfs,
+                drawsCamTotal, drawsCam[GFX_PRIM_STATS_WORLD],
+                drawsCam[GFX_PRIM_STATS_SMODELCACHED], drawsCam[GFX_PRIM_STATS_SMODELRIGID],
+                drawsCam[GFX_PRIM_STATS_XMODELRIGID] + drawsCam[GFX_PRIM_STATS_XMODELSKINNED],
+                drawsCam[GFX_PRIM_STATS_BMODEL], drawsCam[GFX_PRIM_STATS_FX],
+                drawsCam[GFX_PRIM_STATS_HUD],
+                drawsShadowTotal, drawsShadow[GFX_PRIM_STATS_SMODELCACHED],
+                drawsShadow[GFX_PRIM_STATS_SMODELRIGID], trisTotal);
+            report_begin = perf_after_issue;
+            frames = 0;
+            begin_sum = scene_sum = ui_sum = end_sum = issue_sum = 0;
+        }
+    }
+#endif
     //Profile_EndInternal(0);
 #ifdef KISAK_XBOX
     if (R_SkinCacheReachedThreshold() && g_allowRemoveCorpse)
@@ -273,6 +529,11 @@ void __cdecl SCR_UpdateScreen()
                 updateScreenCalled = 0;
             }
         }
+#ifdef __SWITCH__
+        else
+        {
+        }
+#endif
         //Profile_EndInternal(0);
     }
 }
@@ -315,16 +576,16 @@ void __cdecl CL_CubemapShot_f()
     double v11; // fp31
     const char *v12; // r3
     const char *v13; // r3
-    long double v14; // fp2
+    double v14; // fp2
     const char *v15; // r3
-    long double v16; // fp2
+    double v16; // fp2
     const char *v17; // r3
-    long double v18; // fp2
+    double v18; // fp2
     const char *v19; // r3
     const char *v20; // r3
-    long double v21; // fp2
+    double v21; // fp2
     const char *v22; // r3
-    long double v23; // fp2
+    double v23; // fp2
     unsigned int displayWidth; // r11
     CubemapShot i; // r31
     DemoType DemoType; // r3
@@ -428,14 +689,11 @@ LABEL_20:
             R_LightingFromCubemapShots(&v30);
 
         v27 = CUBEMAPSHOT_RIGHT;
-        v28 = (const char **)&szShotName[0];
-        do
+        for (size_t shotNameIndex = 0; shotNameIndex < ARRAY_COUNT(szShotName); ++shotNameIndex, ++v27)
         {
-            v29 = va("env/%s%s.tga", v33, *v28);
+            v29 = va("env/%s%s.tga", v33, szShotName[shotNameIndex]);
             R_SaveCubemapShot((char*)v29, v27, v10, v11);
-            ++v28;
-            ++v27;
-        } while ((int)v28 < (int)&szShotName[6]);
+        }
     }
     else
     {
@@ -446,4 +704,3 @@ LABEL_20:
             displayWidth - 2);
     }
 }
-

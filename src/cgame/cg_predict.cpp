@@ -641,7 +641,9 @@ void __cdecl CG_PredictPlayerState(int localClientNum)
     centity_s *Entity; // r3
 
     cg_s *cgameGlob = CG_GetLocalClientGlobals(localClientNum);
+    
     CG_PredictPlayerState_Internal(localClientNum);
+    
 
     playerState_s *ps = &cgameGlob->predictedPlayerState;
 
@@ -653,5 +655,6 @@ void __cdecl CG_PredictPlayerState(int localClientNum)
     memcpy(&cgameGlob->predictedPlayerEntity.currentState, &cgameGlob->predictedPlayerEntity.nextState.lerp, sizeof(LerpEntityState));
     cgameGlob->predictedPlayerEntity.oldEType = cgameGlob->predictedPlayerEntity.nextState.eType;
     CG_CalcEntityLerpPositions(localClientNum, &cgameGlob->predictedPlayerEntity);
+    
 }
 

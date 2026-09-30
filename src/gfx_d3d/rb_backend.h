@@ -43,6 +43,8 @@ enum MaterialVertexDeclType : __int32
      THREAD_CONTEXT_COUNT        = 0x7,
  };
 #elif KISAK_SP
+#ifndef THREAD_CONTEXT_ENUM_DEFINED
+#define THREAD_CONTEXT_ENUM_DEFINED
 enum ThreadContext_t : __int32
 {
     THREAD_CONTEXT_MAIN = 0x0,
@@ -61,6 +63,7 @@ enum ThreadContext_t : __int32
     THREAD_CONTEXT_SERVER_DEMO = 11,
     THREAD_CONTEXT_COUNT = 12,
 };
+#endif
 #elif defined(KISAK_RADIANT)
 enum ThreadContext_t : __int32 {
     THREAD_CONTEXT_MAIN     = 0x0,
@@ -617,6 +620,12 @@ void __cdecl RB_ResetStatTracking();
 void __cdecl RB_BeginFrame(const GfxBackEndData *data);
 void __cdecl RB_EndFrame(char drawType);
 GfxIndexBufferState *RB_SwapBuffers();
+#ifdef __SWITCH__
+// one-shot screenshot request served by RB_SwapBuffers' backbuffer
+// readback (PNG); RB_PollRequestedScreenshot reports when it was written.
+void RB_RequestScreenshot(const char *ospath);
+bool RB_PollRequestedScreenshot(bool *ok);
+#endif
 void RB_UpdateBackEndDvarOptions();
 void __cdecl RB_ExecuteRenderCommandsLoop(const void *cmds);
 void __cdecl RB_Draw3D();

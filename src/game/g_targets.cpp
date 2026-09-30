@@ -25,72 +25,41 @@ void __cdecl G_InitTargets()
 
 void __cdecl G_LoadTargets()
 {
-    int v0; // r20
-    float *v1; // r31
-    const char *v2; // r3
-    const char *v3; // r30
-    unsigned int v4; // r7
-    const char *v5; // r3
-    const char *v6; // r3
-    int v7; // r11
-    const char *v8; // r3
-    int v9; // r3
     char v10[1032]; // [sp+50h] [-480h] BYREF
 
-    v0 = 0;
-    v1 = &targGlob.targets[0].offset[2];
     targGlob.targetCount = 0;
-    do
+    for (int targetIndex = 0; targetIndex < MAX_TARGETS; ++targetIndex)
     {
-        SV_GetConfigstring(v0 + 27, v10, 1024);
+        target_t &target = targGlob.targets[targetIndex];
+        target.ent = nullptr;
+        SV_GetConfigstring(targetIndex + 27, v10, 1024);
         if (v10[0])
         {
             ++targGlob.targetCount;
-            v2 = Info_ValueForKey(v10, "ent");
-            v3 = v2;
-            if (*v2)
+            const char *entValue = Info_ValueForKey(v10, "ent");
+            if (*entValue)
             {
-                v4 = atol(v2);
-                if (v4 >= 0x880)
+                const int entNum = atol(entValue);
+                if (entNum >= 0x880)
                     MyAssertHandler(
                         "c:\\trees\\cod3\\cod3src\\src\\game\\g_targets.cpp",
                         64,
                         0,
                         "entNum doesn't index MAX_GENTITIES\n\t%i not in [0, %i)",
-                        v4,
+                        entNum,
                         2176);
-                *((unsigned int *)v1 - 3) = (unsigned int)&level.gentities[atol(v3)];
+                target.ent = &level.gentities[entNum];
             }
-            else
-            {
-                *(v1 - 3) = 0.0;
-            }
-            v5 = Info_ValueForKey(v10, "offs");
-            *(v1 - 2) = 0.0;
-            *(v1 - 1) = 0.0;
-            *v1 = 0.0;
-            if (*v5)
-                sscanf(v5, "%f %f %f", v1 - 2, v1 - 1, v1);
-            v6 = Info_ValueForKey(v10, "mat");
-            if (*v6)
-                v7 = atol(v6);
-            else
-                v7 = -1;
-            *((unsigned int *)v1 + 1) = v7;
-            v8 = Info_ValueForKey(v10, "offmat");
-            if (*v8)
-                v9 = atol(v8);
-            else
-                v9 = -1;
-            *((unsigned int *)v1 + 2) = v9;
+            const char *offsetValue = Info_ValueForKey(v10, "offs");
+            target.offset[0] = target.offset[1] = target.offset[2] = 0.0f;
+            if (*offsetValue)
+                sscanf(offsetValue, "%f %f %f", &target.offset[0], &target.offset[1], &target.offset[2]);
+            const char *materialValue = Info_ValueForKey(v10, "mat");
+            target.materialIndex = *materialValue ? atol(materialValue) : -1;
+            const char *offscreenMaterialValue = Info_ValueForKey(v10, "offmat");
+            target.offscreenMaterialIndex = *offscreenMaterialValue ? atol(offscreenMaterialValue) : -1;
         }
-        else
-        {
-            *(v1 - 3) = 0.0;
-        }
-        v1 += 7;
-        ++v0;
-    } while ((uintptr_t)v1 < (uintptr_t)&targGlob.targets[32]);
+    }
 }
 
 void __cdecl Scr_Target_SetShader()
@@ -111,33 +80,8 @@ void __cdecl Scr_Target_SetShader()
     if (Scr_GetNumParam() < 2)
         Scr_Error("Too few arguments\n");
     Entity = Scr_GetEntity(0);
-    v2 = 0;
-    v3 = &targGlob.targets[1];
-    v4 = 0;
-    while (v3[-1].ent != Entity)
-    {
-        if (v3->ent == Entity)
-        {
-            ++v2;
-            break;
-        }
-        if (v3[1].ent == Entity)
-        {
-            v2 += 2;
-            break;
-        }
-        if (v3[2].ent == Entity)
-        {
-            v2 += 3;
-            break;
-        }
-        v4 += 112;
-        v2 += 4;
-        v3 += 4;
-        if (v4 >= 0x380)
-            break;
-    }
-    if (v2 == 32)
+    v2 = TargetIndex(Entity);
+    if (v2 == MAX_TARGETS)
     {
         v5 = va("Entity %i is not a target", Entity->s.number);
         Scr_Error(v5);
@@ -151,11 +95,10 @@ void __cdecl Scr_Target_SetShader()
     {
         v7 = -1;
     }
-    v8 = v2;
     targGlob.targets[v2].materialIndex = v7;
     v9 = v2 + 27;
     SV_GetConfigstring(v9, v11, 1024);
-    v10 = va("%i", targGlob.targets[v8].materialIndex);
+    v10 = va("%i", targGlob.targets[v2].materialIndex);
     Info_SetValueForKey(v11, "mat", v10);
     SV_SetConfigstring(v9, v11);
 }
@@ -178,33 +121,8 @@ void __cdecl Scr_Target_SetOffscreenShader()
     if (Scr_GetNumParam() < 2)
         Scr_Error("Too few arguments\n");
     Entity = Scr_GetEntity(0);
-    v2 = 0;
-    v3 = &targGlob.targets[1];
-    v4 = 0;
-    while (v3[-1].ent != Entity)
-    {
-        if (v3->ent == Entity)
-        {
-            ++v2;
-            break;
-        }
-        if (v3[1].ent == Entity)
-        {
-            v2 += 2;
-            break;
-        }
-        if (v3[2].ent == Entity)
-        {
-            v2 += 3;
-            break;
-        }
-        v4 += 112;
-        v2 += 4;
-        v3 += 4;
-        if (v4 >= 0x380)
-            break;
-    }
-    if (v2 == 32)
+    v2 = TargetIndex(Entity);
+    if (v2 == MAX_TARGETS)
     {
         v5 = va("Entity %i is not a target", Entity->s.number);
         Scr_Error(v5);
@@ -218,11 +136,10 @@ void __cdecl Scr_Target_SetOffscreenShader()
     {
         v7 = -1;
     }
-    v8 = v2;
     targGlob.targets[v2].offscreenMaterialIndex = v7;
     v9 = v2 + 27;
     SV_GetConfigstring(v9, v11, 1024);
-    v10 = va("%i", targGlob.targets[v8].offscreenMaterialIndex);
+    v10 = va("%i", targGlob.targets[v2].offscreenMaterialIndex);
     Info_SetValueForKey(v11, "offmat", v10);
     SV_SetConfigstring(v9, v11);
 }
@@ -293,65 +210,15 @@ void __cdecl Scr_Target_Set()
         Scr_Error("Too few arguments\n");
     Entity = Scr_GetEntity(0);
     v2 = Entity;
-    v3 = 0;
-    v4 = &targGlob.targets[1];
-    v5 = 0;
-    while (v4[-1].ent != Entity)
-    {
-        if (v4->ent == Entity)
-        {
-            ++v3;
-            break;
-        }
-        if (v4[1].ent == Entity)
-        {
-            v3 += 2;
-            break;
-        }
-        if (v4[2].ent == Entity)
-        {
-            v3 += 3;
-            break;
-        }
-        v5 += 112;
-        v3 += 4;
-        v4 += 4;
-        if (v5 >= 0x380)
-            break;
-    }
-    if (v3 == 32)
+    v3 = TargetIndex(Entity);
+    if (v3 == MAX_TARGETS)
     {
         if (targGlob.targetCount >= 0x20)
             Scr_Error("Maximum number of targets exceeded");
-        v3 = 0;
-        v6 = 0;
-        v7 = &targGlob.targets[1];
-        while (v7[-1].ent)
+        for (v3 = 0; v3 < MAX_TARGETS && targGlob.targets[v3].ent; ++v3)
+            ;
+        if (v3 == MAX_TARGETS)
         {
-            if (!v7->ent)
-            {
-                ++v3;
-                break;
-            }
-            if (!v7[1].ent)
-            {
-                v3 += 2;
-                break;
-            }
-            if (!v7[2].ent)
-            {
-                v3 += 3;
-                break;
-            }
-            v6 += 112;
-            v3 += 4;
-            v7 += 4;
-            if (v6 >= 0x380)
-                goto LABEL_27;
-        }
-        if (v3 < 0x20)
-            goto LABEL_28;
-    LABEL_27:
         MyAssertHandler(
             "c:\\trees\\cod3\\cod3src\\src\\game\\g_targets.cpp",
             263,
@@ -359,7 +226,7 @@ void __cdecl Scr_Target_Set()
             "targetIndex doesn't index MAX_TARGETS\n\t%i not in [0, %i)",
             v3,
             32);
-    LABEL_28:
+        }
         v8 = v3;
         targGlob.targets[v8].ent = v2;
         offset = targGlob.targets[v3].offset;
@@ -453,11 +320,11 @@ int __cdecl G_WorldDirToScreenPos(
     const float *worldDir,
     float *outScreenPos)
 {
-    long double v9; // fp2
+    double v9; // fp2
     int result; // r3
     double v11; // fp28
     double v12; // fp27
-    long double v13; // fp2
+    double v13; // fp2
     double v14; // fp31
     double v15; // fp30
     float v16[4]; // [sp+50h] [-90h] BYREF
@@ -514,33 +381,8 @@ int __cdecl ScrGetTargetScreenPos(float *screenPos)
     fov_x = Scr_GetFloat(2);
     if (fov_x <= 0.0)
         Scr_ParamError(2u, "FOV must be positive");
-    v10 = 0;
-    v11 = 0;
-    v12 = &targGlob.targets[1];
-    while (v12[-1].ent != Entity)
-    {
-        if (v12->ent == Entity)
-        {
-            ++v10;
-            break;
-        }
-        if (v12[1].ent == Entity)
-        {
-            v10 += 2;
-            break;
-        }
-        if (v12[2].ent == Entity)
-        {
-            v10 += 3;
-            break;
-        }
-        v11 += 112;
-        v10 += 4;
-        v12 += 4;
-        if (v11 >= 0x380)
-            break;
-    }
-    if (v10 == 32)
+    v10 = TargetIndex(Entity);
+    if (v10 == MAX_TARGETS)
     {
         v13 = va("Entity %i is not a target", Entity->s.number);
         Scr_Error(v13);
@@ -725,4 +567,3 @@ void __cdecl Scr_Target_SetJavelinOnly()
     //SV_SetConfigstring(targIdx + 387, configString);
     SV_SetConfigstring(CS_TARGETS + targIdx, configString);
 }
-

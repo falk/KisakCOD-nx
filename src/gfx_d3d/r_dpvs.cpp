@@ -1,6 +1,8 @@
 #include <universal/q_shared.h>
+#include <port/switch_perf.h>
 #include "r_dpvs.h"
 #include <qcommon/mem_track.h>
+#include <qcommon/cm_cull.h>
 #include "r_model_lighting.h"
 #include "r_dvars.h"
 #include <DynEntity/DynEntity_client.h>
@@ -17,6 +19,7 @@
 #include "rb_light.h"
 #include "r_sunshadow.h" // SCENE_VIEW_CAMERA
 #include <universal/profile.h>
+#include <database/db_retail_frame_evidence.h>
 
 #ifdef KISAK_MP
 #include <cgame_mp/cg_local_mp.h>
@@ -140,7 +143,7 @@ uint32_t __cdecl R_FindNearestReflectionProbeInCell(
                 world->reflectionProbeCount);
         Vec3Sub(origin, world->reflectionProbes[probeIndex].origin, diff);
         testProbeDist = Vec3LengthSq(diff);
-        if (bestProbeDist > (double)testProbeDist)
+        if (bestProbeDist > testProbeDist)
         {
             bestProbeDist = testProbeDist;
             bestProbe = probeIndex;
@@ -166,7 +169,7 @@ uint32_t __cdecl R_FindNearestReflectionProbe(const GfxWorld *world, const float
     {
         Vec3Sub(origin, world->reflectionProbes[probeIndex].origin, diff);
         testProbeDist = Vec3LengthSq(diff);
-        if (bestProbeDist > (double)testProbeDist)
+        if (bestProbeDist > testProbeDist)
         {
             bestProbeDist = testProbeDist;
             bestProbe = probeIndex;
@@ -232,7 +235,7 @@ void __cdecl R_AddAllSceneEntSurfacesCamera(const GfxViewInfo *viewInfo)
             {
                 sceneEnt = &scene.sceneDObj[sceneEntIndex];
                 iassert(sceneEnt->cull.state >= CULL_STATE_BOUNDED);
-                cachedLightingHandle = (uint16_t *)LongNoSwap((uint32_t)sceneEnt->info.cachedLightingHandle);
+                cachedLightingHandle = sceneEnt->info.cachedLightingHandle;
                 lightingHandle = R_AllocModelLighting_Box(
                     viewInfo,
                     sceneEnt->lightingOrigin,
@@ -874,12 +877,14 @@ void __cdecl R_DrawAllSceneEnt(const GfxViewInfo *viewInfo)
                 visData |= sceneEntVisData[viewIndex][sceneEntIndex];
             }
         }
-        if (((visData & 1) != 0 || R_IsEntityVisibleToAnyShadowedPrimaryLight(viewInfo, entnum))
-            && !R_DrawBModel(&sceneBrush->info, sceneBrush->bmodel, &sceneBrush->placement))
+        if ((visData & 1) != 0 || R_IsEntityVisibleToAnyShadowedPrimaryLight(viewInfo, entnum))
         {
-            Com_BitSetAssert(scene.entOverflowedDrawBuf, sceneBrush->entnum, 0xFFFFFFF);
-            for (viewIndex = 0; viewIndex < 3; ++viewIndex)
-                sceneEntVisData[viewIndex][sceneEntIndex] = 0;
+            if (!R_DrawBModel(&sceneBrush->info, sceneBrush->bmodel, &sceneBrush->placement))
+            {
+                Com_BitSetAssert(scene.entOverflowedDrawBuf, sceneBrush->entnum, 0xFFFFFFF);
+                for (viewIndex = 0; viewIndex < 3; ++viewIndex)
+                    sceneEntVisData[viewIndex][sceneEntIndex] = 0;
+            }
         }
     }
 }
@@ -901,10 +906,17 @@ int __cdecl R_DrawBModel(BModelDrawInfo *bmodelInfo, const GfxBrushModel *bmodel
     else
         visibleSurfaceCount = bmodel->surfaceCountNoDecal;
     iassert( visibleSurfaceCount );
-
-    const uint surfBytes = sizeof(BModelSurface) * visibleSurfaceCount + sizeof(GfxScaledPlacement);
+    // LP64 fix: the 8 bytes-per-surface reservation assumed a 32-bit
+    // BModelSurface (two 4-byte pointers); on the Switch target the struct
+    // is 16 bytes, so consecutive R_DrawBModel calls overlapped and a later
+    // bmodel's GfxScaledPlacement overwrote an earlier bmodel's
+    // BModelSurfaces, faulting the camera pass on a garbage `surf` pointer.
+    // Reserve by the real struct sizes (identical to the old formula when
+    // pointers are 4 bytes).
+    const uint32_t surfBytes =
+        sizeof(GfxScaledPlacement) + sizeof(BModelSurface) * visibleSurfaceCount;
     startSurfPos = InterlockedExchangeAdd(&frontEndDataOut->surfPos, surfBytes);
-    if (surfBytes + startSurfPos <= sizeof(frontEndDataOut->surfsBuffer))
+    if (surfBytes + (uint32_t)startSurfPos <= sizeof(frontEndDataOut->surfsBuffer))
     {
         iassert( !(startSurfPos & 3) );
         newPlacement = (GfxScaledPlacement *)&frontEndDataOut->surfsBuffer[startSurfPos];
@@ -1252,7 +1264,7 @@ void __cdecl R_FilterEntIntoCells_r(FilterEntInfo *entInfo, mnode_t *node, const
         if (cellIndex - cellCount < 0)
             break;
         plane = &rgp.world->dpvsPlanes.planes[planeIndex];
-        side = BoxOnPlaneSide(mins2, maxs2, plane);
+        side = BoxOnPlaneSideInline(mins2, maxs2, plane, BoxOnPlaneSide);
         if (side == 3)
         {
             type = plane->type;
@@ -1273,7 +1285,7 @@ void __cdecl R_FilterEntIntoCells_r(FilterEntInfo *entInfo, mnode_t *node, const
                 localmaxs[2] = maxs2[2];
                 localmaxs[type] = dist;
                 iassert(BoxOnPlaneSide(localmins, maxs2, plane) == BOXSIDE_FRONT);
-                if (maxs2[type] > (double)dist)
+                if (maxs2[type] > dist)
                     R_FilterEntIntoCells_r(entInfo, node + 1, localmins, maxs2);
                 maxs2[0] = localmaxs[0];
                 maxs2[1] = localmaxs[1];
@@ -1430,7 +1442,7 @@ void __cdecl R_FilterDynEntIntoCells_r(
 
                 iassert(BoxOnPlaneSide(localmins, maxs2, plane) == BOXSIDE_FRONT);
 
-                if (maxs2[type] > (double)dist)
+                if (maxs2[type] > dist)
                     R_FilterDynEntIntoCells_r(node + 1, dynEntIndex, drawType, localmins, maxs2);
                 maxs2[0] = localmaxs[0];
                 maxs2[1] = localmaxs[1];
@@ -1889,11 +1901,11 @@ GfxPortal *__cdecl R_NextQueuedPortal()
         if (chosenChildIndex > dpvsGlob.queuedCount)
             break;
         if (chosenChildIndex < dpvsGlob.queuedCount
-            && dpvsGlob.portalQueue[chosenChildIndex].dist >(double)dpvsGlob.portalQueue[chosenChildIndex + 1].dist)
+            && dpvsGlob.portalQueue[chosenChildIndex].dist >dpvsGlob.portalQueue[chosenChildIndex + 1].dist)
         {
             chosenChildIndex = 2 * heapIndex + 2;
         }
-        if (dpvsGlob.portalQueue[chosenChildIndex].dist >= (double)dpvsGlob.portalQueue[dpvsGlob.queuedCount].dist)
+        if (dpvsGlob.portalQueue[chosenChildIndex].dist >= dpvsGlob.portalQueue[dpvsGlob.queuedCount].dist)
             break;
         dist = dpvsGlob.portalQueue[chosenChildIndex].dist;
         portalQueue = dpvsGlob.portalQueue;
@@ -1915,7 +1927,7 @@ int R_AssertValidQueue()
 
     for (queueIndex = 1; queueIndex < dpvsGlob.queuedCount; ++queueIndex)
     {
-        if (dpvsGlob.portalQueue[queueIndex].dist < (double)dpvsGlob.portalQueue[(queueIndex - 1) >> 1].dist)
+        if (dpvsGlob.portalQueue[queueIndex].dist < dpvsGlob.portalQueue[(queueIndex - 1) >> 1].dist)
             MyAssertHandler(
                 ".\\r_dpvs.cpp",
                 2347,
@@ -1988,7 +2000,7 @@ void __cdecl R_EnqueuePortal(GfxPortal *portal)
     for (heapIndex = dpvsGlob.queuedCount; ; heapIndex = (heapIndex - 1) >> 1)
     {
         parentIndex = (heapIndex - 1) >> 1;
-        if (parentIndex < 0 || dist >= (double)dpvsGlob.portalQueue[parentIndex].dist)
+        if (parentIndex < 0 || dist >= dpvsGlob.portalQueue[parentIndex].dist)
             break;
         v1 = dpvsGlob.portalQueue[parentIndex].dist;
         portalQueue = dpvsGlob.portalQueue;
@@ -2021,13 +2033,13 @@ double __cdecl R_FurthestPointOnWinding(const float (*points)[3], int pointCount
 
     v7 = Vec3Dot(plane->coeffs, (const float *)points) + plane->coeffs[3];
     v6 = Vec3Dot(plane->coeffs, &(*points)[3 * pointCount - 3]) + plane->coeffs[3];
-    if (v6 >= (double)v7)
+    if (v6 >= v7)
     {
         distMax = v6;
         for (pointIndexa = pointCount - 2; pointIndexa > 0; --pointIndexa)
         {
             v4 = Vec3Dot(plane->coeffs, &(*points)[3 * pointIndexa]) + plane->coeffs[3];
-            if (v4 < (double)distMax)
+            if (v4 < distMax)
                 break;
             distMax = v4;
         }
@@ -2038,7 +2050,7 @@ double __cdecl R_FurthestPointOnWinding(const float (*points)[3], int pointCount
         for (pointIndex = 1; pointIndex < pointCount - 1; ++pointIndex)
         {
             v5 = Vec3Dot(plane->coeffs, &(*points)[3 * pointIndex]) + plane->coeffs[3];
-            if (v5 < (double)distMax)
+            if (v5 < distMax)
                 break;
             distMax = v5;
         }
@@ -2427,6 +2439,7 @@ void __cdecl R_AddCellSurfacesAndCullGroupsInFrustumDelayed(
     dpvsDynamicCell.planeCount = planeCount;
     dpvsDynamicCell.frustumPlaneCount = frustumPlaneCount;
     dpvsDynamicCell.viewIndex = g_viewIndex; //*(_WORD *)(*((uint32_t *)NtCurrentTeb()->ThreadLocalStoragePointer + _tls_index) + 12);
+
     R_AddWorkerCmd(WRKCMD_DPVS_CELL_DYN_MODEL, (uint8_t *)&dpvsDynamicCell);
     R_AddWorkerCmd(WRKCMD_DPVS_CELL_SCENE_ENT, (uint8_t *)&dpvsDynamicCell);
     R_AddWorkerCmd(WRKCMD_DPVS_CELL_DYN_BRUSH, (uint8_t *)&dpvsDynamicCell);
@@ -2525,7 +2538,9 @@ void __cdecl R_InitSceneData(int localClientNum)
     for (cellIndex = 0; cellIndex < 2 * cellCount; ++cellIndex)
         Com_Memset(&rgp.world->dpvsPlanes.sceneEntCellBits[128 * cellIndex + offset], 0, 4 * (gfxCfg.entCount >> 5));
     memset((uint8_t *)dpvsGlob.entVisBits[localClientNum], 0, 4 * (gfxCfg.entCount >> 5));
-    memset((uint8_t *)scene.dpvs.entInfo[localClientNum], 0, 4 * gfxCfg.entCount);
+    // LP64: GfxEntCellRefInfo is a float/pointer union (8 bytes), not the
+    // ILP32 4 bytes, so size the clear by the element type.
+    memset((uint8_t *)scene.dpvs.entInfo[localClientNum], 0, sizeof(GfxEntCellRefInfo) * gfxCfg.entCount);
 }
 
 void __cdecl DynEntCl_InitFilter()
@@ -2559,8 +2574,11 @@ void __cdecl R_InitSceneBuffers()
         dpvsGlob.entVisBits[localClientNum] = (uint32_t *)R_AllocGlobalVariable(
             4 * (gfxCfg.entCount >> 5),
             "R_InitSceneBuffers");
+        // LP64: sizeof(GfxEntCellRefInfo) is 8 (it holds a GfxBrushModel *);
+        // the ILP32 4 * entCount allocation left the upper half of the
+        // entities writing past the end of the buffer.
         scene.dpvs.entInfo[localClientNum] = (GfxEntCellRefInfo *)R_AllocGlobalVariable(
-            4 * gfxCfg.entCount,
+            sizeof(GfxEntCellRefInfo) * gfxCfg.entCount,
             "R_InitSceneBuffers");
     }
 }
@@ -2832,6 +2850,9 @@ void __cdecl R_AddWorldSurfacesPortalWalk(int cameraCellIndex)
 
     iassert( Sys_IsMainThread() );
     iassert( rgp.world->dpvsPlanes.cellCount );
+#ifdef __SWITCH__
+    SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_PORTALWALK);
+#endif
     memset((uint8_t *)dpvsGlob.cellVisibleBits, 0, 4 * ((rgp.world->dpvsPlanes.cellCount + 31) >> 5));
     dpvsGlob.cellBits = dpvsGlob.cellVisibleBits;
     if (!r_skipPvs->current.enabled)
@@ -3069,13 +3090,13 @@ double __cdecl R_NearestPointOnWinding(const float (*points)[3], int pointCount,
 
     v7 = Vec3Dot(plane->coeffs, (const float *)points) + plane->coeffs[3];
     v6 = Vec3Dot(plane->coeffs, &(*points)[3 * pointCount - 3]) + plane->coeffs[3];
-    if (v6 <= (double)v7)
+    if (v6 <= v7)
     {
         distMin = v6;
         for (pointIndexa = pointCount - 2; pointIndexa > 0; --pointIndexa)
         {
             v4 = Vec3Dot(plane->coeffs, &(*points)[3 * pointIndexa]) + plane->coeffs[3];
-            if (v4 > (double)distMin)
+            if (v4 > distMin)
                 break;
             distMin = v4;
         }
@@ -3086,7 +3107,7 @@ double __cdecl R_NearestPointOnWinding(const float (*points)[3], int pointCount,
         for (pointIndex = 1; pointIndex < pointCount - 1; ++pointIndex)
         {
             v5 = Vec3Dot(plane->coeffs, &(*points)[3 * pointIndex]) + plane->coeffs[3];
-            if (v5 > (double)distMin)
+            if (v5 > distMin)
                 break;
             distMin = v5;
         }

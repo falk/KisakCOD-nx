@@ -138,7 +138,9 @@ struct client_fields_s // sizeof=0x14
     void(__cdecl *setter)(gclient_s *, const client_fields_s *);
     void(__cdecl *getter)(gclient_s *, const client_fields_s *);
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(client_fields_s) == 0x14);
+#endif
 
 struct VehicleLocalPhysics // sizeof=0x34
 {                                       // ...
@@ -146,7 +148,9 @@ struct VehicleLocalPhysics // sizeof=0x34
     int32_t hasGround;                      // ...
     int32_t onGround;                       // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(VehicleLocalPhysics) == 0x34);
+#endif
 
 struct VehiclePhysicsBackup // sizeof=0x1B8
 {                                       // ...
@@ -226,7 +230,9 @@ struct game_hudelem_field_t // sizeof=0x1C  (SP/MP same)
     void(__cdecl *setter)(game_hudelem_s *, int);
     void(__cdecl *getter)(game_hudelem_s *, int);
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(game_hudelem_field_t) == 0x1C);
+#endif
 
 
 

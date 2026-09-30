@@ -5,9 +5,16 @@
 #include <qcommon/threads.h>
 #include <universal/com_memory.h>
 #include "r_init.h"
+#ifndef __SWITCH__
+// Miles + the Win32 shell are excluded from the Switch boot closure;
+// cinematics play without their adapters there (loud failure arrives with
+// the audio/AV seam).
 #include <msslib/mss.h>
+#endif
 #include <sound/snd_local.h>
+#ifndef __SWITCH__
 #include <win32/win_local.h>
+#endif
 #include "rb_state.h"
 #include "r_image.h"
 #include <database/database.h>
@@ -497,7 +504,7 @@ char __cdecl R_Cinematic_StartPlayback_Now(const char *filename, uint32_t playba
     R_Cinematic_CheckBinkError();
     BinkSetMemory(R_Cinematic_Bink_Alloc, R_Cinematic_Bink_Free);
     R_Cinematic_CheckBinkError();
-#ifndef KISAK_OPENAL
+#if !defined(KISAK_OPENAL) && !defined(__SWITCH__)
     Driver = MSS_GetDriver();
     BinkSetSoundSystem(BinkOpenMiles, (uint32_t)Driver);
     R_Cinematic_CheckBinkError();

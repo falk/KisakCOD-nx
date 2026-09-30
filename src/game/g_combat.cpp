@@ -6,6 +6,7 @@
 #include "g_local.h"
 #include <script/scr_vm.h>
 #include <script/scr_const.h>
+#include <script/scr_stringlist.h>
 #include "g_main.h"
 #include <server/sv_public.h>
 #include "actor_senses.h"
@@ -405,7 +406,10 @@ void __cdecl G_DamageNotify(
     {
         //v36 = 2 * (modelIndex + 272);
         iassert(targ->attachTagNames[modelIndex - 1]);
-        modelName = SV_GetConfigstringConst(*((unsigned __int16 *)&targ->scripted + modelIndex + 1) + 1123); // CS_MODELS (PC SP, was Xbox 1155)
+        // LP64: was *((uint16_t *)&targ->scripted + modelIndex + 1), the ILP32
+        // address of attachModelNames[modelIndex - 1] (4-byte pointer, then the
+        // array). With an 8-byte `scripted` that read the pointer's bytes.
+        modelName = SV_GetConfigstringConst(targ->attachModelNames[modelIndex - 1] + 1123); // CS_MODELS (PC SP, was Xbox 1155)
         iassert(modelName);
         //Scr_AddConstString(*(unsigned __int16 *)(&targ->s.eType + v36));
         Scr_AddConstString(targ->attachTagNames[modelIndex - 1]);

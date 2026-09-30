@@ -1210,8 +1210,8 @@ void HECmd_ChangeFontScaleOverTime(scr_entref_t entref)
     double Float; // fp1
     double v3; // fp31
     const char *v4; // r3
-    long double v5; // fp2
-    long double v6; // fp2
+    double v5; // fp2
+    double v6; // fp2
 
     HudElem = HECmd_GetHudElem(entref);
     Float = Scr_GetFloat(0);

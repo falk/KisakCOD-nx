@@ -62,7 +62,11 @@ struct __declspec(align(128)) scrMemTreeGlob_t // sizeof=0xC0380
                                         // MT_DumpTree(void)+1FB/r ...
     int totalAllocBuckets;              // XREF: MT_DumpTree(void):loc_59E7AE/r
 };
+#ifndef KISAK_RETAIL_FS_STANDALONE
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(scrMemTreeGlob_t) == 0xC0380);
+#endif
+#endif
 
 static const char* mt_type_names[22] =
 {

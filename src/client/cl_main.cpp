@@ -8,7 +8,15 @@
 #include "cl_ui.h"
 #include <qcommon/cmd.h>
 #include <devgui/devgui.h>
+#ifdef __SWITCH__
+#include <universal/critical_section.h>
+#include <platform/switch/switch_input_lifecycle.h>
+#include <platform/switch/switch_platform.h>
+#include <port/switch_rumble.h>
+extern bool Sys_IsMainThread();
+#else
 #include <win32/win_local.h>
+#endif
 #include <server/sv_public.h>
 #include <universal/com_files.h>
 #include <universal/q_parse.h>
@@ -165,19 +173,6 @@ int __cdecl CL_LocalClientNumFromControllerIndex(unsigned int controllerIndex)
             controllerIndex,
             cl_controller_in_use);
     return 0;
-}
-
-int __cdecl CL_ControllerIndexFromClientNum(int clientIndex)
-{
-    if (clientIndex)
-        MyAssertHandler(
-            "c:\\trees\\cod3\\cod3src\\src\\client\\cl_main.cpp",
-            230,
-            0,
-            "clientIndex doesn't index STATIC_MAX_LOCAL_CLIENTS\n\t%i not in [0, %i)",
-            clientIndex,
-            1);
-    return cl_controller_in_use;
 }
 
 int __cdecl CL_GetFirstActiveControllerIndex()
@@ -642,7 +637,8 @@ void __cdecl CL_ResetSkeletonCache()
     //PIXSetMarker(0xFFFFFFFF, "CL_ResetSkeletonCache");
     if (!++clients[0].skelTimeStamp)
         clients[0].skelTimeStamp = 1;
-    clients[0].skelMemoryStart = (char *)((unsigned int)&clients[0].skelMemory[15] & 0xFFFFFFF0);
+    clients[0].skelMemoryStart = reinterpret_cast<char *>(
+        (reinterpret_cast<uintptr_t>(&clients[0].skelMemory[15]) & ~uintptr_t(0xF)));
     clients[0].skelMemPos = 0;
 }
 
@@ -654,12 +650,11 @@ void __cdecl CL_ClearState()
     CG_SetNextSnap(0);
     SND_StopSounds(SND_STOP_ALL);
     configstrings = clients[0].configstrings;
-    do
+    for (uint32_t configStringIndex = 0; configStringIndex < MAX_CONFIGSTRINGS; ++configStringIndex, ++configstrings)
     {
         if (*configstrings)
             SL_RemoveRefToString(*configstrings);
-        ++configstrings;
-    } while ((int)configstrings < (int)clients[0].mapname);
+    }
     memset(clients, 0, sizeof(clients));
     Com_ClientDObjClearAllSkel();
     memset(clientConnections, 0, sizeof(clientConnections));
@@ -764,7 +759,9 @@ void __cdecl CL_PacketEvent(msg_t *msg, int serverMessageSequence)
     messageNum = clients[0].snap.messageNum;
     clientConnections[0].serverMessageSequence = serverMessageSequence;
     clientConnections[0].lastPacketTime = cls.realtime;
+    
     CL_ParseServerMessage(msg);
+    
     if (cls.demorecording)
     {
         CL_WriteDemoMessage(msg, readcount);
@@ -1017,15 +1014,20 @@ cmd_function_s CL_DevGuiCmd_f_VAR;
 cmd_function_s CL_DevGuiOpen_f_VAR;
 void CL_InitDevGui()
 {
+    Com_Printf(0, "CL_InitDevGui: start\n");
     DevGui_Init();
     Cmd_AddCommandInternal("devgui_dvar", CL_DevGuiDvar_f, &CL_DevGuiDvar_f_VAR);
     Cmd_AddCommandInternal("devgui_cmd", CL_DevGuiCmd_f, &CL_DevGuiCmd_f_VAR);
     Cmd_AddCommandInternal("devgui_open", CL_DevGuiOpen_f, &CL_DevGuiOpen_f_VAR);
+    Com_Printf(0, "CL_InitDevGui: CL_CreateDevGui...\n");
     CL_CreateDevGui();
+    Com_Printf(0, "CL_InitDevGui: done\n");
 }
 
 void __cdecl CL_StartHunkUsers()
 {
+    Com_Printf(0, "CL_StartHunkUsers: begin (isRunning=%d uiStarted=%d devGuiStarted=%d)\n",
+               clientUIActives[0].isRunning, cls.uiStarted, cls.devGuiStarted);
     if (clientUIActives[0].isRunning)
     {
         if (!cls.rendererStarted)
@@ -1034,16 +1036,21 @@ void __cdecl CL_StartHunkUsers()
             MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\client\\cl_main.cpp", 1341, 0, "%s", "cls.soundStarted");
         if (!cls.uiStarted)
         {
+            Com_Printf(0, "CL_StartHunkUsers: calling CL_InitUI...\n");
             CL_InitUI();
+            Com_Printf(0, "CL_StartHunkUsers: CL_InitUI done.\n");
             Sys_LoadingKeepAlive();
         }
         if (!cls.devGuiStarted)
         {
             cls.devGuiStarted = 1;
+            Com_Printf(0, "CL_StartHunkUsers: calling CL_InitDevGui...\n");
             CL_InitDevGui();
+            Com_Printf(0, "CL_StartHunkUsers: CL_InitDevGui done.\n");
             Sys_LoadingKeepAlive();
         }
     }
+    Com_Printf(0, "CL_StartHunkUsers: end\n");
 }
 
 int __cdecl CL_ScaledMilliseconds()
@@ -1215,14 +1222,14 @@ void __cdecl CL_PlayLogo_f()
     int v1; // r3
     const char *v2; // r30
     const char *v3; // r3
-    long double v4; // fp2
-    long double v5; // fp2
+    double v4; // fp2
+    double v5; // fp2
     const char *v6; // r3
-    long double v7; // fp2
-    long double v8; // fp2
+    double v7; // fp2
+    double v8; // fp2
     const char *v9; // r3
-    long double v10; // fp2
-    long double v11; // fp2
+    double v10; // fp2
+    double v11; // fp2
     const char *v12; // r3
     const char *v13; // r3
 
@@ -1332,7 +1339,12 @@ void __cdecl CL_InitOnceForAllClients()
 
 void __cdecl CL_StopControllerRumbles()
 {
-    //CG_StopAllRumbles(0); // KISAKTODO
+    //CG_StopAllRumbles(0); // no CG-side rumble-graph system exists to
+    // stop (see switch_rumble.cpp's top comment); this is the explicit hard
+    // reset for the Switch HD Rumble path this port has instead.
+#ifdef __SWITCH__
+    Switch_RumbleStopAllDevices();
+#endif
 }
 
 void CL_Pause_f()
@@ -1563,17 +1575,6 @@ Font_s *__cdecl CL_RegisterFont(const char *fontName, int imageTrack)
     return R_RegisterFont(fontName, imageTrack);
 }
 
-static bool cl_skipRendering;
-void __cdecl CL_SetSkipRendering(bool skip)
-{
-    cl_skipRendering = skip;
-}
-
-bool __cdecl CL_SkipRendering()
-{
-    return cl_skipRendering;
-}
-
 void __cdecl CL_UpdateSound()
 {
     PROF_SCOPED("update sound");
@@ -1604,6 +1605,13 @@ void __cdecl CL_ShutdownRenderer(int destroyWindow)
 void __cdecl CL_ShutdownAll(bool destroyWindow)
 {
     R_SyncRenderThread();
+#ifdef __SWITCH__
+    // R_SyncRenderThread drains the engine command handoff, but the deko3d
+    // GPU queue can still hold submitted work. Wait for it to go idle before
+    // releasing hunk/asset state during map reload, so deko9 never flushes
+    // against torn-down objects.
+    R_SwitchWaitForGpuIdle();
+#endif
     CL_ShutdownHunkUsers();
 
     if (cls.rendererStarted)
@@ -1793,7 +1801,6 @@ cmd_function_s CL_StopControllerRumbles_VAR;
 void __cdecl CL_Init(int localClientNum)
 {
     int v21; // r28
-    const dvar_s **v22; // r29
     const char *v23; // r5
     unsigned __int16 v24; // r4
     const char *v26; // r5
@@ -1868,14 +1875,11 @@ void __cdecl CL_Init(int localClientNum)
         0x4001u,
         "Used by script for keeping track of cheats");
 
-    v21 = 0;
-    v22 = arcadeScore;
-    do
+    for (v21 = 0; v21 < ARRAY_COUNT(arcadeScore); ++v21)
     {
         Com_sprintf(v29, 32, "s%d", v21);
-        *v22++ = Dvar_RegisterInt(v29, 0, 0, 0x7FFFFFFF, 0x4001u, "Used by script for keeping track of arcade scores");
-        ++v21;
-    } while ((int)v22 < (int)&arcadeScore[19]);
+        arcadeScore[v21] = Dvar_RegisterInt(v29, 0, 0, 0x7FFFFFFF, 0x4001u, "Used by script for keeping track of arcade scores");
+    }
 
     input_invertPitch = Dvar_RegisterBool("input_invertPitch", 0, 0x400u, "Invert gamepad pitch");
     input_viewSensitivity = Dvar_RegisterFloat("input_viewSensitivity", 1.0, 0.000099999997, 5.0, 0, 0);
@@ -1931,4 +1935,3 @@ void __cdecl CL_Init(int localClientNum)
     clients[0].usingAds = 0;
     Com_Printf(CON_CHANNEL_CLIENT, "----- Client Initialization Complete -----\n");
 }
-

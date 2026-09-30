@@ -98,7 +98,7 @@ struct CustomSearchInfo_FindPathWithWidth
 
         v5 = (float)(pSuccessor->constant.vOrigin[0] - vGoalPos[0]);
         v6 = (float)(pSuccessor->constant.vOrigin[1] - vGoalPos[1]);
-        // KISAKFIX: IDA decompile declares `long double v7 = exp(a4)` (8 bytes); kisak port
+        // KISAKFIX: IDA decompile declares `double v7 = exp(a4)` (8 bytes); kisak port
         // collapsed v7 to float (4 bytes) but kept the `*(double*)&v7` read pattern, which
         // on x86 reads 4 bytes of v7 + 4 bytes of stack garbage. Use double to match IDA.
         double v7 = exp(a4);
@@ -109,7 +109,7 @@ struct CustomSearchInfo_FindPathWithWidth
         return v8;
 
         //double v4; // xmm0_8
-        //long double v6; // [esp-18h] [ebp-3Ch]
+        //double v6; // [esp-18h] [ebp-3Ch]
         //float v7; // [esp+8h] [ebp-1Ch] BYREF
         //float dist; // [esp+Ch] [ebp-18h]
         //float *vOrigin; // [esp+10h] [ebp-14h]

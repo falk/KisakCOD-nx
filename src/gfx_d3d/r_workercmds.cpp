@@ -16,10 +16,15 @@
 #include <win32/win_net.h>
 #include <win32/win_local.h>
 #include "rb_logfile.h"
+#include <database/db_retail_frame_evidence.h>
 #include "r_setstate_d3d.h"
 #include "r_model_pose.h"
 
 #include <setjmp.h>
+
+#include <universal/spin_pause.h>
+
+#include <port/switch_perf.h>
 
 void(__cdecl *g_cmdExecFailed[WRKCMD_COUNT])();
 volatile WorkerCmdType g_waitTypeMainThread;
@@ -218,7 +223,7 @@ int __cdecl R_ProcessWorkerCmd(WorkerCmdType type)
     int v2; // eax
     int v3; // eax
     uint32_t bufCount; // [esp+0h] [ebp-7A4h]
-    uint8_t data[1920]; // [esp+4h] [ebp-7A0h] BYREF
+    alignas(16) uint8_t data[1920]; // [esp+4h] [ebp-7A0h] BYREF
     int dataSize; // [esp+788h] [ebp-1Ch]
     WorkerCmds *workerCmds; // [esp+78Ch] [ebp-18h]
     uint32_t currentCount; // [esp+790h] [ebp-14h]
@@ -306,6 +311,9 @@ int __cdecl R_ProcessWorkerCmd(WorkerCmdType type)
 void __cdecl R_ProcessWorkerCmdInternal(WorkerCmdType type, void *data)
 {
     R_NotifyWorkerCmdType(type);
+    // count the DPVS/skin command as executed, whichever path ran it
+    // (inline synchronous fallback or a real worker thread).
+    RetailKillhouseFrameEvidenceNoteWorkerCmd((uint32_t)type);
     switch (type)
     {
     case WRKCMD_UPDATE_FX_SPOT_LIGHT:
@@ -330,7 +338,14 @@ void __cdecl R_ProcessWorkerCmdInternal(WorkerCmdType type, void *data)
         R_AddCellDynBrushSurfacesInFrustumCmd((const DpvsDynamicCellCmd *)data);
         break;
     case WRKCMD_DPVS_ENTITY:
-        R_AddEntitySurfacesInFrustumCmd((uint16_t *)data);
+#ifdef __SWITCH__
+    {
+        SWITCH_PERF_THREAD_SCOPE(SWITCH_PERF_SCENE_DOBJ_CULL);
+#endif
+        R_AddEntitySurfacesInFrustumCmd((const DpvsEntityCmd *)data);
+#ifdef __SWITCH__
+    }
+#endif
         break;
     case WRKCMD_ADD_SCENE_ENT:
         R_AddAllSceneEntSurfacesCamera(*(const GfxViewInfo **)data);
@@ -342,10 +357,24 @@ void __cdecl R_ProcessWorkerCmdInternal(WorkerCmdType type, void *data)
         R_GenerateShadowCookiesCmd((ShadowCookieCmd *)data);
         break;
     case WRKCMD_BOUNDS_ENT_DELAYED:
+#ifdef __SWITCH__
+    {
+        SWITCH_PERF_THREAD_SCOPE(SWITCH_PERF_ENTS_PRED_BOUNDS);
+#endif
         R_UpdateGfxEntityBoundsCmd((GfxSceneEntity **)data);
+#ifdef __SWITCH__
+    }
+#endif
         break;
     case WRKCMD_SKIN_ENT_DELAYED:
+#ifdef __SWITCH__
+    {
+        SWITCH_PERF_THREAD_SCOPE(SWITCH_PERF_ENTS_PRED_SKIN);
+#endif
         R_SkinGfxEntityCmd((GfxSceneEntity **)data);
+#ifdef __SWITCH__
+    }
+#endif
         break;
     case WRKCMD_GENERATE_FX_VERTS:
         if (!dx.deviceLost)
@@ -359,7 +388,14 @@ void __cdecl R_ProcessWorkerCmdInternal(WorkerCmdType type, void *data)
         R_SkinCachedStaticModelCmd((SkinCachedStaticModelCmd *)data);
         break;
     case WRKCMD_SKIN_XMODEL:
+#ifdef __SWITCH__
+    {
+        SWITCH_PERF_THREAD_SCOPE(SWITCH_PERF_SCENE_XMODEL_SKIN);
+#endif
         R_SkinXModelCmd((WORD*)data);
+#ifdef __SWITCH__
+    }
+#endif
         break;
     default:
         if (!alwaysfails)
@@ -387,75 +423,37 @@ void R_InitWorkerThreads()
     }
 }
 
+// Each queue's element size is the native size of the command it carries, and
+// its capacity is the retail command count (the arrays above are declared with
+// those counts). The ILP32 byte literals truncated every pointer-carrying
+// command (FxCmd, DPVS cells, entity pointers, skin commands) on LP64. The
+// inline path never copied through these queues, so the truncation only
+// surfaced once real worker threads started consuming them.
+#define R_WORKER_CMD_QUEUE(type, array)                                           \
+    static_assert(sizeof((array)[0]) <= 192, "worker cmd exceeds the 192-byte slot"); \
+    g_workerCmds[type].buf = (uint8_t *)(array);                                  \
+    g_workerCmds[type].bufSize = sizeof(array);                                   \
+    g_workerCmds[type].dataSize = sizeof((array)[0])
+
 int R_InitWorkerCmds()
 {
-    g_workerCmds[WRKCMD_UPDATE_FX_SPOT_LIGHT].buf = (uint8_t *)g_UpdateFxSpotLightBuf;
-    g_workerCmds[WRKCMD_UPDATE_FX_SPOT_LIGHT].bufSize = 12;
-    g_workerCmds[WRKCMD_UPDATE_FX_SPOT_LIGHT].dataSize = 12;
-
-    g_workerCmds[WRKCMD_UPDATE_FX_NON_DEPENDENT].buf = (uint8_t *)g_UpdateFxNonDependentBuf;
-    g_workerCmds[WRKCMD_UPDATE_FX_NON_DEPENDENT].bufSize = 12;
-    g_workerCmds[WRKCMD_UPDATE_FX_NON_DEPENDENT].dataSize = 12;
-
-    g_workerCmds[WRKCMD_UPDATE_FX_REMAINING].buf = (uint8_t *)g_UpdateFxRemainingBuf;
-    g_workerCmds[WRKCMD_UPDATE_FX_REMAINING].bufSize = 12;
-    g_workerCmds[WRKCMD_UPDATE_FX_REMAINING].dataSize = 12;
-
-    g_workerCmds[WRKCMD_DPVS_CELL_STATIC].buf = (uint8_t *)g_dpvsCellStaticBuf;
-    g_workerCmds[WRKCMD_DPVS_CELL_STATIC].bufSize = 3072;
-    g_workerCmds[WRKCMD_DPVS_CELL_STATIC].dataSize = 12;
-
-    g_workerCmds[WRKCMD_DPVS_CELL_SCENE_ENT].buf = (uint8_t *)g_dpvsCellSceneEntBuf;
-    g_workerCmds[WRKCMD_DPVS_CELL_SCENE_ENT].bufSize = 6144;
-    g_workerCmds[WRKCMD_DPVS_CELL_SCENE_ENT].dataSize = 12;
-
-    g_workerCmds[WRKCMD_DPVS_CELL_DYN_MODEL].buf = (uint8_t *)g_dpvsCellDynModelBuf;
-    g_workerCmds[WRKCMD_DPVS_CELL_DYN_MODEL].bufSize = 6144;
-    g_workerCmds[WRKCMD_DPVS_CELL_DYN_MODEL].dataSize = 12;
-
-    g_workerCmds[WRKCMD_DPVS_CELL_DYN_BRUSH].buf = (uint8_t *)g_dpvsCellDynBrushBuf;
-    g_workerCmds[WRKCMD_DPVS_CELL_DYN_BRUSH].bufSize = 6144;
-    g_workerCmds[WRKCMD_DPVS_CELL_DYN_BRUSH].dataSize = 12;
-
-    g_workerCmds[WRKCMD_DPVS_ENTITY].buf = (uint8_t *)g_dpvsEntityBuf;
-    g_workerCmds[WRKCMD_DPVS_ENTITY].bufSize = 0x8000;
-    g_workerCmds[WRKCMD_DPVS_ENTITY].dataSize = 16;
-
-    g_workerCmds[WRKCMD_ADD_SCENE_ENT].buf = (uint8_t *)g_addSceneEntBuf;
-    g_workerCmds[WRKCMD_ADD_SCENE_ENT].bufSize = 4;
-    g_workerCmds[WRKCMD_ADD_SCENE_ENT].dataSize = 4;
-
-    g_workerCmds[WRKCMD_SPOT_SHADOW_ENT].buf = (uint8_t *)g_spotShadowEntBuf;
-    g_workerCmds[WRKCMD_SPOT_SHADOW_ENT].bufSize = 2048;
-    g_workerCmds[WRKCMD_SPOT_SHADOW_ENT].dataSize = 8;
-
-    g_workerCmds[WRKCMD_SHADOW_COOKIE].buf = (uint8_t *)g_shadowCookieBuf;
-    g_workerCmds[WRKCMD_SHADOW_COOKIE].bufSize = 16;
-    g_workerCmds[WRKCMD_SHADOW_COOKIE].dataSize = 16;
-
-    g_workerCmds[WRKCMD_BOUNDS_ENT_DELAYED].buf = (uint8_t *)g_GfxEntityBoundsBuf;
-    g_workerCmds[WRKCMD_BOUNDS_ENT_DELAYED].bufSize = 1024;
-    g_workerCmds[WRKCMD_BOUNDS_ENT_DELAYED].dataSize = 4;
-
-    g_workerCmds[WRKCMD_SKIN_ENT_DELAYED].buf = (uint8_t *)g_SkinGfxEntityBuf;
-    g_workerCmds[WRKCMD_SKIN_ENT_DELAYED].bufSize = 4096;
-    g_workerCmds[WRKCMD_SKIN_ENT_DELAYED].dataSize = 4;
-
-    g_workerCmds[WRKCMD_GENERATE_FX_VERTS].buf = (uint8_t *)g_GenerateFxVertsBuf;
-    g_workerCmds[WRKCMD_GENERATE_FX_VERTS].bufSize = 136;
-    g_workerCmds[WRKCMD_GENERATE_FX_VERTS].dataSize = 68;
-
-    g_workerCmds[WRKCMD_GENERATE_MARK_VERTS].buf = (uint8_t *)g_GenerateMarkVertsBuf;
-    g_workerCmds[WRKCMD_GENERATE_MARK_VERTS].bufSize = 12;
-    g_workerCmds[WRKCMD_GENERATE_MARK_VERTS].dataSize = 12;
-
-    g_workerCmds[WRKCMD_SKIN_CACHED_STATICMODEL].buf = (uint8_t *)g_skinCachedStaticModelBuf;
-    g_workerCmds[WRKCMD_SKIN_CACHED_STATICMODEL].bufSize = 2048;
-    g_workerCmds[WRKCMD_SKIN_CACHED_STATICMODEL].dataSize = 4;
-
-    g_workerCmds[WRKCMD_SKIN_XMODEL].buf = (uint8_t *)g_SkinXModelBuf;
-    g_workerCmds[WRKCMD_SKIN_XMODEL].bufSize = 28672;
-    g_workerCmds[WRKCMD_SKIN_XMODEL].dataSize = 28;
+    R_WORKER_CMD_QUEUE(WRKCMD_UPDATE_FX_SPOT_LIGHT, g_UpdateFxSpotLightBuf);
+    R_WORKER_CMD_QUEUE(WRKCMD_UPDATE_FX_NON_DEPENDENT, g_UpdateFxNonDependentBuf);
+    R_WORKER_CMD_QUEUE(WRKCMD_UPDATE_FX_REMAINING, g_UpdateFxRemainingBuf);
+    R_WORKER_CMD_QUEUE(WRKCMD_DPVS_CELL_STATIC, g_dpvsCellStaticBuf);
+    R_WORKER_CMD_QUEUE(WRKCMD_DPVS_CELL_SCENE_ENT, g_dpvsCellSceneEntBuf);
+    R_WORKER_CMD_QUEUE(WRKCMD_DPVS_CELL_DYN_MODEL, g_dpvsCellDynModelBuf);
+    R_WORKER_CMD_QUEUE(WRKCMD_DPVS_CELL_DYN_BRUSH, g_dpvsCellDynBrushBuf);
+    R_WORKER_CMD_QUEUE(WRKCMD_DPVS_ENTITY, g_dpvsEntityBuf);
+    R_WORKER_CMD_QUEUE(WRKCMD_ADD_SCENE_ENT, g_addSceneEntBuf);
+    R_WORKER_CMD_QUEUE(WRKCMD_SPOT_SHADOW_ENT, g_spotShadowEntBuf);
+    R_WORKER_CMD_QUEUE(WRKCMD_SHADOW_COOKIE, g_shadowCookieBuf);
+    R_WORKER_CMD_QUEUE(WRKCMD_BOUNDS_ENT_DELAYED, g_GfxEntityBoundsBuf);
+    R_WORKER_CMD_QUEUE(WRKCMD_SKIN_ENT_DELAYED, g_SkinGfxEntityBuf);
+    R_WORKER_CMD_QUEUE(WRKCMD_GENERATE_FX_VERTS, g_GenerateFxVertsBuf);
+    R_WORKER_CMD_QUEUE(WRKCMD_GENERATE_MARK_VERTS, g_GenerateMarkVertsBuf);
+    R_WORKER_CMD_QUEUE(WRKCMD_SKIN_CACHED_STATICMODEL, g_skinCachedStaticModelBuf);
+    R_WORKER_CMD_QUEUE(WRKCMD_SKIN_XMODEL, g_SkinXModelBuf);
 
     return R_InitWorkerCmdsPos();
 }
@@ -497,6 +495,10 @@ void __cdecl  R_WorkerThread()
     if (setjmp(*(jmp_buf *)Value))
         Com_ErrorAbort();
     Profile_Guard(1);
+#ifdef __SWITCH__
+    SwitchPerf_MarkWorkerThread();
+    const int perfWorker = Sys_GetCurrentThreadId() == threadId[THREAD_CONTEXT_WORKER1] ? 1 : 0;
+#endif
 
     while (1)
     {
@@ -508,7 +510,14 @@ void __cdecl  R_WorkerThread()
         }
         {
             PROF_SCOPED("WorkerThread");
+#ifdef __SWITCH__
+            const uint64_t perfStart = SwitchPerf_g_enabled ? SwitchPerf_NowTicks() : 0;
             R_ProcessWorkerCmds();
+            if (perfStart)
+                SwitchPerf_AddWorkerTicks(perfWorker, SwitchPerf_NowTicks() - perfStart);
+#else
+            R_ProcessWorkerCmds();
+#endif
         }
     }
 }
@@ -537,10 +546,11 @@ void __cdecl R_AddWorkerCmd(WorkerCmdType type, uint8_t *data)
                 InterlockedExchangeAdd((LONG*)&workerCmds->endPos, -bufSize);
             memcpy(&workerCmds->buf[endPos], data, dataSize);
             Destination = (LONG*)&workerCmds->syncedEndPos;
+            uint32_t spin = 0;
             do
             {
                 while (*Destination != endPos)
-                    ;
+                    Sys_SpinPause(spin++);
             } while (InterlockedCompareExchange(Destination, (dataSize + endPos) % bufSize, endPos) != endPos);
             InterlockedExchangeAdd((LONG*)&workerCmds->outSize, 1);
             R_NotifyWorkerCmdType(type);
@@ -631,4 +641,3 @@ void __cdecl R_WaitWorkerCmds()
 
     R_ProcessWorkerCmdsWithTimeout(R_FinishedWorkerCmds, 1);
 }
-

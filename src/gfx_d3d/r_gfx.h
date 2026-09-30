@@ -232,6 +232,7 @@ struct GfxImage // sizeof=0x24
     bool noPicmip;
     uint8_t semantic;
     uint8_t track;
+    bool substitutedTexture; // Runtime provenance, occupies existing padding.
     // padding byte
     // padding byte
     // padding byte
@@ -243,7 +244,9 @@ struct GfxImage // sizeof=0x24
     bool delayLoadPixels;
     const char* name;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(GfxImage) == 36);
+#endif
 
 struct GfxCodeMatrices // sizeof=0x800
 {                                       // ...
@@ -364,6 +367,18 @@ struct GfxDelayedCmdBuf // sizeof=0x10
     uint32_t primDrawSurfSize;
     GfxDrawSurf drawSurfKey;
 };
+
+// LP64: the
+// prim-draw-surf stream (frontEndDataOut->primDrawSurfsBuf,
+// r_rendercmds.h) is a flat uint32_t-word buffer. The static-model draw
+// path stores one raw XSurface* per queued surface group directly in that
+// stream (R_AddDelayedStaticModelDrawSurf / R_GetNextStaticModelSurf /
+// R_GetNextStaticModelCachedSurf). On the ILP32 reference ABI a pointer is
+// exactly one word, so every writer/reader of that slot hardcoded "1" (or a
+// "+2" total including the leading count word); on LP64 the same pointer
+// needs two words. This is the one word count every such site must use.
+#define PRIM_DRAW_SURF_PTR_WORDS \
+    ((uint32_t)((sizeof(void *) + sizeof(uint32_t) - 1) / sizeof(uint32_t)))
 struct GfxBspDrawSurfData // sizeof=0x18
 {                                       // ...
     GfxDelayedCmdBuf delayedCmdBuf;
@@ -395,7 +410,9 @@ struct GfxWorldDpvsStatic // sizeof=0x68
     uint32_t* surfaceCastsSunShadow; // ...
     volatile int usageCount;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(GfxWorldDpvsStatic) == 0x68);
+#endif
 
 using EntVisData = byte *[3];
 
@@ -672,7 +689,9 @@ struct GfxPixelShaderLoadDef // sizeof=0x8
     uint16_t programSize;
     uint16_t loadForRenderer;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(GfxPixelShaderLoadDef) == 8);
+#endif
 
 struct GfxDepthOfField // sizeof=0x20
 {                                       // ...

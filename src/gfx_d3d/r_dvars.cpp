@@ -48,6 +48,7 @@
  const dvar_t *r_cacheSModelLighting;
  const dvar_t *r_drawEntities;
  const dvar_t *r_distortion;
+ const dvar_t *r_distortionResolveOnDemand;
  const dvar_t *r_filmUseTweaks;
  const dvar_t *r_drawBModels;
  const dvar_t *r_drawXModels;
@@ -84,6 +85,7 @@
  const dvar_t *r_dof_viewModelEnd;
  const dvar_t *r_matTwkPreviewSize;
  const dvar_t *r_outdoorFeather;
+ const dvar_t *r_outdoorDebug;
  const dvar_t *r_diffuseColorScale;
  const dvar_t *r_texFilterAnisoMax;
  const dvar_t *r_drawPrimCap;
@@ -191,7 +193,56 @@
  const dvar_t *r_envMapSunIntensity;
  const dvar_t *r_highLodDist;
  const dvar_t *r_forceLod;
- const dvar_t *r_logFile;
+  const dvar_t *r_logFile;
+  const dvar_t *r_captureRing;
+  const dvar_t *r_deko9Verify;
+  const dvar_t *r_deko9EarlyZ;
+  const dvar_t *r_deko9HazardCache;
+  const dvar_t *r_deko9ConstFast;
+  const dvar_t *r_deko9TexIncremental;
+  const dvar_t *r_deko9StaticHazard;
+  const dvar_t *r_deko9Instancing;
+  const dvar_t *r_deko9StaticPretess;
+  const dvar_t *r_deko9StaticPretessModels;
+  const dvar_t *r_renderResolution;
+  const dvar_t *r_fsrSharpness;
+  const dvar_t *r_fsrMode;
+  const dvar_t *r_dynres;
+  const dvar_t *r_dynresBudgetMs;
+  const dvar_t *r_dynresMin;
+  const dvar_t *r_dynresMax;
+  const dvar_t *r_dynresForceScale;
+  const dvar_t *r_dynresFakeGpuMs;
+  const dvar_t *r_dynresFakeWave;
+  const dvar_t *r_deko9GpuPasses;
+  const dvar_t *r_deko9RtCompression;
+  const dvar_t *r_deko9LightBarriers;
+  const dvar_t *r_halfResParticles;
+  const dvar_t *r_halfResParticlesUpsample;
+  const dvar_t *r_halfResParticlesDepthTol;
+  const dvar_t *r_halfResParticlesStats;
+  const dvar_t *r_halfResParticlesOrder;
+  const dvar_t *r_halfResParticlesDebug;
+  const dvar_t *r_halfResParticlesHw;
+  const dvar_t *r_deko9NativeFloatZ;
+  const dvar_t *r_deko9ZcullStats;
+  const dvar_t *r_shadowFilter;
+  const dvar_t *r_deko9Census;
+  const dvar_t *r_deko9FaultTrace;
+  const dvar_t *r_deko9GpuMap;
+  const dvar_t *r_deko9DrawCensus;
+  const dvar_t *r_deko9DrawCensusPasses;
+  const dvar_t *r_deko9DrawCensusFrames;
+  const dvar_t *r_deko9DrawCensusGroups;
+  const dvar_t *r_deko9SkipEmissive;
+  const dvar_t *r_deko9EmissiveTour;
+  const dvar_t *r_deko9EmissiveTourSpots;
+  const dvar_t *r_deko9EmissiveTourGroups;
+  const dvar_t *r_deko9EmissiveTourTimes;
+  const dvar_t *r_deko9EmissiveTourShots;
+  const dvar_t *r_deko9EmissiveTourPaused;
+ const dvar_t *r_view2dAlphaDiag;
+ const dvar_t *r_view2dAlphaSkip;
  const dvar_t *r_normalMap;
  const dvar_t *r_outdoorDownBias;
  const dvar_t *r_texFilterDisable;
@@ -202,6 +253,7 @@
  const dvar_t *r_portalBevelsOnly;
  const dvar_t *r_showCullSModels;
  const dvar_t *r_skipDrawTris;
+ const dvar_t *r_portDebugChecks;
  const dvar_t *sc_debugCasterCount;
  const dvar_t *r_dof_farEnd;
  const dvar_t *r_znear;
@@ -227,6 +279,15 @@
  const dvar_t *r_skinCache;
  const dvar_t *r_fastSkin;
  const dvar_t *r_smc_enable;
+#ifdef __SWITCH__
+ const dvar_t *r_smc_admitUnlinked;
+#endif
+// staticissue.md test 3 (killhouse static-model pile): force every static
+// model through the skinned funnel, which draws the validated CPU
+// xsurf->verts0/triIndices through the engine's dynamic buffers instead of
+// the per-zone block-7/8 GPU buffers. Diagnostic only: if the pile
+// disappears, the zone geometry buffer upload/offset association is wrong;
+// if it remains, the decode/draw association is wrong.
  const dvar_t *r_pretess;
  const dvar_t *r_picmip_manual;
  const dvar_t *r_picmip;
@@ -579,6 +640,10 @@
      r_skinCache = Dvar_RegisterBool("r_skinCache", true, DVAR_NOFLAG, "Enable cache for vertices of animated models");
      r_fastSkin = Dvar_RegisterBool("r_fastSkin", false, DVAR_ARCHIVE, "Enable fast model skinning");
      r_smc_enable = Dvar_RegisterBool("r_smc_enable", true, DVAR_NOFLAG, "Enable static model cache");
+#ifdef __SWITCH__
+     r_smc_admitUnlinked = Dvar_RegisterBool("r_smc_admitUnlinked", true, DVAR_NOFLAG,
+         "Admit static model LODs the linker left out of the cache when they fit its block classes");
+#endif
      r_pretess = Dvar_RegisterBool("r_pretess", true, DVAR_NOFLAG, "Batch surfaces to reduce primitive count");
      minb.value.max = FLT_MAX;
      minb.value.min = 0.0f;
@@ -687,12 +752,32 @@
          1,
          DVAR_CHEAT,
          "Replace all lightmaps with pure black or pure white");
+     // Port diagnostics are deliberately DVAR_NOFLAG, never DVAR_ARCHIVE: an
+     // archived value survives in config.cfg and silently reshapes later
+     // "control" runs (an archived r_fullbright "1" persisted across boots and
+     // overrode the NRO's own command line). Set them per run from the +exec
+     // diagnostic config.
      r_colorMap = Dvar_RegisterEnum(
          "r_colorMap",
          colorMapNames,
          1,
          DVAR_CHEAT,
          "Replace all color maps with pure black or pure white");
+     r_view2dAlphaDiag = Dvar_RegisterBool(
+         "r_view2dAlphaDiag",
+         0,
+         DVAR_NOFLAG,
+         "Port diagnostic: log a 'VIEW2D_ALPHA' line (once/sec per material) for every 2D stretch-pic draw "
+         "covering at least 40% of the display, with its material name, vertex alpha and which GPU pass "
+         "(view2d/hud2d) it landed in. See RB_StretchPicCmd (rb_backend.cpp).");
+     r_view2dAlphaSkip = Dvar_RegisterBool(
+         "r_view2dAlphaSkip",
+         true,
+         DVAR_NOFLAG,
+         "Drop a 2D stretch-pic draw (menu/HUD background, screen fade, etc.) before it is queued as a render "
+         "command when its vertex alpha is 0 and the material's blend mode makes that a no-op (identical "
+         "pixels; skips full-screen invisible quads in the view2d GPU pass). 0 restores the old always-draw "
+         "behavior for A/B. See Material_2DZeroAlphaIsNoOp (r_rendercmds.cpp).");
      r_normalMap = Dvar_RegisterEnum(
          "r_normalMap",
          normalMapNames,
@@ -852,12 +937,391 @@
          0,
          DVAR_CHEAT,
          "Draws a histogram of the sizes of each primitive batch");
-     r_logFile = Dvar_RegisterInt(
-         "r_logFile",
-         0,
-         (DvarLimits)0x7FFFFFFF00000000LL,
-         DVAR_NOFLAG,
-         "Write all graphics hardware calls for this many frames to a logfile");
+      r_logFile = Dvar_RegisterInt(
+          "r_logFile",
+          0,
+          (DvarLimits)0x7FFFFFFF00000000LL,
+          DVAR_NOFLAG,
+          "Write all graphics hardware calls for this many frames to a logfile");
+      r_captureRing = Dvar_RegisterBool(
+          "r_captureRing",
+          0,
+          DVAR_NOFLAG,
+          "Write every 15th presented frame to sdmc:/switch/kisakcod/screenshot_NN.bmp (10-slot ring) for remote debugging");
+      r_deko9Verify = Dvar_RegisterBool(
+          "r_deko9Verify",
+          0,
+          DVAR_NOFLAG,
+          "deko3d renderer: re-derive every draw's binding, vertex input and constants the slow way and compare "
+          "with the native fast path (FAIL:DEKO9_FASTPATH_MISMATCH / DEKO9_FASTPATH_VERIFY)");
+      r_deko9EarlyZ = Dvar_RegisterBool(
+          "r_deko9EarlyZ",
+          1,
+          DVAR_NOFLAG,
+          "deko3d renderer: draws that test depth but write neither depth nor stencil use the pixel shader's "
+          "early-fragment-tests variant when it can discard (texkill or alpha test), so hidden pixels skip the shader");
+      // Per-draw CPU fast paths (deko9_native.h Deko9_SetPerDraw), each
+      // re-derived per draw by r_deko9Verify.
+      r_deko9HazardCache = Dvar_RegisterBool(
+          "r_deko9HazardCache",
+          1,
+          DVAR_NOFLAG,
+          "deko3d renderer: a draw with the previous draw's sampled images and render targets, and no barrier or "
+          "other hazard-tracked operation since, skips hazard evaluation");
+      r_deko9ConstFast = Dvar_RegisterBool(
+          "r_deko9ConstFast",
+          1,
+          DVAR_NOFLAG,
+          "deko3d renderer: shader-constant pushes checked with a per-stage any-dirty flag instead of scanning "
+          "the dirty bitmask");
+      r_deko9TexIncremental = Dvar_RegisterBool(
+          "r_deko9TexIncremental",
+          1,
+          DVAR_NOFLAG,
+          "deko3d renderer: a texture/shader binding change re-resolves only the sampler slots whose texture or "
+          "sampler state changed");
+      // Off reverts to full per-draw hazard tracking of every sampled
+      // store, for the A/B pixel proof
+      // via r_deko9EmissiveTourShots.
+      r_deko9StaticHazard = Dvar_RegisterBool(
+          "r_deko9StaticHazard",
+          1,
+          DVAR_NOFLAG,
+          "deko3d renderer: a store never used as a render/depth/blit target is added to a draw's hazard set only "
+          "when newly bound or a copy wrote it while it stayed bound, instead of every draw it is sampled");
+      r_deko9Instancing = Dvar_RegisterBool(
+          "r_deko9Instancing",
+          1,
+          DVAR_NOFLAG,
+          "deko3d renderer: draw runs of rigid static models with one instanced draw (per-instance vertex "
+          "constants from an instance stream) instead of one draw per model");
+      r_deko9StaticPretess = Dvar_RegisterBool(
+          "r_deko9StaticPretess",
+          1,
+          DVAR_NOFLAG,
+          "deko3d renderer: draw world (BSP and brush-model) triangles as ranges of one static index buffer built "
+          "at map load instead of copying their indices into the dynamic index buffers every frame");
+      r_deko9StaticPretessModels = Dvar_RegisterBool(
+          "r_deko9StaticPretessModels",
+          1,
+          DVAR_NOFLAG,
+          "deko3d renderer: draw cached static-model lists from the model's static "
+          "index buffer, one ranged draw per instance (cache slot as base vertex), instead of copying every "
+          "instance's indices each frame");
+      {
+          // Render resolution (deko3d only). The engine renders exactly as if
+          // the screen were this size (vidConfig, back buffer, every target,
+          // HUD); deko9 upscales the finished frame to the 1280x720 swapchain
+          // at present with the r_fsrMode pass. Latched: applies when the
+          // device is created (startup; deko9 cannot Reset to a new size).
+          static const char *renderResolutionNames[] = {"960x540", "1024x576", "1088x612", "1152x648", "1280x720",
+                                                        nullptr};
+          r_renderResolution = Dvar_RegisterEnum(
+              "r_renderResolution",
+              renderResolutionNames,
+              4,
+              DVAR_ARCHIVE | DVAR_LATCH,
+              "deko3d renderer: internal render resolution; below 1280x720 the frame is upscaled at present "
+              "with r_fsrMode (applies at startup)");
+          DvarLimits fsrLimits;
+          fsrLimits.value.min = 0.0f;
+          fsrLimits.value.max = 4.0f;
+          r_fsrSharpness = Dvar_RegisterFloat(
+              "r_fsrSharpness",
+              0.2f,
+              fsrLimits,
+              DVAR_ARCHIVE,
+              "deko3d renderer: RCAS sharpening of r_fsrMode bilinear_rcas in stops below maximum (0 = "
+              "sharpest, each +1 halves it); only used when r_renderResolution is below the display size");
+          // Present upscaler (src/deko9/deko9_fsr.h); order = deko9::UpscaleMode.
+          // Applies at the next present.
+          static const char *fsrModeNames[] = {"sgsr", "bilinear_rcas", "bilinear", nullptr};
+          r_fsrMode = Dvar_RegisterEnum(
+              "r_fsrMode",
+              fsrModeNames,
+              0,
+              DVAR_ARCHIVE,
+              "deko3d renderer: upscaler when r_renderResolution is below the display size: sgsr (Snapdragon "
+              "GSR 1, edge-directed with sharpening), bilinear_rcas (bilinear + FSR 1 RCAS, r_fsrSharpness), "
+              "bilinear");
+          // Dynamic render resolution (r_dynres.cpp
+          // section 10). The layout (scene targets allocated at the output
+          // size, the scene upscaled into the back buffer before the 2D
+          // pass, HUD at the output size) needs a device restart; everything
+          // else applies per frame.
+          r_dynres = Dvar_RegisterBool(
+              "r_dynres",
+              0,
+              DVAR_ARCHIVE | DVAR_LATCH,
+              "deko3d renderer: dynamic render resolution: the 3D scene renders at a size between r_dynresMin "
+              "and r_dynresMax of the 1280x720 output chosen per frame from the GPU frame time "
+              "(r_dynresBudgetMs), is upscaled with r_fsrMode before the HUD, which draws at 1280x720 "
+              "(replaces r_renderResolution; applies at startup)");
+          DvarLimits budgetLimits;
+          budgetLimits.value.min = 4.0f;
+          budgetLimits.value.max = 100.0f;
+          r_dynresBudgetMs = Dvar_RegisterFloat(
+              "r_dynresBudgetMs",
+              15.5f,
+              budgetLimits,
+              DVAR_ARCHIVE,
+              "deko3d renderer: r_dynres GPU frame-time budget in ms; over it the scene size drops at once, "
+              "well under it (predicted at the next size) it rises slowly");
+          DvarLimits scaleLimits;
+          scaleLimits.value.min = 0.25f;
+          scaleLimits.value.max = 1.0f;
+          r_dynresMin = Dvar_RegisterFloat(
+              "r_dynresMin",
+              0.75f,
+              scaleLimits,
+              DVAR_ARCHIVE,
+              "deko3d renderer: r_dynres smallest scene scale per axis (0.75 = 960x544 of 1280x720)");
+          r_dynresMax = Dvar_RegisterFloat(
+              "r_dynresMax",
+              1.0f,
+              scaleLimits,
+              DVAR_ARCHIVE,
+              "deko3d renderer: r_dynres largest scene scale per axis (1.0 = 1280x720, no upscale)");
+          DvarLimits forceLimits;
+          forceLimits.value.min = 0.0f;
+          forceLimits.value.max = 1.0f;
+          r_dynresForceScale = Dvar_RegisterFloat(
+              "r_dynresForceScale",
+              0.0f,
+              forceLimits,
+              DVAR_NOFLAG,
+              "deko3d renderer: with r_dynres, a fixed scene scale per axis (0.25..1, quantised to 16x8 px) "
+              "instead of the controller; 0 = controller");
+          DvarLimits fakeLimits;
+          fakeLimits.value.min = 0.0f;
+          fakeLimits.value.max = 100.0f;
+          r_dynresFakeGpuMs = Dvar_RegisterFloat(
+              "r_dynresFakeGpuMs",
+              0.0f,
+              fakeLimits,
+              DVAR_NOFLAG,
+              "deko3d renderer: r_dynres test input: feed the controller this GPU ms at 1280x720, scaled by "
+              "the frame's pixel count, instead of the measured time (for emulators, whose GPU times are meaningless); 0 = measured");
+          r_dynresFakeWave = Dvar_RegisterInt(
+              "r_dynresFakeWave",
+              0,
+              (DvarLimits)0x000F424000000000LL, // [0, 1000000]
+              DVAR_NOFLAG,
+              "deko3d renderer: with r_dynresFakeGpuMs, alternate every this many frames between the full fake "
+              "time and 60% of it (0 = constant), so the controller keeps changing size");
+      }
+      r_deko9GpuPasses = Dvar_RegisterBool(
+          "r_deko9GpuPasses",
+          0,
+          DVAR_NOFLAG,
+          "deko3d renderer: GPU timestamp per render phase; logs a 'DEKO9 gpupass' line with GPU ms per frame "
+          "for each phase every 60 frames");
+      r_deko9RtCompression = Dvar_RegisterBool(
+          "r_deko9RtCompression",
+          1,
+          DVAR_LATCH,
+          "deko3d renderer: hardware compression (DkImageFlags_HwCompression) for render targets and depth "
+          "buffers (default on: lowers GPU time); read when the device and render targets are "
+          "created (set on the command line)");
+      r_deko9LightBarriers = Dvar_RegisterInt(
+          "r_deko9LightBarriers",
+          0,
+          0,
+          2,
+          DVAR_NOFLAG,
+          "deko3d renderer: barrier for render->sample hazards inside the 3D pipe: 0 full barrier + L2 flush, "
+          "1 DkBarrier_Primitives, 2 DkBarrier_Fragments (copy/2D-engine hazards stay full)");
+      // Off-screen soft particles (zfeather* over/additive
+      // sprites) drawn into an off-screen premultiplied target and
+      // composited once per run.
+      r_halfResParticles = Dvar_RegisterInt(
+          "r_halfResParticles",
+          0,
+          0,
+          2,
+          DVAR_NOFLAG,
+          "deko3d renderer: soft particles into an off-screen target composited over the scene: 0 off, "
+          "1 half resolution, 2 full resolution (the plumbing proof: ~identical to 0)");
+      r_halfResParticlesUpsample = Dvar_RegisterInt(
+          "r_halfResParticlesUpsample",
+          1,
+          0,
+          2,
+          DVAR_NOFLAG,
+          "deko3d renderer: r_halfResParticles composite: 0 bilinear, 1 nearest-depth where the 4 off-screen "
+          "depths disagree with the pixel's (silhouettes), bilinear elsewhere; 2 = 1 with those pixels marked red "
+          "(diagnostic)");
+      DvarLimits tolLimits;
+      tolLimits.value.min = 0.0f;
+      tolLimits.value.max = 10.0f;
+      r_halfResParticlesDepthTol = Dvar_RegisterFloat(
+          "r_halfResParticlesDepthTol",
+          0.1f,
+          tolLimits,
+          DVAR_NOFLAG,
+          "deko3d renderer: r_halfResParticlesUpsample 1: relative view-depth difference above which a pixel "
+          "takes the nearest-depth off-screen texel instead of the bilinear blend");
+      r_halfResParticlesDebug = Dvar_RegisterInt(
+          "r_halfResParticlesDebug",
+          0,
+          0,
+          15,
+          DVAR_NOFLAG,
+          "deko3d renderer: r_halfResParticles bisection bits: 1 = at factor 1 (r_halfResParticles 2) use the "
+          "scene depth and float-Z instead of the depth pass's copies, 2 = only the depth, 4 = only the float-Z, "
+          "8 = (any factor) never composite: the off-screen content is dropped, everything else runs");
+      r_halfResParticlesHw = Dvar_RegisterInt(
+          "r_halfResParticlesHw",
+          3,
+          0,
+          3,
+          DVAR_NOFLAG,
+          "deko3d renderer: r_halfResParticles hardware rules, default 3 = "
+          "all; lower values are a diagnostic A/B only: 1 = off-screen targets uncompressed (created without "
+          "DkImageFlags_HwCompression; the passes refuse compressed ones), 2 = zcull invalidated after the depth "
+          "pass's gl_FragDepth writes");
+      r_halfResParticlesOrder = Dvar_RegisterInt(
+          "r_halfResParticlesOrder",
+          1,
+          0,
+          1,
+          DVAR_NOFLAG,
+          "deko3d renderer: r_halfResParticles composite points: 0 before every full-res run that follows "
+          "off-screen content (strict list order), 1 only before a full-res run of a later sort key (runs of "
+          "one sort key have no designed order)");
+      r_halfResParticlesStats = Dvar_RegisterInt(
+          "r_halfResParticlesStats",
+          0,
+          0,
+          100000,
+          DVAR_NOFLAG,
+          "deko3d renderer: every N views log the emissive run structure (HRP_RUNS: off-screen runs, "
+          "composites, redirected draws, materials); 0 = off");
+      r_deko9NativeFloatZ = Dvar_RegisterInt(
+          "r_deko9NativeFloatZ",
+          1,
+          0,
+          1,
+          DVAR_NOFLAG,
+          "deko3d renderer: float-Z (soft particles, light beams, depth of field) from the scene depth buffer: "
+          "0 the engine's second geometry pass, 1 one full-screen pass from the depth buffer instead");
+      r_deko9ZcullStats = Dvar_RegisterBool(
+          "r_deko9ZcullStats",
+          0,
+          DVAR_NOFLAG,
+          "deko3d renderer: log a 'DEKO9 zcull' block every 60 frames: per pass depth-tested draws, draws while "
+          "the zcull region is invalidated, depth-target switches, depth clears, compare-direction flips, and "
+          "with r_deko9GpuPasses the hardware zcull counters");
+      r_shadowFilter = Dvar_RegisterInt(
+          "r_shadowFilter",
+          0,
+          0,
+          1,
+          DVAR_NOFLAG,
+          "deko3d renderer: shadow-map filtering of the lit shaders: 0 retail (shader model 3: four hardware-PCF "
+          "taps per spot lookup and per sun cascade), 1 one hardware-PCF tap at the kernel's centre (the shader "
+          "model 2 filter); changes the shader translation");
+      r_deko9Census = Dvar_RegisterBool(
+          "r_deko9Census",
+          0,
+          DVAR_NOFLAG,
+          "deko3d renderer: per-D3D9-entry-point call census (calls, bytes deko9 itself copied, CPU time); "
+          "logs a 'DEKO9 calls' block every 60 frames with the top entry points, uploaded textures and "
+          "dynamic VB/IB locks by role. Measurement only; off costs one branch per gated call");
+      // GPU-fault black box.
+      r_deko9FaultTrace = Dvar_RegisterInt(
+          "r_deko9FaultTrace",
+          0,
+          0,
+          64,
+          DVAR_NOFLAG,
+          "deko3d renderer: GPU-fault black box. N > 0: the GPU reports its (list, draw) position every N draws, "
+          "every draw of the last 16 lists is recorded, and a watcher thread logs a 'DEKO9 gpuhb' heartbeat every "
+          "250 ms and a 'DEKO9 blackbox' dump (draws around the GPU's position with texture addresses, last memory "
+          "events) when the GPU stops mid-list for 20 ms or the queue faults. Diagnostics; costs GPU time");
+      r_deko9GpuMap = Dvar_RegisterInt(
+          "r_deko9GpuMap",
+          0,
+          0,
+          1,
+          DVAR_NOFLAG,
+          "deko3d renderer: 1 logs a 'DEKO9 gpumap' line per static GPU pool and per image created, resized, "
+          "named or freed, with the GPU VA it is addressed through");
+      // A/B measurement (rb_ab_tour.h).
+      r_deko9DrawCensus = Dvar_RegisterInt(
+          "r_deko9DrawCensus",
+          0,
+          0,
+          2,
+          DVAR_NOFLAG,
+          "deko3d renderer: census of every draw in every pass (per pass and per material/pixel shader: draws, "
+          "samples written, estimated cost = pixels x PS instructions, GPU time, lights-pass light counts); 1 "
+          "samples + time, 2 also fragment shader invocations (hardware); logs 'DEKO9 dcensus' lines");
+      r_deko9DrawCensusPasses = Dvar_RegisterString(
+          "r_deko9DrawCensusPasses",
+          "",
+          DVAR_NOFLAG,
+          "deko3d renderer: r_deko9DrawCensus pass filter, comma-separated gpupass names (shadow,floatz,prepass,"
+          "lit,decal,sun,lights,resolve,emissive,postfx,sunpost,view2d,hud2d,other); empty = all");
+      r_deko9DrawCensusFrames = Dvar_RegisterInt(
+          "r_deko9DrawCensusFrames",
+          100,
+          1,
+          100000,
+          DVAR_NOFLAG,
+          "deko3d renderer: frames per r_deko9DrawCensus report when no r_deko9EmissiveTour runs");
+      r_deko9DrawCensusGroups = Dvar_RegisterBool(
+          "r_deko9DrawCensusGroups",
+          0,
+          DVAR_NOFLAG,
+          "deko3d renderer: r_deko9EmissiveTour keeps the draw census on in its A/B group phases too (label "
+          "spotN/<group>), for draw-count A/Bs of a dvar on one paused frame; "
+          "the serialized census timings then apply to those phases");
+      r_deko9SkipEmissive = Dvar_RegisterString(
+          "r_deko9SkipEmissive",
+          "",
+          DVAR_NOFLAG,
+          "deko3d renderer (A/B measurement): emissive-pass materials whose name contains one of these "
+          "comma-separated substrings are not drawn; * = all");
+      r_deko9EmissiveTour = Dvar_RegisterBool(
+          "r_deko9EmissiveTour",
+          0,
+          DVAR_NOFLAG,
+          "deko3d renderer (A/B tour): once the map has run the tour delay, teleport through "
+          "r_deko9EmissiveTourSpots and measure every GPU pass per spot and group (EMISSIVE_PHASE lines)");
+      // Level-neutral defaults: the spots and groups of a run come from its
+      // command line or cfg.
+      r_deko9EmissiveTourSpots = Dvar_RegisterString(
+          "r_deko9EmissiveTourSpots",
+          "here",
+          DVAR_NOFLAG,
+          "deko3d renderer: r_deko9EmissiveTour viewpoints, x,y,z,yaw,pitch separated by /; here = the player's "
+          "own position");
+      r_deko9EmissiveTourGroups = Dvar_RegisterString(
+          "r_deko9EmissiveTourGroups",
+          "-",
+          DVAR_NOFLAG,
+          "deko3d renderer: r_deko9EmissiveTour A/B groups, name:substr,substr (emissive materials skipped), "
+          "name:@booldvar (set to 0) or name:@dvar=value (set, restored after), separated by / (each spot runs a "
+          "baseline, one phase per group, and a second baseline); - = none");
+      r_deko9EmissiveTourTimes = Dvar_RegisterString(
+          "r_deko9EmissiveTourTimes",
+          "40,3,8",
+          DVAR_NOFLAG,
+          "deko3d renderer: r_deko9EmissiveTour delay after map load, settle and measure seconds per phase");
+      r_deko9EmissiveTourPaused = Dvar_RegisterBool(
+          "r_deko9EmissiveTourPaused",
+          0,
+          DVAR_NOFLAG,
+          "deko3d renderer: r_deko9EmissiveTour measures each phase on a paused world (the same frame drawn "
+          "repeatedly), for CPU A/B of per-draw paths without scene motion");
+      r_deko9EmissiveTourShots = Dvar_RegisterString(
+          "r_deko9EmissiveTourShots",
+          "",
+          DVAR_NOFLAG,
+          "deko3d renderer: dvar (bool, or name=value: on = value, off = the value at setup) for a paused pixel A/B per r_deko9EmissiveTour spot (screenshots "
+          "ezab_<map><spot>_on_a/on_b/off/on_c); name=v1|v2|..: one shot per value "
+          "(ezab_<map><spot>_v<value>.png, then the first value again as _again); empty = no shot phases");
      r_norefresh = Dvar_RegisterBool("r_norefresh", 0, DVAR_CHEAT, "Skips all rendering.  Useful for benchmarking.");
      minv.value.max = 1.0f;
      minv.value.min = 0.0f;
@@ -867,7 +1331,15 @@
          minv,
          DVAR_CHEAT,
          "Scale 3D viewports by this fraction.  Use this to see if framerate is pixel shader bound.");
+#ifdef __SWITCH__
+     // The render back end runs on its own thread by default (retail's
+     // handshake, switch_thread_sync.cpp; deko9 single-submitter + frame
+     // ring); the server worker
+     // threads stay inline.
+     r_smp_backend = Dvar_RegisterBool("r_smp_backend", true, DVAR_NOFLAG, "Process renderer back end in a separate thread (Switch: on by default)");
+#else
      r_smp_backend = Dvar_RegisterBool("r_smp_backend", true, DVAR_NOFLAG, "Process renderer back end in a separate thread");
+#endif
      r_smp_worker = Dvar_RegisterBool("r_smp_worker", true, DVAR_NOFLAG, "Process renderer front end in a separate thread");
      r_smp_worker_thread[0] = R_RegisterWorkerThreadDvar("r_smp_worker_thread0", 0);
      r_smp_worker_thread[1] = R_RegisterWorkerThreadDvar("r_smp_worker_thread1", 1u);
@@ -990,6 +1462,11 @@
          DVAR_CHEAT,
          "Only draw primitive batches with more than this many triangles");
      r_skipDrawTris = Dvar_RegisterBool("r_skipDrawTris", false, DVAR_CHEAT, "Skip drawing primitive tris.");
+     // Port-added per-frame checks retail does not do (static-model index
+     // guards, per-draw prim stats and debug dvars, placement-axis asserts).
+     // Measurable overhead; off unless chasing a data or draw bug.
+     r_portDebugChecks = Dvar_RegisterBool("r_portDebugChecks", false, DVAR_NOFLAG,
+                                           "Enable port-added per-draw validation and draw statistics");
      r_drawWater = Dvar_RegisterBool("r_drawWater", true, DVAR_ARCHIVE, "Enable water animation");
      r_lockPvs = Dvar_RegisterBool(
          "r_lockPvs",
@@ -1259,6 +1736,13 @@
      minbw.value.min = 0.0f;
      r_blur = Dvar_RegisterFloat("r_blur", 0.0f, minbw, DVAR_CHEAT, "Dev tweak to blur the screen");
      r_distortion = Dvar_RegisterBool("r_distortion", true, DVAR_ARCHIVE, "Enable distortion");
+     // Switch: the post-sun resolve (a full-screen
+     // copy of the scene for distortion materials) only in views whose
+     // emissive list has a technique that samples it; 0 = every frame
+     // (retail behaviour). Image-exact: nothing else reads the copy.
+     r_distortionResolveOnDemand = Dvar_RegisterBool(
+         "r_distortionResolveOnDemand", true, DVAR_NOFLAG,
+         "Resolve the post-sun scene copy only when a visible emissive technique samples it");
      r_glow_allowed = Dvar_RegisterBool("r_glow_allowed", true, DVAR_ARCHIVE, "Allow glow.");
      r_glow_allowed_script_forced = Dvar_RegisterBool(
          "r_glow_allowed_script_forced",
@@ -1445,6 +1929,8 @@
      mincu.value.min = -FLT_MAX;
      r_outdoorFeather = Dvar_RegisterFloat("r_outdoorFeather", 8.0f, mincu, DVAR_SAVED, "Outdoor z-feathering value");
      Dvar_SetModified((dvar_s*)r_outdoorFeather);
+     r_outdoorDebug = Dvar_RegisterBool("r_outdoorDebug", false, DVAR_NOFLAG,
+                                        "Port diagnostic: read back $outdoor and print the precipitation outdoor test at the camera");
      r_sun_from_dvars = Dvar_RegisterBool(
          "r_sun_from_dvars",
          false,
@@ -1501,6 +1987,10 @@
          false,
          DVAR_NOFLAG,
          "Dump static model info for the next frame.");
+     // Diagnostic: stamp model-lighting samples with their depth-slice
+     // index so the host can locate each slice. Non-archived, non-cheat.
+     Dvar_RegisterBool("r_killhouseMLSentinel", false, 0,
+                       "Stamp model lighting samples with their slice index");
      r_altModelLightingUpdate = Dvar_RegisterBool(
          "r_altModelLightingUpdate",
          true,

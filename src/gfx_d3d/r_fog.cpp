@@ -15,6 +15,17 @@ void __cdecl R_SetFogFromServer(float start, uint8_t r, uint8_t g, uint8_t b, fl
     rg.fogSettings[FOG_SERVER].color.packed = (r << 16) | (g << 8) | b | 0xFF000000;
     rg.fogSettings[FOG_SERVER].fogStart = start;
     rg.fogSettings[FOG_SERVER].density = density;
+    // the server fog value received by the
+    // renderer, before the frame lerp.  Bounded, change-agnostic (the
+    // script sets it once).
+    {
+        static uint32_t s_killhouseFogStoredLines = 0;
+        if (s_killhouseFogStoredLines < 8)
+        {
+            ++s_killhouseFogStoredLines;
+            
+        }
+    }
 }
 
 void __cdecl R_SwitchFog(uint32_t fogvar, int startTime, int transitionTime)

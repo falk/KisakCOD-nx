@@ -10,7 +10,11 @@ struct ArchivedCanonicalStringInfo // sizeof=0x8
     // padding byte
     const char *value;
 };
+// Transient script-VM-only structs, never serialized; see the identical note
+// in scr_compiler.h.
+#if !defined(__SWITCH__)
 static_assert(sizeof(ArchivedCanonicalStringInfo) == 0x8);
+#endif
 
 struct scrEvaluateGlob_t // sizeof=0x10
 {                                       // ...
@@ -22,7 +26,9 @@ struct scrEvaluateGlob_t // sizeof=0x10
     bool objectChanged;                 // ...
     // padding byte
 };
+#if !defined(__SWITCH__)
 static_assert(sizeof(scrEvaluateGlob_t) == 0x10);
+#endif
 
 void __cdecl TRACK_scr_evaluate();
 uint32_t __cdecl Scr_GetBuiltin(sval_u func_name);

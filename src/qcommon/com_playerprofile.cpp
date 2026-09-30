@@ -25,7 +25,7 @@ int __cdecl Com_BuildPlayerProfilePath_Internal(
     int pathSize,
     const char *playerName,
     const char *format,
-    char *vargs)
+    va_list vargs)
 {
     int totalLength; // [esp+0h] [ebp-Ch]
     int totalLengtha; // [esp+0h] [ebp-Ch]
@@ -72,7 +72,7 @@ int __cdecl Com_BuildPlayerProfilePath_Internal(
 bool __cdecl Com_HasPlayerProfile()
 {
     iassert( com_playerProfile );
-    return *(char *)com_playerProfile->current.integer != 0;
+    return *com_playerProfile->current.string != 0;
 }
 
 
@@ -166,7 +166,7 @@ char __cdecl Com_DeletePlayerProfile(const char *profileName)
     if (!Com_IsValidPlayerProfileDir(profileName))
         return 0;
     Com_BuildPlayerProfilePathForPlayer(profilePath, 64, profileName, "");
-    FS_BuildOSPath((char *)fs_basepath->current.integer, (char*)"players", profilePath, osPath);
+    FS_BuildOSPath((char *)fs_basepath->current.string, (char*)"players", profilePath, osPath);
     if (!Sys_RemoveDirTree(osPath))
         return 0;
     if (!I_stricmp(profileName, com_playerProfile->current.string))
@@ -203,7 +203,7 @@ char __cdecl Com_NewPlayerProfile(const char *profileName)
     else
     {
         Com_BuildPlayerProfilePathForPlayer(profilePath, 64, profileName, "");
-        FS_BuildOSPath((char *)fs_basepath->current.integer, (char*)"players", profilePath, osPath);
+        FS_BuildOSPath((char *)fs_basepath->current.string, (char*)"players", profilePath, osPath);
         if (FS_CreatePath(osPath))
         {
             Com_Printf(CON_CHANNEL_SYSTEM, "Unable to create new profile path: %s\n", osPath);
@@ -556,6 +556,20 @@ void __cdecl Com_SetRecommended(int localClientNum, int restart)
     }
 }
 
+#if defined(__SWITCH__)
+// No interactive message box on Horizon: silently accept the hardware/config
+// change rather than blocking startup on a dialog that can never be shown.
+bool __cdecl Sys_ShouldUpdateForInfoChange()
+{
+    Sys_ArchiveInfo(0);
+    return true;
+}
+
+bool __cdecl Sys_ShouldUpdateForConfigChange()
+{
+    return true;
+}
+#else
 bool __cdecl Sys_ShouldUpdateForInfoChange()
 {
     HWND ActiveWindow; // eax
@@ -580,6 +594,7 @@ bool __cdecl Sys_ShouldUpdateForConfigChange()
     ActiveWindow = GetActiveWindow();
     return MessageBoxA(ActiveWindow, v2, v3, 0x44u) == 6;
 }
+#endif
 
 bool __cdecl Sys_HasInfoChanged()
 {

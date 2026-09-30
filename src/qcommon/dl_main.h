@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdarg.h>
+
 enum dlStatus_t : __int32
 {                                       // ...
     DL_CONTINUE = 0x0,
@@ -7,7 +9,7 @@ enum dlStatus_t : __int32
     DL_FAILED = 0x2,
 };
 
-int __cdecl DL_VPrintf(const char *fmt, char *argptr);
+int __cdecl DL_VPrintf(const char *fmt, va_list argptr);
 void __cdecl DL_CancelDownload();
 void __cdecl DL_InitDownload();
 int __cdecl DL_BeginDownload(char *localName, char *remoteName);

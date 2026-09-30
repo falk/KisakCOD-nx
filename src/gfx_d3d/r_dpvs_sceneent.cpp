@@ -155,7 +155,7 @@ void R_AddCellSceneEntSurfacesInFrustumCmd(GfxWorldDpvsPlanes *data)
                             if (sceneEnt->cull.state < 2)
                                 R_AddWorkerCmd(WRKCMD_DPVS_ENTITY, (uint8_t *)&dpvsEntity);
                             else
-                                R_AddEntitySurfacesInFrustumCmd((uint16_t *)&dpvsEntity);
+                                R_AddEntitySurfacesInFrustumCmd(&dpvsEntity);
                         }
                     }
                 }

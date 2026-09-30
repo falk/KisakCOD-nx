@@ -1,4 +1,11 @@
 #include <universal/q_shared.h>
+#include <port/switch_perf.h>
+#ifdef __SWITCH__
+#include <port/switch_pcsample.h>
+#include <platform/switch/switch_pgo.h>
+#include <platform/switch/switch_crash.h>
+void Switch_ScreenshotFrame();
+#endif
 #include "qcommon.h"
 
 #include "cmd.h"
@@ -35,6 +42,7 @@
 #include <gfx_d3d/r_workercmds.h>
 #include <universal/com_convexhull.h>
 #include <gfx_d3d/r_dvars.h>
+#include <gfx_d3d/rb_ab_tour.h>
 #include "mem_track.h"
 #include <universal/profile.h>
 
@@ -103,6 +111,13 @@ const dvar_t *com_maxFrameTime;
 const dvar_t *com_statmon;
 const dvar_t *com_filter_output;
 const dvar_t *com_developer;
+#ifdef __SWITCH__
+static const dvar_t *switch_performanceMode;
+static const dvar_t *switch_perfTrace;
+static const dvar_t *switch_pcSample;
+static const dvar_t *switch_crashTest;
+static void Com_UpdateSwitchPerformanceMode();
+#endif
 
 const dvar_t *sys_lockThreads;
 const dvar_t *sys_smp_allowed;
@@ -170,8 +185,12 @@ void QDECL Com_PrintMessage(int channel, const char* msg, int error)
 	// LWSS: Punkbuster stuff
 	//PbCaptureConsoleOutput(msg, 4096);
 
-    // always print to stdout console
+#ifdef __SWITCH__
+    Sys_Print(msg);
+#else
     fprintf(stderr, "%s", msg);
+    fflush(stderr);
+#endif
 
 	if (rd_buffer)
 	{
@@ -206,7 +225,9 @@ void QDECL Com_PrintMessage(int channel, const char* msg, int error)
 			&& (!com_filter_output || !com_filter_output->current.enabled
 				|| Con_IsChannelVisible(CON_DEST_CONSOLE, channel, 3)))
 		{
+#ifndef __SWITCH__
 			Sys_Print(msg);
+#endif
 		}
 		if (channel != CON_CHANNEL_CONSOLEONLY && com_logfile && com_logfile->current.integer)
 			Com_LogPrintMessage(channel, msg);
@@ -308,6 +329,9 @@ void __cdecl Debug_Frame(int localClientNum)
     cls.realFrametime = Com_ModifyMsec(msec);
     cls.realtime += cls.frametime;
     CL_UpdateSound();
+#ifdef __SWITCH__
+    Switch_ScreenshotFrame(); // report the previous frame's screenshot request
+#endif
     if (Scr_CanDrawScript())
     {
         R_BeginDebugFrame();
@@ -351,6 +375,20 @@ qboolean Com_Memcmp(const void* src0, const void* src1, const uint32_t count)
 	uint32_t i;
 	// MMX version anyone?
 
+	// Left untouched by hot-path optimization passes: Com_Memcmp has zero
+	// callers anywhere in src/ (grepped; only self-reference + a static
+	// analysis tool's function-name list), so it is not hot, and it is not
+	// safe to swap for `memcmp(...) == 0` anyway -- this loop has a
+	// pre-existing bug worth flagging: `nm2 = count / 16` is a *group*
+	// count, but `i` is a *dword* index advanced by 4 per group, so the
+	// condition `i < nm2` stops the fast path after the first 16 bytes for
+	// any count >= 32 (e.g. count == 64: nm2 == 4, loop runs once at i=0,
+	// then 4 < 4 is false); the `count & 15` tail never runs either for
+	// count a multiple of 16. So today this function silently ignores
+	// differences beyond the first 16 bytes for count >= 32 and a multiple
+	// of 16. `memcmp() == 0` would be a real, stricter equality check and
+	// not semantically identical, so it is out of scope for this change;
+	// left as-is and reported, not fixed here.
 	if (count >= 16)
 	{
 		uint32_t* dw = (uint32_t*)(src0);
@@ -411,7 +449,13 @@ void Com_Prefetch(const void* s, const uint32_t bytes, e_prefetch type)
 		}
 #else
         // DI: lol
+#ifdef __GNUC__
+        // MSVC's PreFetchCacheLine intrinsic does not exist on GCC/AArch64;
+        // prefetch the first cache line of the target instead.
+        __builtin_prefetch(s, 0, 3);
+#else
         PreFetchCacheLine(PF_NON_TEMPORAL_LEVEL_ALL, s);
+#endif
 #endif
 
 		break;
@@ -428,8 +472,7 @@ void __cdecl Com_LogPrintMessage(int channel, const char* msg)
         if (logfile)
         {
             FS_WriteLog(msg, strlen(msg), logfile);
-            if (com_logfile->current.integer > 1)
-                FS_Flush(logfile);
+            FS_Flush(logfile);
         }
     }
     Sys_LeaveCriticalSection(CRITSECT_CONSOLE);
@@ -439,7 +482,7 @@ void Com_OpenLogFile()
 {
     const char* BuildNumber; // eax
     const char* v1; // [esp-4h] [ebp-14h]
-    __int64 aclock; // [esp+0h] [ebp-10h] BYREF
+    time_t aclock; // [esp+0h] [ebp-10h] BYREF
     tm* newtime; // [esp+Ch] [ebp-4h]
 
     if (Sys_IsMainThread() && !opening_qconsole)
@@ -667,6 +710,15 @@ void Com_Error(errorParm_t code, const char* fmt, ...)
     com_errorEntered = 1;
     _vsnprintf(com_errorMessage, 0x1000u, fmt, va);
     com_errorMessage[4095] = 0;
+#ifdef __SWITCH__
+    // Emit the message before the error-cleanup path runs: on Switch a fatal
+    // can die inside Com_ErrorCleanup (e.g. temp memory is already cleared
+    // when SEH_UpdateLanguageInfo re-lists localized strings), which
+    // otherwise hides the actual error entirely.
+    Sys_Print("Com_Error: ");
+    Sys_Print(com_errorMessage);
+    Sys_Print("\n");
+#endif
     iassert( com_errorMessage[0] );
     if (code == ERR_SCRIPT || code == ERR_LOCALIZATION)
     {
@@ -787,6 +839,31 @@ void __cdecl Com_ParseCommandLine(char* commandLine)
         }
         ++commandLine;
     }
+}
+
+// A boolean dvar's startup value from the command line ("set <name> <n>" /
+// "seta"), readable before the dvar or command systems exist.
+bool Com_StartupFlagSet(const char *name)
+{
+    const size_t len = strlen(name);
+    for (int i = 0; i < com_numConsoleLines; ++i)
+    {
+        const char *s = com_consoleLines[i];
+        while (*s == ' ')
+            ++s;
+        if (!I_strnicmp(s, "seta ", 5))
+            s += 5;
+        else if (!I_strnicmp(s, "set ", 4))
+            s += 4;
+        else
+            continue;
+        while (*s == ' ')
+            ++s;
+        if (I_strnicmp(s, name, (int)len) || (s[len] != ' ' && s[len] != '\t'))
+            continue;
+        return atoi(s + len) != 0;
+    }
+    return false;
 }
 
 int __cdecl Com_SafeMode()
@@ -954,60 +1031,6 @@ void __cdecl Com_ServerPacketEvent()
     }
 }
 #endif
-
-void __cdecl Com_EventLoop()
-{
-    sysEvent_t result; // [esp+4h] [ebp-48h] BYREF
-    sysEvent_t ev; // [esp+34h] [ebp-18h]
-
-    PROF_SCOPED("Com_EventLoop");
-
-    while (1)
-    {
-        ev = *Sys_GetEvent(&result);
-
-        switch (ev.evType)
-        {
-        case SE_NONE:
-        {
-            iassert(!ev.evPtr);
-#ifdef KISAK_MP
-            Com_ClientPacketEvent();
-            Com_ServerPacketEvent();
-#endif
-            goto END;
-        }
-        case SE_KEY:
-        {
-            iassert(!ev.evPtr);
-            CL_KeyEvent(0, ev.evValue, ev.evValue2, ev.evTime);
-            break;
-        }
-        case SE_CHAR:
-        {
-            iassert(!ev.evPtr);
-            CL_CharEvent(0, ev.evValue);
-            break;
-        }
-        case SE_CONSOLE:
-        {
-            iassert(ev.evPtr);
-            Cbuf_AddText(0, (const char *)ev.evPtr);
-            Com_FreeEvent((char *)ev.evPtr);
-            Cbuf_AddText(0, "\n");
-            break;
-        }
-
-        default:
-            iassert(!ev.evPtr);
-            Com_Error(ERR_FATAL, "Com_EventLoop: bad event type %i", ev.evType);
-            break;
-        }
-    }
-
-END:
-    return;
-}
 
 void __cdecl Com_SetScriptSettings()
 {
@@ -1301,6 +1324,9 @@ void __cdecl Com_Init_Try_Block_Function(char* commandLine)
     Cbuf_Execute(0, v1);
     if ((dvar_modifiedFlags & 0x20) != 0)
         Com_InitDvars();
+#ifdef __SWITCH__
+    Com_UpdateSwitchPerformanceMode();
+#endif
     com_recommendedSet = Dvar_RegisterBool("com_recommendedSet", 0, DVAR_ARCHIVE, "Use recommended settings");
     Com_CheckSetRecommended(0);
     Com_StartupVariable(0);
@@ -1333,6 +1359,9 @@ void __cdecl Com_Init_Try_Block_Function(char* commandLine)
         Cmd_AddCommandInternal("assert", Com_Assert_f, &Com_Assert_f_VAR);
     }
     Cmd_AddCommandInternal("quit", Com_Quit_f, &Com_Quit_f_VAR);
+#ifdef KISAK_SWITCH_PGO_GEN
+    SwitchPgo_Init(); // switch_pgoDump / switch_pgoReset (PGO training builds)
+#endif
     Cmd_AddCommandInternal("writeconfig", Com_WriteConfig_f, &Com_WriteConfig_f_VAR);
     Cmd_AddCommandInternal("writedefaults", Com_WriteDefaults_f, &Com_WriteDefaults_f_VAR);
 #ifdef KISAK_MP
@@ -1567,6 +1596,44 @@ void Com_InitDvars()
         DVAR_NOFLAG,
         "Write to log file - 0 = disabled, 1 = async file write, 2 = Sync every write");
     com_statmon = Dvar_RegisterBool("com_statmon", 0, 0, "Draw stats monitor");
+#ifdef __SWITCH__
+    switch_performanceMode = Dvar_RegisterBool(
+        "performance",
+        true,
+        DVAR_NOFLAG,
+        "Temporarily disable expensive Switch diagnostics, synchronous logging, capture ring, and stat monitor");
+    // Off by default: opt in per run with "+set switch_perfTrace 1" to get the
+    // grouped SWITCH_PERF per-second CPU phase breakdown.  Kept separate from
+    // `performance` so production runs stay quiet and so the breakdown can be
+    // taken in the exact shipping configuration.
+    switch_perfTrace = Dvar_RegisterBool(
+        "switch_perfTrace",
+        false,
+        DVAR_NOFLAG,
+        "Print one SWITCH_PERF per-second CPU phase breakdown (frame/render/issue/scene/cgame)");
+    // Stack sampler for hardware profiling (switch_pcsample.cpp); prints
+    // PCSAMPLE/PCS blocks every 5 s for offline tooling.
+    switch_pcSample = Dvar_RegisterInt(
+        "switch_pcSample",
+        0,
+        0,
+        4000,
+        DVAR_NOFLAG,
+        "Sample game thread stacks this many times per second (0 = off)");
+    // TEST ONLY (switch_crash.cpp): fires once on the next Com_Frame, then
+    // resets to 0. Exercises __libnx_exception_handler's CRASH: lines --
+    // never set outside testing the crash handler.
+    // 1 = null-write data abort. 2 = udf illegal-instruction trap (not
+    // abort(): see switch_crash.h for why plain abort() does not fault here).
+    switch_crashTest = Dvar_RegisterInt(
+        "switch_crashTest",
+        0,
+        0,
+        2,
+        DVAR_NOFLAG,
+        "TEST ONLY: 1 = trigger a null-write data abort, 2 = trigger an illegal-instruction trap "
+        "(exercises the crash handler; never set outside that test)");
+#endif
 #ifdef KISAK_MP
     com_timescale = Dvar_RegisterFloat("com_timescale", 1.0, 0.001f, 1000.0f, DVAR_SYSTEMINFO | DVAR_ROM | DVAR_CHEAT | DVAR_TEMP | DVAR_SAVED, "Scale time of each frame");
 #elif KISAK_SP
@@ -1599,6 +1666,107 @@ void Com_InitDvars()
         DVAR_ROM,
         "True if the game video is running in 16x9 aspect, false if 4x3.");
 }
+
+#ifdef __SWITCH__
+static void Com_UpdateSwitchPerformanceMode()
+{
+    static bool was_enabled;
+    static int saved_developer;
+    static int saved_logfile;
+    static bool saved_diag_markers;
+    static bool saved_capture_ring;
+    static bool saved_statmon;
+    static int saved_gpu_sync;
+    static int saved_aa_samples;
+    static bool saved_diag_markers_valid;
+    static bool saved_capture_ring_valid;
+    static bool saved_gpu_sync_valid;
+    static bool saved_aa_samples_valid;
+    const bool enabled = switch_performanceMode && switch_performanceMode->current.enabled;
+    // Cached instead of a Dvar_FindVar lookup every frame.
+    extern const dvar_t *com_diagMarkers;
+    const dvar_t *diag_markers = com_diagMarkers;
+    const dvar_t *capture_ring = Dvar_FindVar("r_captureRing");
+    const dvar_t *gpu_sync = Dvar_FindVar("r_gpuSync");
+    const dvar_t *aa_samples = Dvar_FindVar("r_aaSamples");
+
+    if (enabled && !was_enabled)
+    {
+        saved_developer = com_developer ? com_developer->current.integer : 0;
+        saved_logfile = com_logfile ? com_logfile->current.integer : 0;
+        saved_diag_markers_valid = diag_markers && diag_markers->type == DVAR_TYPE_BOOL;
+        saved_capture_ring_valid = capture_ring && capture_ring->type == DVAR_TYPE_BOOL;
+        saved_gpu_sync_valid = gpu_sync && gpu_sync->type == DVAR_TYPE_ENUM;
+        saved_aa_samples_valid = aa_samples && aa_samples->type == DVAR_TYPE_INT;
+        saved_diag_markers = saved_diag_markers_valid && diag_markers->current.enabled;
+        saved_capture_ring = saved_capture_ring_valid && capture_ring->current.enabled;
+        saved_gpu_sync = saved_gpu_sync_valid ? gpu_sync->current.integer : 1;
+        saved_aa_samples = saved_aa_samples_valid ? aa_samples->current.integer : 1;
+        saved_statmon = com_statmon && com_statmon->current.enabled;
+        Com_Printf(16, "Switch performance mode enabled\n");
+    }
+    else if (!enabled && was_enabled)
+    {
+        Dvar_SetInt(com_developer, saved_developer);
+        Dvar_SetInt(com_logfile, saved_logfile);
+        if (saved_diag_markers_valid && diag_markers && diag_markers->type == DVAR_TYPE_BOOL)
+            Dvar_SetBool(diag_markers, saved_diag_markers);
+        if (saved_capture_ring_valid && capture_ring && capture_ring->type == DVAR_TYPE_BOOL)
+            Dvar_SetBool(capture_ring, saved_capture_ring);
+        if (saved_gpu_sync_valid && gpu_sync && gpu_sync->type == DVAR_TYPE_ENUM)
+            Dvar_SetInt(gpu_sync, saved_gpu_sync);
+        if (saved_aa_samples_valid && aa_samples && aa_samples->type == DVAR_TYPE_INT)
+            Dvar_SetInt(aa_samples, saved_aa_samples);
+        Dvar_SetBool(com_statmon, saved_statmon);
+        Com_Printf(16, "Switch performance mode disabled; diagnostic settings restored\n");
+    }
+
+    if (enabled)
+    {
+        if (!saved_diag_markers_valid && diag_markers && diag_markers->type == DVAR_TYPE_BOOL)
+        {
+            saved_diag_markers = diag_markers->current.enabled;
+            saved_diag_markers_valid = true;
+        }
+        if (!saved_capture_ring_valid && capture_ring && capture_ring->type == DVAR_TYPE_BOOL)
+        {
+            saved_capture_ring = capture_ring->current.enabled;
+            saved_capture_ring_valid = true;
+        }
+        if (!saved_gpu_sync_valid && gpu_sync && gpu_sync->type == DVAR_TYPE_ENUM)
+        {
+            saved_gpu_sync = gpu_sync->current.integer;
+            saved_gpu_sync_valid = true;
+        }
+        if (!saved_aa_samples_valid && aa_samples && aa_samples->type == DVAR_TYPE_INT)
+        {
+            saved_aa_samples = aa_samples->current.integer;
+            saved_aa_samples_valid = true;
+        }
+        if (com_developer && com_developer->current.integer)
+            Dvar_SetInt(com_developer, 0);
+        if (com_logfile && com_logfile->current.integer)
+            Dvar_SetInt(com_logfile, 0);
+        if (diag_markers && diag_markers->type == DVAR_TYPE_BOOL && diag_markers->current.enabled)
+            Dvar_SetBool(diag_markers, false);
+        if (capture_ring && capture_ring->type == DVAR_TYPE_BOOL && capture_ring->current.enabled)
+            Dvar_SetBool(capture_ring, false);
+        if (com_statmon && com_statmon->current.enabled)
+            Dvar_SetBool(com_statmon, false);
+        // "off" triggers a full deko3d WaitForIdle after every frame on
+        // Switch. Adaptive fences preserve correctness without serializing
+        // all visible-scene GPU work, which is essential for performance.
+        if (gpu_sync && gpu_sync->type == DVAR_TYPE_ENUM && gpu_sync->current.integer != 1)
+            Dvar_SetInt(gpu_sync, 1);
+        // The hardware config historically requested 4x MSAA. At 720p this
+        // quadruples color/depth sample work and is strongly view-dependent.
+        if (aa_samples && aa_samples->type == DVAR_TYPE_INT && aa_samples->current.integer != 1)
+            Dvar_SetInt(aa_samples, 1);
+    }
+
+    was_enabled = enabled;
+}
+#endif
 
 void __cdecl Com_StartupConfigs(int localClientNum)
 {
@@ -1827,6 +1995,17 @@ void __cdecl Com_Frame_Try_Block_Function()
     int msec; // [esp+6Ch] [ebp-10h]
     int minMsec; // [esp+74h] [ebp-8h]
     int maxFPS; // [esp+78h] [ebp-4h] BYREF
+#ifdef __SWITCH__
+    const uint32_t perf_frame_begin = Sys_Milliseconds();
+    uint32_t perf_setup_end;
+    uint32_t perf_server_end;
+    uint32_t perf_client_end;
+    uint32_t perf_render_end;
+    // SWITCH_PERF: whole frame + the same setup/server/client/render/tail
+    // boundaries as the coarse PERF line, but at counter resolution.
+    SWITCH_PERF_SCOPE(SWITCH_PERF_FRAME_TOTAL);
+    SwitchPerfMarks switchPerfMarks;
+#endif
 
     iassert(cmd_args.nesting == -1);
 
@@ -1907,7 +2086,15 @@ void __cdecl Com_Frame_Try_Block_Function()
     iassert(msec > 0);
     msec = Com_ModifyMsec(msec);
     iassert(msec > 0);
+#ifdef __SWITCH__
+    perf_setup_end = Sys_Milliseconds();
+    switchPerfMarks.mark(SWITCH_PERF_FRAME_SETUP);
+#endif
     msec = SV_Frame(msec);
+#ifdef __SWITCH__
+    perf_server_end = Sys_Milliseconds();
+    switchPerfMarks.mark(SWITCH_PERF_FRAME_SERVER);
+#endif
 
 #ifdef KISAK_MP
     Com_DedicatedModified();
@@ -1916,6 +2103,19 @@ void __cdecl Com_Frame_Try_Block_Function()
 #endif
     {
         R_SetEndTime(com_lastFrameTime[lastFrameIndex]);
+
+#ifdef KISAK_SP
+        // Retail PC Com_Frame (0x535526-0x535536): with a fullscreen menu up
+        // (no CG_DrawActiveFrame, so no SV_FrameRateSmoothing), throttle to
+        // the GPU here, before IN_Frame.
+        if (UI_IsFullscreen())
+        {
+#ifdef __SWITCH__
+            SWITCH_PERF_SCOPE(SWITCH_PERF_FRAME_SYNCGPU);
+#endif
+            R_SyncGpu(NULL);
+        }
+#endif
 
         {
             PROF_SCOPED("pre frame");
@@ -1952,12 +2152,18 @@ void __cdecl Com_Frame_Try_Block_Function()
             CL_Frame(0, msec);
 #endif
         }
+#ifdef __SWITCH__
+        perf_client_end = Sys_Milliseconds();
+        switchPerfMarks.mark(SWITCH_PERF_FRAME_CLIENT);
+#endif
 
-#ifdef KISAK_MP
         dvar_modifiedFlags &= ~2u;
         Com_UpdateMenu();
-#endif
         SCR_UpdateScreen();
+#ifdef __SWITCH__
+        perf_render_end = Sys_Milliseconds();
+        switchPerfMarks.mark(SWITCH_PERF_FRAME_RENDER);
+#endif
         Ragdoll_Update(msec);
         iassert(Sys_IsMainThread());
 #ifdef KISAK_SP
@@ -1969,6 +2175,62 @@ void __cdecl Com_Frame_Try_Block_Function()
         R_WaitEndTime();
     }
 
+#ifdef __SWITCH__
+    // One compact line per second. This deliberately uses coarse monotonic
+    // millisecond buckets so profiling remains cheap enough to leave enabled
+    // during representative performance runs.
+    if (switch_performanceMode && switch_performanceMode->current.enabled)
+    {
+        static uint32_t report_begin;
+        static uint32_t frames;
+        static uint64_t setup_sum;
+        static uint64_t server_sum;
+        static uint64_t client_sum;
+        static uint64_t render_sum;
+        static uint64_t tail_sum;
+        static uint32_t frame_min = UINT32_MAX;
+        static uint32_t frame_max;
+        const uint32_t perf_frame_end = Sys_Milliseconds();
+        const uint32_t frame_ms = perf_frame_end - perf_frame_begin;
+
+        if (!report_begin)
+            report_begin = perf_frame_begin;
+        ++frames;
+        setup_sum += perf_setup_end - perf_frame_begin;
+        server_sum += perf_server_end - perf_setup_end;
+        client_sum += perf_client_end - perf_server_end;
+        render_sum += perf_render_end - perf_client_end;
+        tail_sum += perf_frame_end - perf_render_end;
+        if (frame_ms < frame_min)
+            frame_min = frame_ms;
+        if (frame_ms > frame_max)
+            frame_max = frame_ms;
+
+        const uint32_t elapsed = perf_frame_end - report_begin;
+        if (elapsed >= 1000)
+        {
+            const double inv_frames = 1.0 / (double)frames;
+            Com_Printf(
+                16,
+                "PERF fps=%.1f frame=%.1fms min=%ums max=%ums setup=%.1f server=%.1f client=%.1f render=%.1f tail=%.1f\n",
+                (double)frames * 1000.0 / (double)elapsed,
+                (double)elapsed * inv_frames,
+                frame_min,
+                frame_max,
+                (double)setup_sum * inv_frames,
+                (double)server_sum * inv_frames,
+                (double)client_sum * inv_frames,
+                (double)render_sum * inv_frames,
+                (double)tail_sum * inv_frames);
+            report_begin = perf_frame_end;
+            frames = 0;
+            setup_sum = server_sum = client_sum = render_sum = tail_sum = 0;
+            frame_min = UINT32_MAX;
+            frame_max = 0;
+        }
+    }
+#endif
+
 #ifdef KISAK_SP
     //if (g_launchData.startupText[0])
     //{
@@ -1977,6 +2239,9 @@ void __cdecl Com_Frame_Try_Block_Function()
     //    XSetLaunchData(&g_launchData, 0x3D8u);
     //    Com_Error(ERR_DROP, v35);
     //}
+#endif
+#ifdef __SWITCH__
+    switchPerfMarks.mark(SWITCH_PERF_FRAME_TAIL);
 #endif
 }
 
@@ -2109,16 +2374,20 @@ void __cdecl Com_AssetLoadUI()
 #endif
         zoneInfo.allocFlags = DB_ZONE_GAME;
         zoneInfo.freeFlags = DB_ZONE_GAME | DB_ZONE_LOAD | DB_ZONE_DEV;
-        DB_LoadXAssets(&zoneInfo, 1u, 0);
+        DB_LoadXAssets(&zoneInfo, 1u, 1);
+        DB_SyncXAssets();
+        R_MaterializeAllImages();
     }
 #ifdef KISAK_MP
     UI_SetMap((char*)"", (char*)"");
 #elif KISAK_SP
     UI_SetMap((char *)"");
 #endif
+    Com_Printf(0, "Com_Init: Calling CL_StartHunkUsers...\n");
     R_BeginRemoteScreenUpdate();
     CL_StartHunkUsers();
     R_EndRemoteScreenUpdate();
+    Com_Printf(0, "Com_Init: Complete! Returning to switch_sp_main...\n");
 }
 
 void __cdecl Com_CheckSyncFrame()
@@ -2135,6 +2404,23 @@ void __cdecl Com_Frame()
 {
 #ifdef TRACY_ENABLE
     TracyCFrameMarkStart("Com_Frame");
+#endif
+#ifdef __SWITCH__
+    Com_UpdateSwitchPerformanceMode();
+    SwitchPerf_SetEnabled(switch_perfTrace && switch_perfTrace->current.enabled);
+    SwitchPcSample_SetRate(switch_pcSample ? switch_pcSample->current.integer : 0);
+    SwitchPerf_BeginFrame();
+#if defined(KISAK_SP)
+    R_AbTourFrame();
+#endif
+    // TEST ONLY: +set switch_crashTest 1|2 fires the crash handler on the
+    // first frame, then resets so a save/reload of dvars does not refire it.
+    if (switch_crashTest && switch_crashTest->current.integer)
+    {
+        const int mode = switch_crashTest->current.integer;
+        Dvar_SetInt((dvar_s *)switch_crashTest, 0);
+        SwitchCrash_RunTest(mode);
+    }
 #endif
     void* Value; // eax
 
@@ -2176,6 +2462,9 @@ void __cdecl Com_Frame()
 
 #ifdef TRACY_ENABLE
     TracyCFrameMarkEnd("Com_Frame");
+#endif
+#ifdef __SWITCH__
+    SwitchPerf_EndFrame();
 #endif
 }
 
@@ -2246,7 +2535,14 @@ void __cdecl Com_Restart()
     Hunk_Clear();
     Hunk_ResetDebugMem();
     if (IsFastFileLoad())
+    {
         DB_ReleaseXAssets();
+        // CM_Shutdown (above) zeroed `cm`; retire the retail zone that owns it
+        // so the upcoming map spawn re-decodes the clipmap instead of taking
+        // the reload-idempotency skip and faulting in CM_InitThreadData on a
+        // null cm.box_brush.
+        DB_RetailZoneRetireClipMapZone();
+    }
     Com_SetScriptSettings();
     com_fixedConsolePosition = 0;
 #ifdef KISAK_MP
@@ -2384,7 +2680,7 @@ void Com_CheckError()
     if (v0)
     {
         void * value = Sys_GetValue(2);
-        longjmp((int*)value, -1);
+        longjmp(*(jmp_buf *)value, -1);
     }
 }
 

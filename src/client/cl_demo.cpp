@@ -433,7 +433,6 @@ void __cdecl CL_Record_f()
     const char *v4; // r3
     const char *v5; // r3
     char *v6; // r30
-    char *v7; // r11
     int v9; // r3
     _BYTE v10[4]; // [sp+50h] [-41E0h] BYREF
     unsigned int v11[3]; // [sp+54h] [-41DCh] BYREF
@@ -492,20 +491,18 @@ void __cdecl CL_Record_f()
                 MSG_Init(&v13, v16, 0x4000);
                 MSG_WriteLong(&v13, clientConnections[0].serverCommands.header.sent);
                 configstrings = clients[0].configstrings;
-                do
+                for (uint32_t configStringIndex = 0;
+                     configStringIndex < ARRAY_COUNT(clients[0].configstrings);
+                     ++configStringIndex, ++configstrings)
                 {
                     if (!*configstrings)
                         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\client\\cl_demo.cpp", 489, 0, "%s", "cl->configstrings[i]");
                     v4 = SL_ConvertToString(*configstrings);
                     MSG_WriteString(&v13, (char*)v4);
-                    ++configstrings;
-                } while ((int)configstrings < (int)clients[0].mapname);
+                }
                 v5 = SL_ConvertToString(clients[0].configstrings[CS_SERVERINFO]);
                 v6 = (char*)Info_ValueForKey(v5, "mapname");
-                v7 = v6;
-                while (*v7++)
-                    ;
-                v10[0] = (_BYTE)v7 - (_BYTE)v6 - 1;
+                v10[0] = (uint8_t)strlen(v6);
                 FS_Write((const char*)v10, 1, cls.demofile);
                 v9 = FS_Write(v6, v10[0], cls.demofile);
                 Hunk_CheckTempMemoryClear();
@@ -875,4 +872,3 @@ void __cdecl CL_StartPlayingDemo()
     com_time = clients[0].snap.serverTime - 50;
     cls.timeDemoFrames = 0;
 }
-

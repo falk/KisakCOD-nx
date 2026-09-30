@@ -605,7 +605,13 @@ inline float __cdecl Q_rsqrt(float number)
     return y;
 }
 
-float Q_fabs(float f);
+// |f|: clears the sign bit, exactly what the retail integer mask did (NaN
+// payloads kept). Inline so the ~400 I_fabs sites compile to one FABS
+// instead of a call: a high-call-count hot path in a PGO profile.
+inline float Q_fabs(float f)
+{
+    return fabsf(f);
+}
 
 #define I_rsqrt Q_rsqrt
 #define I_fabs Q_fabs

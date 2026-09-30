@@ -1,6 +1,10 @@
 #include <universal/q_shared.h>
 #include "DynEntity_client.h"
+#ifndef __SWITCH__
 #include <win32/win_local.h>
+#else
+#include <universal/critical_section.h>
+#endif
 #include <gfx_d3d/r_dpvs.h>
 #include <universal/profile.h>
 
@@ -106,7 +110,7 @@ bool __cdecl DynEntPieces_SpawnPhysicsModel(
     float forceDir[3]; // [esp+10h] [ebp-5Ch] BYREF
     float velocity[3]; // [esp+1Ch] [ebp-50h] BYREF
     float angularVelocity[3]; // [esp+28h] [ebp-44h] BYREF
-    int32_t physObjId; // [esp+34h] [ebp-38h]
+    uintptr_t physObjId; // [esp+34h] [ebp-38h]
     float mins[3]; // [esp+38h] [ebp-34h] BYREF
     float quat[4]; // [esp+44h] [ebp-28h] BYREF
     float maxs[3]; // [esp+54h] [ebp-18h] BYREF
@@ -133,7 +137,7 @@ bool __cdecl DynEntPieces_SpawnPhysicsModel(
         angularVelocity[2] = dynEntPieces_angularVelocity->current.vector[2];
         velocity[2] = velocity[2] + model->physPreset->piecesUpwardVelocity;
         Sys_EnterCriticalSection(CRITSECT_PHYSICS);
-        physObjId = (int)DynEntPieces_SpawnPhysObj(
+        physObjId = (uintptr_t)DynEntPieces_SpawnPhysObj(
             model->name,
             mins,
             maxs,
@@ -208,12 +212,13 @@ void __cdecl DynEntPieces_CalcForceDir(const float *hitDir, float spreadFraction
     int32_t v5; // [esp+10h] [ebp-10h]
     float outDir[3]; // [esp+14h] [ebp-Ch] BYREF
 
+    // The old divisor assumed 15-bit RAND_MAX (components in [-1,1]); scale
+    // by the real RAND_MAX so debris directions stay unit-ish instead of ~1e5.
     v5 = rand();
-    outDir[0] = (double)v5 / 32767.0 + (double)v5 / 32767.0 - 1.0;
+    outDir[0] = (double)v5 / (RAND_MAX + 1.0) + (double)v5 / (RAND_MAX + 1.0) - 1.0;
     v4 = rand();
-    outDir[1] = (double)v4 / 32767.0 + (double)v4 / 32767.0 - 1.0;
+    outDir[1] = (double)v4 / (RAND_MAX + 1.0) + (double)v4 / (RAND_MAX + 1.0) - 1.0;
     v3 = rand();
-    outDir[2] = (double)v3 / 32767.0 + (double)v3 / 32767.0 - 1.0;
+    outDir[2] = (double)v3 / (RAND_MAX + 1.0) + (double)v3 / (RAND_MAX + 1.0) - 1.0;
     Vec3Lerp(hitDir, outDir, spreadFraction, forceDir);
 }
-

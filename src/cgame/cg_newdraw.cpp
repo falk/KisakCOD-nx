@@ -838,7 +838,7 @@ char *__cdecl CG_GetWeaponUseString(int localClientNum, const char **secondarySt
     int cursorHintIcon; // r11
     int v5; // r30
     WeaponDef *WeaponDef; // r29
-    char *v7; // r28
+    const weaponInfo_s *v7; // r28
     char *v8; // r30
     char *v9; // r30
     char v11[336]; // [sp+50h] [-150h] BYREF
@@ -872,7 +872,7 @@ char *__cdecl CG_GetWeaponUseString(int localClientNum, const char **secondarySt
             "%s\n\t(localClientNum) = %i",
             "(localClientNum == 0)",
             localClientNum);
-    v7 = (char *)cg_weaponsArray + 72 * v5;
+    v7 = &cg_weaponsArray[0][v5]; // LP64: was byte stride 72 (ILP32 sizeof(weaponInfo_s))
     if (WeaponDef->inventoryType)
     {
         if (WeaponDef->offhandClass == OFFHAND_CLASS_FRAG_GRENADE)
@@ -892,7 +892,7 @@ char *__cdecl CG_GetWeaponUseString(int localClientNum, const char **secondarySt
         else
             v8 = UI_SafeTranslateString("PLATFORM_PICKUPNEWWEAPON");
     }
-    *secondaryString = (const char *)*((unsigned int *)v7 + 15);
+    *secondaryString = v7->translatedDisplayName; // LP64: was a 32-bit read at the ILP32 offset 60
     return UI_ReplaceConversionString(v8, v11);
 }
 
@@ -937,6 +937,63 @@ char *__cdecl CG_GetUseString(int localClientNum)
     return UI_ReplaceConversionString(v6, v8);
 }
 
+// switch_hintDiag 1: trace the cursor-hint draw chain. One line whenever the
+// stage, icon or string index changes, so a missing prompt can be placed on
+// the server (icon=0), the material table (stage=no_material), the string
+// lookup (empty text) or the draw itself. The first frame a hint's text is
+// actually submitted emits PASS:CURSOR_HINT_DRAWN with that text, which the
+// Killhouse weapon-loop proof waits for before it picks the weapon up.
+const dvar_t *switch_hintDiag;
+int g_switchCursorHintTextDrawn;
+
+static void CG_SwitchHintDiag(
+    const char *stage,
+    const cg_s *cgameGlob,
+    const char *text,
+    const char *secondary)
+{
+    static const char *s_lastStage;
+    static int s_lastIcon = -1;
+    static int s_lastString = -2;
+    static int s_passed;
+    int icon;
+    int hintString;
+
+    if (!switch_hintDiag || !switch_hintDiag->current.enabled)
+        return;
+    icon = cgameGlob ? cgameGlob->cursorHintIcon : -1;
+    hintString = cgameGlob ? cgameGlob->cursorHintString : -1;
+    if (text && *text && !strcmp(stage, "text"))
+        ++g_switchCursorHintTextDrawn; // frames with hint text submitted
+    if (stage == s_lastStage && icon == s_lastIcon && hintString == s_lastString)
+        return;
+    s_lastStage = stage;
+    s_lastIcon = icon;
+    s_lastString = hintString;
+    Com_Printf(
+        0,
+        "CURSOR_HINT stage=%s icon=%d string=%d snapHint=%d snapEnt=%d mat=%s text=\"%s\" name=\"%s\" cg_cursorHints=%d\n",
+        stage,
+        icon,
+        hintString,
+        cgameGlob && cgameGlob->nextSnap ? cgameGlob->nextSnap->ps.cursorHint : -1,
+        cgameGlob && cgameGlob->nextSnap ? cgameGlob->nextSnap->ps.cursorHintEntIndex : -1,
+        icon > 0 && icon < HINT_NUM_HINTS && cgMedia.hintMaterials[icon] ? cgMedia.hintMaterials[icon]->info.name
+                                                                        : "(null)",
+        text ? text : "",
+        secondary ? secondary : "",
+        cg_cursorHints ? cg_cursorHints->current.integer : -1);
+    if (text && *text && !strcmp(stage, "text"))
+    {
+        if (!s_passed)
+        {
+            s_passed = 1;
+            Com_Printf(0, "PASS:CURSOR_HINT_DRAWN icon=%d text=\"%s\" name=\"%s\"\n", icon, text,
+                       secondary ? secondary : "");
+        }
+    }
+}
+
 void __cdecl CG_DrawCursorhint(
     int32_t localClientNum,
     const rectDef_s *rect,
@@ -953,7 +1010,7 @@ void __cdecl CG_DrawCursorhint(
     const float *v14; // r6
     int v15; // r5
     int v16; // r4
-    long double v17; // fp2
+    double v17; // fp2
     char *displayString; // r28
     double heightScale; // fp29
     double widthScale; // fp23
@@ -964,7 +1021,7 @@ void __cdecl CG_DrawCursorhint(
     __int64 v25; // r11
     double v26; // fp13
     double v27; // fp0
-    long double v28; // fp2
+    double v28; // fp2
     int cursorHintIcon; // r11
     char *UseString; // r3
     const char *v31; // r30
@@ -1056,6 +1113,8 @@ void __cdecl CG_DrawCursorhint(
     const char *v118; // [sp+78h] [-1B8h] BYREF
     char v119[336]; // [sp+80h] [-1B0h] BYREF
 
+    if (!cg_cursorHints->current.integer)
+        CG_SwitchHintDiag("disabled", CG_GetLocalClientGlobals(localClientNum), 0, 0);
     if (cg_cursorHints->current.integer)
     {
         translatedDisplayName = 0;
@@ -1073,6 +1132,7 @@ void __cdecl CG_DrawCursorhint(
                 100))
             {
                 LocalClientGlobals->cursorHintIcon = HINT_NONE;
+                CG_SwitchHintDiag("none", LocalClientGlobals, 0, 0);
                 return;
             }
             displayString = 0;
@@ -1114,6 +1174,8 @@ void __cdecl CG_DrawCursorhint(
                 {
                     UseString = CG_GetUseString(localClientNum);
                     v31 = UseString;
+                    CG_SwitchHintDiag(UseString && *UseString ? "text" : "noicon_empty", LocalClientGlobals,
+                                      UseString, 0);
                     if (UseString)
                     {
                         if (*UseString)
@@ -1141,7 +1203,10 @@ void __cdecl CG_DrawCursorhint(
                 return;
             }
             if (!cgMedia.hintMaterials[cursorHintIcon])
+            {
+                CG_SwitchHintDiag("no_material", LocalClientGlobals, 0, 0);
                 return;
+            }
             if (cursorHintIcon < FIRST_WEAPON_HINT || cursorHintIcon > LAST_WEAPON_HINT)
             {
                 if (LocalClientGlobals->cursorHintString < 0)
@@ -1149,6 +1214,8 @@ void __cdecl CG_DrawCursorhint(
                     if (cursorHintIcon != HINT_HEALTH)
                     {
                     LABEL_39:
+                        CG_SwitchHintDiag(displayString && *displayString ? "text" : "icon_only",
+                                          LocalClientGlobals, displayString, translatedDisplayName);
                         if (displayString && *displayString)
                         {
                             length = UI_TextWidth(displayString, 0, font, fontscale);
@@ -1737,8 +1804,8 @@ void __cdecl CG_DrawPlayerAmmoValue(
     Material *material,
     int textStyle)
 {
-    long double v12; // fp2
-    long double v13; // fp2
+    double v12; // fp2
+    double v13; // fp2
     double v14; // fp1
     unsigned int SelectedWeaponIndex; // r3
     int v16; // r30
@@ -2525,8 +2592,8 @@ void __cdecl CG_DrawPlayerStance(
     int32_t textStyle)
 {
 #if 0
-    long double v11; // fp2
-    long double v12; // fp2
+    double v11; // fp2
+    double v12; // fp2
     double v13; // fp31
     int scrPlace; // r7
     const float *v15; // r6
@@ -2543,8 +2610,8 @@ void __cdecl CG_DrawPlayerStance(
     int v26; // r3
     __int128 v27; // r11
     double v28; // fp31
-    long double v29; // fp2
-    long double v30; // fp2
+    double v29; // fp2
+    double v30; // fp2
     int tagmat; // r7
     double origin; // fp8
     double v33; // fp7
@@ -3095,7 +3162,7 @@ void __cdecl CG_OwnerDraw(
     int v65; // r7
     float *v66; // r6
     const float *v67; // r5
-    long double v68; // fp2
+    double v68; // fp2
     bool v69; // [sp+Bh] [-D5h]
     rectDef_s rect; // [sp+60h] [-80h] BYREF
 

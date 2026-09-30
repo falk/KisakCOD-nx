@@ -517,11 +517,19 @@ void __cdecl SV_CheckLoadLevel(SaveGame *save)
         CL_ReadDemoMessagesUntilNextSnap();
     else
         SV_SendClientMessages();
+    
     Hunk_CheckTempMemoryClear();
     Hunk_CheckTempMemoryHighClear();
+    
 }
 
-static void SV_FreeReliableCommandsForClient(client_t *cl)
+// Pre-existing decompiled-source name collision with the real exported
+// SV_FreeReliableCommandsForClient in sv_init.cpp (declared non-static in
+// sv_public.h): this file's own copy was silently shadowing that
+// declaration by being `static`, which GCC now rejects as a linkage
+// conflict.  Renamed rather than merged, since the two bodies clear
+// different byte counts and this file's only caller is local to it.
+static void SV_FreeReliableCommandsForClientLocal(client_t *cl)
 {
     Com_Memset(&cl->reliableCommands, 0, 12);
 }
@@ -536,7 +544,7 @@ static void SV_ShutdownGameVM(int clearScripts)
     sv.state = SS_DEAD;
     G_ShutdownGame(clearScripts);
     svs.clients->gentity = 0;
-    SV_FreeReliableCommandsForClient(svs.clients);
+    SV_FreeReliableCommandsForClientLocal(svs.clients);
 }
 
 void __cdecl SV_ShutdownGameProgs()
@@ -569,7 +577,7 @@ void __cdecl SV_InitGameVM(uint32_t randomSeed, int restart, int savegame, SaveG
     if (!++sv.skelTimeStamp)
         sv.skelTimeStamp = 1;
     sv.skelMemPos = 0;
-    g_sv_skel_memory_start = (char *)((uint32_t)&g_sv_skel_memory[15] & 0xFFFFFFF0);
+    g_sv_skel_memory_start = (char *)(((uintptr_t)&g_sv_skel_memory[15]) & ~(uintptr_t)0xF);
     SND_ErrorCleanup();
 
     {
@@ -832,7 +840,7 @@ void __cdecl SV_SetGametype()
     if (com_sv_running->current.enabled && G_GetSavePersist())
         I_strncpyz(gametype, sv.gametype, 64);
     else
-        I_strncpyz(gametype, (char *)sv_gametype->current.integer, 64);
+        I_strncpyz(gametype, sv_gametype->current.string, 64);
     for (s = gametype; *s; ++s)
         *s = tolower(*s);
     if (!Scr_IsValidGameType(gametype))

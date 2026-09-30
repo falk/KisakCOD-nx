@@ -316,7 +316,9 @@ struct MaterialPixelShaderProgram // sizeof=0xC
     IDirect3DPixelShader9 *ps;
     GfxPixelShaderLoadDef loadDef;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(MaterialPixelShaderProgram) == 12);
+#endif
 
 struct MaterialPixelShader // sizeof=0x10
 {                                       // ...
@@ -361,6 +363,23 @@ struct MaterialTechnique // sizeof=0x1C
     uint16_t passCount;
     MaterialPass passArray[1];
 };
+
+// a drawn pass is valid only when both shader objects exist, both
+// programs were created by the device, and both were cooked for the renderer
+// in use.  Load_CreateMaterial*Shader nulls a variant whose loadForRenderer
+// does not match (the engine's supported dedicated-server/variant path), so
+// anything that later draws that pass must fail loudly rather than bind a
+// null shader.  Extracted here so the runtime guard and the host acceptance
+// test share one predicate.
+inline bool MaterialPassShadersDrawable(const MaterialPass *pass, int rendererInUse)
+{
+    if (!pass || !pass->pixelShader || !pass->vertexShader)
+        return false;
+    return pass->pixelShader->prog.ps != nullptr
+        && pass->vertexShader->prog.vs != nullptr
+        && pass->pixelShader->prog.loadDef.loadForRenderer == rendererInUse
+        && pass->vertexShader->prog.loadDef.loadForRenderer == rendererInUse;
+}
 struct WaterWritable // sizeof=0x4
 {                                       // ...
     float floatTime;
@@ -476,6 +495,13 @@ struct MaterialTextureDef // sizeof=0xC
     MaterialTextureDefInfo u;
 };
 
+inline GfxImage *MaterialTextureImage(const MaterialTextureDef &texture)
+{
+    return texture.semantic == 11
+        ? (texture.u.water ? texture.u.water->image : nullptr)
+        : texture.u.image;
+}
+
 struct MaterialConstantDef // sizeof=0x20
 {
     uint32_t nameHash;
@@ -507,7 +533,9 @@ struct MaterialTechniqueSet // sizeof=0x94
     MaterialTechniqueSet *remappedTechniqueSet;
     MaterialTechnique *techniques[TECHNIQUE_COUNT];
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(MaterialTechniqueSet) == 148);
+#endif
 
 struct Material // sizeof=0x50
 {                                       // ...
@@ -552,7 +580,9 @@ struct Material // sizeof=0x50
 // 8-byte alignment. The pad is harmless — the fields are read/written by name.
 static_assert(sizeof(Material) == 96);
 #else
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(Material) == 80);
+#endif
 #endif
 
 struct MaterialMemory // sizeof=0x8
@@ -710,6 +740,7 @@ bool __cdecl Material_IsDefault(const Material *material);
 Material *__cdecl Material_Register_FastFile(const char *name);
 Material *__cdecl Material_Register(const char *name, int imageTrack);
 Material *__cdecl Material_RegisterHandle(const char *name, int imageTrack);
+Material *__cdecl Material_Find(const char *name);
 
 void __cdecl Material_GetHashIndex(const char *name, uint16_t *hashIndex, bool *exists);
 void __cdecl Material_Add(Material *material, uint16_t hashIndex);

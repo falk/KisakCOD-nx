@@ -14,8 +14,10 @@
 #include "r_shadowcookie.h"
 
 #include <algorithm>
+#include <chrono>
 #include <universal/com_files.h>
 #include <universal/profile.h>
+#include <database/db_retail_decode_material.h>
 
 //MaterialGlobals materialGlobals; // LWSS: moved to db_registry for DEDICATED
 
@@ -286,17 +288,71 @@ uint8_t *__cdecl Material_Alloc(uint32_t size)
     return Hunk_Alloc(size, "Material_Alloc", 22);
 }
 
+// Load-time shader creation profile, read and reset per zone by
+// DB_TryLoadXFileInternal (KILLHOUSE_LOAD_SHADERS). Device shader creation
+// dominates the techset share of zone decode time, so this splits it out
+// of decode_ms. Database thread only.
+static uint32_t s_shaderCreateCount;
+static uint64_t s_shaderCreateUs;
+
+namespace
+{
+struct ShaderCreateTimer
+{
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~ShaderCreateTimer()
+    {
+        ++s_shaderCreateCount;
+        s_shaderCreateUs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start)
+                .count());
+    }
+};
+} // namespace
+
+void R_TakeShaderCreateStats(uint32_t *count, uint64_t *micros)
+{
+    *count = s_shaderCreateCount;
+    *micros = s_shaderCreateUs;
+    s_shaderCreateCount = 0;
+    s_shaderCreateUs = 0;
+}
+
 void __cdecl Load_CreateMaterialPixelShader(GfxPixelShaderLoadDef *loadDef, MaterialPixelShader *mtlShader)
 {
     iassert( loadDef == &mtlShader->prog.loadDef );
+    bool isMatch = (mtlShader && mtlShader->name && strcmp(mtlShader->name, "ler") == 0);
     if (r_loadForRenderer->current.enabled && loadDef->loadForRenderer == r_rendererInUse->current.integer)
     {
         ProfLoad_Begin("Create pixel shader");
-        dx.device->CreatePixelShader((DWORD*)loadDef->program, (IDirect3DPixelShader9 **)&mtlShader->prog);
+        ShaderCreateTimer timer;
+        HRESULT hr = dx.device ? dx.device->CreatePixelShader((DWORD*)loadDef->program, (IDirect3DPixelShader9 **)&mtlShader->prog) : (HRESULT)0x80004005L;
         ProfLoad_End();
+        if (isMatch || (int)hr < 0)
+        {
+        }
     }
     else
     {
+        // this is the engine's supported path only while
+        // r_loadForRenderer is disabled (dedicated server, no D3D
+        // allocation).  With rendering enabled a mismatch means the variant
+        // was cooked for another renderer; record every null-out, not just
+        // the r0c0n0s0 trace, so a production run can prove which variants
+        // were dropped.  Material_GetTechnique makes any *drawn* drop fatal.
+        static uint32_t s_psSkipLog = 0;
+        if (s_psSkipLog < 64u)
+        {
+            ++s_psSkipLog;
+            Switch_BootLog(va("KILLHOUSE_SHADER_PS_SKIP name=%s lfr=%u curRen=%d enabled=%d\n",
+                              (mtlShader && mtlShader->name) ? mtlShader->name : "null",
+                              loadDef->loadForRenderer,
+                              r_rendererInUse ? r_rendererInUse->current.integer : -1,
+                              r_loadForRenderer ? r_loadForRenderer->current.enabled : -1));
+        }
+        if (isMatch)
+        {
+        }
         mtlShader->prog.ps = 0;
     }
 }
@@ -307,11 +363,28 @@ void __cdecl Load_CreateMaterialVertexShader(GfxVertexShaderLoadDef *loadDef, Ma
     if (r_loadForRenderer->current.enabled && loadDef->loadForRenderer == r_rendererInUse->current.integer)
     {
         ProfLoad_Begin("Create vertex shader");
-        dx.device->CreateVertexShader((DWORD*)loadDef->program, (IDirect3DVertexShader9 **)&mtlShader->prog);
+        ShaderCreateTimer timer;
+        HRESULT hr = dx.device ? dx.device->CreateVertexShader((DWORD*)loadDef->program, (IDirect3DVertexShader9 **)&mtlShader->prog) : (HRESULT)0x80004005L;
         ProfLoad_End();
+        if ((int)hr < 0)
+        {
+        }
     }
     else
     {
+        // same as the pixel-shader null-out above -- record every
+        // dropped variant so the production run can prove which (if any)
+        // were dropped; Material_GetTechnique keeps drawn drops fatal.
+        static uint32_t s_vsSkipLog = 0;
+        if (s_vsSkipLog < 64u)
+        {
+            ++s_vsSkipLog;
+            Switch_BootLog(va("KILLHOUSE_SHADER_VS_SKIP name=%s lfr=%u curRen=%d enabled=%d\n",
+                              (mtlShader && mtlShader->name) ? mtlShader->name : "null",
+                              loadDef->loadForRenderer,
+                              r_rendererInUse ? r_rendererInUse->current.integer : -1,
+                              r_loadForRenderer ? r_loadForRenderer->current.enabled : -1));
+        }
         mtlShader->prog.vs = 0;
     }
 }
@@ -465,6 +538,11 @@ MaterialTechniqueSet *__cdecl Material_FindTechniqueSet_FastFile(
     const char *name,
     MtlTechSetNotFoundBehavior notFoundBehavior)
 {
+    if (notFoundBehavior == MTL_TECHSET_NOT_FOUND_RETURN_NULL)
+    {
+        XAssetHeader header = DB_FindXAssetHeaderNoDefault(ASSET_TYPE_TECHNIQUE_SET, name);
+        return (MaterialTechniqueSet *)header.techniqueSet;
+    }
     XAssetHeader header; // [esp+4h] [ebp-4h]
 
     header.xmodelPieces = DB_FindXAssetHeader(ASSET_TYPE_TECHNIQUE_SET, name).xmodelPieces;
@@ -492,6 +570,26 @@ bool __cdecl Material_IsDefault(const Material *material)
 
 Material *__cdecl Material_Register_FastFile(const char *name)
 {
+    if (name && *name)
+    {
+        const char *cleanName = (name[0] == ',') ? name + 1 : name;
+        if (DB_XAssetExists(ASSET_TYPE_MATERIAL, cleanName) && !DB_IsXAssetDefault(ASSET_TYPE_MATERIAL, cleanName))
+            return DB_FindXAssetHeader(ASSET_TYPE_MATERIAL, cleanName).material;
+        // a comma-prefixed name is a DB stub, not a body.  The
+        // original Material_Register_FastFile is exactly
+        // DB_FindXAssetHeader(ASSET_TYPE_MATERIAL, name), which resolves the
+        // stub to its registered owner or to the default entry (created by
+        // DB_CreateDefaultEntry).  Keep RetailMaterial_Synthesize2D for the
+        // tolerable non-stub UI names it was introduced for, but never let a
+        // comma stub manufacture a material the retail zones do not own.
+        if (name[0] != ',')
+        {
+            Material *synth = RetailMaterial_Synthesize2D(cleanName, nullptr);
+            if (synth)
+                return synth;
+        }
+        return DB_FindXAssetHeader(ASSET_TYPE_MATERIAL, cleanName).material;
+    }
     return DB_FindXAssetHeader(ASSET_TYPE_MATERIAL, name).material;
 }
 
@@ -600,6 +698,30 @@ bool __cdecl R_MaterialCompare(const MaterialMemory &material0, const MaterialMe
 {
     return material0.memory < material1.memory;
 }
+// LP64: the decompiled materiallist command relied on `inData` being
+// immediately followed by the MaterialMemory array on the stack and on
+// XAssetHeader being 4 bytes; use an explicit list instead.
+struct MaterialList
+{
+    uint32_t count;
+    MaterialMemory sorted[2048];
+};
+
+static void __cdecl R_GetMaterialList(XAssetHeader header, void *data)
+{
+    MaterialList *list = (MaterialList *)data;
+    int memory; // [esp+0h] [ebp-Ch]
+
+    memory = R_GetMaterialMemory(header.material);
+    if (memory)
+    {
+        iassert( list->count < ARRAY_COUNT( list->sorted ) );
+        list->sorted[list->count].material = header.material;
+        list->sorted[list->count].memory = memory;
+        ++list->count;
+    }
+}
+
 void __cdecl R_MaterialList_f()
 {
     const char *fmt; // [esp+8h] [ebp-4150h]
@@ -607,24 +729,18 @@ void __cdecl R_MaterialList_f()
     Material *material; // [esp+13Ch] [ebp-401Ch]
     int v3; // [esp+140h] [ebp-4018h]
     MaterialMemory *v4; // [esp+144h] [ebp-4014h]
-    uint32_t inData; // [esp+148h] [ebp-4010h] BYREF
-    MaterialMemory v6[2049]; // [esp+14Ch] [ebp-400Ch] BYREF
+    static MaterialList list;
     float v7; // [esp+4154h] [ebp-4h]
 
     v3 = 0;
     Com_Printf(CON_CHANNEL_GFX, "-----------------------\n");
-    inData = 0;
-    DB_EnumXAssets(ASSET_TYPE_MATERIAL, (void(__cdecl *)(XAssetHeader, void*))R_GetMaterialList, &inData, 0);
-    // std::_Sort<ShadowCandidate *, int, bool(__cdecl *)(ShadowCandidate const &, ShadowCandidate const &)>(
-    //     (ShadowCandidate *)v6,
-    //     (ShadowCandidate *)&v6[inData],
-    //     (int)(8 * inData) >> 3,
-    //     R_MaterialCompare);
-    std::sort(&v6[0], &v6[inData], R_MaterialCompare);
+    list.count = 0;
+    DB_EnumXAssets(ASSET_TYPE_MATERIAL, R_GetMaterialList, &list, 0);
+    std::sort(&list.sorted[0], &list.sorted[list.count], R_MaterialCompare);
     Com_Printf(CON_CHANNEL_GFX, "geo KB   name\n");
-    for (i = 0; i < inData; ++i)
+    for (i = 0; i < list.count; ++i)
     {
-        v4 = &v6[i];
+        v4 = &list.sorted[i];
         material = v4->material;
         iassert( material );
         v3 += v4->memory;
@@ -638,24 +754,8 @@ void __cdecl R_MaterialList_f()
     }
     Com_Printf(CON_CHANNEL_GFX, "-----------------------\n");
     Com_Printf(CON_CHANNEL_GFX, "current total  %5.1f MB\n", (double)v3 / 1048576.0);
-    Com_Printf(CON_CHANNEL_GFX, "%i total geometry materials\n", inData);
+    Com_Printf(CON_CHANNEL_GFX, "%i total geometry materials\n", list.count);
     Com_Printf(CON_CHANNEL_GFX, "Related commands: meminfo, imagelist, gfx_world, gfx_model, cg_drawfps, com_statmon, tempmeminfo\n");
-}
-
-void __cdecl R_GetMaterialList(XAssetHeader header, char *data)
-{
-    int memory; // [esp+0h] [ebp-Ch]
-    XAssetHeader *materialMemory; // [esp+4h] [ebp-8h]
-
-    memory = R_GetMaterialMemory(header.material);
-    if (memory)
-    {
-        //iassert( materialList->count < ARRAY_COUNT( materialList->sorted ) ); // KISAKTODO
-        materialMemory = (XAssetHeader *)&data[8 * *(uint32_t *)data + 4];
-        materialMemory->xmodelPieces = header.xmodelPieces;
-        materialMemory[1].xmodelPieces = (XModelPieces *)memory;
-        ++*(uint32_t *)data;
-    }
 }
 
 int __cdecl R_GetMaterialMemory(Material *material)
@@ -738,8 +838,7 @@ void __cdecl Material_ReleasePassResources(MaterialPass *pass)
     IDirect3DPixelShader9 *varCopy; // [esp+8h] [ebp-8h]
     int declIndex; // [esp+Ch] [ebp-4h]
 
-    iassert( pass->pixelShader );
-    if (pass->pixelShader->prog.ps)
+    if (pass->pixelShader && pass->pixelShader->prog.ps)
     {
         do
         {
@@ -754,8 +853,7 @@ void __cdecl Material_ReleasePassResources(MaterialPass *pass)
                 935);
         } while (alwaysfails);
     }
-    iassert( pass->vertexShader );
-    if (pass->vertexShader->prog.vs)
+    if (pass->vertexShader && pass->vertexShader->prog.vs)
     {
         do
         {
@@ -766,8 +864,7 @@ void __cdecl Material_ReleasePassResources(MaterialPass *pass)
             R_ReleaseAndSetNULL<IDirect3DDevice9>(var, "pass->vertexShader->prog.vs", ".\\r_material.cpp", 939);
         } while (alwaysfails);
     }
-    iassert( pass->vertexDecl );
-    if (pass->vertexDecl->isLoaded)
+    if (pass->vertexDecl && pass->vertexDecl->isLoaded)
     {
         pass->vertexDecl->isLoaded = 0;
         for (declIndex = 0; declIndex < 16; ++declIndex)
@@ -866,9 +963,8 @@ void __cdecl Material_ReleaseAll()
 
 const Material *__cdecl Material_FromHandle(Material *handle)
 {
-    iassert(handle);
-    iassert(handle->info.name);
-    iassert(handle->info.name[0]);
+    if (!handle || !handle->info.name || !handle->info.name[0])
+        return rgp.defaultMaterial;
 
     return handle;
 }
@@ -944,11 +1040,14 @@ void __cdecl Material_UpdatePicmipForTexdef(const MaterialTextureDef *texdef)
 
 void __cdecl Material_UpdatePicmipSingle(XAssetHeader header)
 {
-    int textureIndex; // [esp+4h] [ebp-4h]
+    Material *material = header.material;
+    if (!material)
+        return;
 
-    for (textureIndex = 0; textureIndex < BYTE2(header.xmodelPieces[4].pieces); ++textureIndex)
-        Material_UpdatePicmipForTexdef((MaterialTextureDef*)header.xmodelPieces[5].pieces + textureIndex);
+    for (int textureIndex = 0; textureIndex < material->textureCount; ++textureIndex)
+        Material_UpdatePicmipForTexdef(&material->textureTable[textureIndex]);
 }
+
 
 void __cdecl Material_UpdatePicmipAll()
 {

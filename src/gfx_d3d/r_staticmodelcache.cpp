@@ -14,6 +14,16 @@
 #include "r_utils.h"
 #include "r_xsurface.h"
 #include "r_model_lighting.h"
+#include <deko9/deko9_native.h> // Deko9_SetBufferRole: r_deko9Census dynamic-buffer table
+
+// KILLHOUSE/SMC diagnostic markers: high-volume per-frame tracing kept for the
+// verifiers, gated off by default so a hardware run does not pay a syscall per
+// line. See com_diagMarkers in switch_diag_dvars.cpp.
+static inline bool Killhouse_DiagMarkers()
+{
+    extern const dvar_t *com_diagMarkers;
+    return com_diagMarkers && com_diagMarkers->current.enabled;
+}
 
 
 static_model_cache_t s_cache;
@@ -27,7 +37,10 @@ void __cdecl TRACK_r_staticmodelcache()
 void *R_AllocStaticModelCache()
 {
     iassert(!gfxBuf.smodelCacheVb);
-    return R_AllocDynamicVertexBuffer(&gfxBuf.smodelCacheVb, 0x800000);
+    void *ret = R_AllocDynamicVertexBuffer(&gfxBuf.smodelCacheVb, 0x800000);
+    if (gfxBuf.smodelCacheVb)
+        Deko9_SetBufferRole(gfxBuf.smodelCacheVb, "smodelCacheVB");
+    return ret;
 }
 
 void __cdecl R_InitStaticModelCache()
@@ -86,25 +99,48 @@ void __cdecl R_CacheStaticModelIndices(uint32_t smodelIndex, uint32_t lod, uint3
     model = rgp.world->dpvs.smodelDrawInsts[smodelIndex].model;
     XModelGetSurfaces(model, &surfs, lod);
     surfCount = XModelGetSurfCount(model, lod);
+    if (Killhouse_DiagMarkers())
+        Com_Printf(0, "SMC_IDX_DIAG smodel=%u lod=%u surfs=%u cacheBase=%u\n", smodelIndex, lod,
+               surfCount, cacheBaseVertIndex);
     for (surfIndex = 0; surfIndex < surfCount; ++surfIndex)
     {
         xsurf = &surfs[surfIndex];
+        if (Killhouse_DiagMarkers())
+            Com_Printf(0, "SMC_IDX_DIAG surf=%u tri=%u vert=%u baseTri=%u baseVert=%u deformed=%u\n",
+                   surfIndex, xsurf->triCount, xsurf->vertCount, xsurf->baseTriIndex,
+                   xsurf->baseVertIndex, xsurf->deformed ? 1u : 0u);
         twoBaseOffsets = (uint16_t)(cacheBaseVertIndex + xsurf->baseVertIndex)
             | ((uint16_t)(cacheBaseVertIndex + xsurf->baseVertIndex) << 16);
+        if (!xsurf->triIndices)
+        {
+            
+            continue;
+        }
         twoSrcIndices = (uint32_t *)xsurf->triIndices;
         baseIndex = 3 * xsurf->baseTriIndex + 4 * cacheBaseVertIndex;
         iassert( baseIndex < SMC_MAX_INDEX_IN_CACHE );
-        if (baseIndex + 3 * xsurf->triCount > 0x100000)
+        if (baseIndex >= (uint32_t)SMC_MAX_INDEX_IN_CACHE ||
+            baseIndex + 3u * (uint32_t)xsurf->triCount > 0x100000u)
+        {
+            
             MyAssertHandler(
                 ".\\r_staticmodelcache.cpp",
                 478,
                 0,
                 "%s",
                 "baseIndex + xsurf->triCount * 3 <= SMC_MAX_INDEX_IN_CACHE");
+            continue;
+        }
         twoDstIndices = (uint32_t *)&gfxBuf.smodelCache.indices[baseIndex];
+        // The packed u32 loop below copies 2 tris (6 indices) per
+        // iteration, so it requires an even triCount. Odd-tri surfaces are
+        // real retail data (not a widen bug): run the even prefix packed,
+        // then the final tri scalar (per-u16, no carry hazard).
+        if (!xsurf->triCount)
+            continue;
         iterationCount = xsurf->triCount / 2;
         iassert( iterationCount * 2 == xsurf->triCount );
-        iassert( iterationCount );
+        if (iterationCount)
         {
             PROF_SCOPED("R_memcpy");
             do
@@ -116,6 +152,15 @@ void __cdecl R_CacheStaticModelIndices(uint32_t smodelIndex, uint32_t lod, uint3
                 twoSrcIndices = twoSrcIndicesa + 1;
                 --iterationCount;
             } while (iterationCount);
+        }
+        if (xsurf->triCount & 1u)
+        {
+            const uint16_t *srcTail = (const uint16_t *)twoSrcIndices;
+            uint16_t *dstTail = (uint16_t *)twoDstIndices;
+            const uint16_t base = (uint16_t)(cacheBaseVertIndex + xsurf->baseVertIndex);
+            dstTail[0] = srcTail[0] + base;
+            dstTail[1] = srcTail[1] + base;
+            dstTail[2] = srcTail[2] + base;
         }
     }
 }
@@ -200,7 +245,11 @@ char __cdecl SMC_GetFreeBlockOfSize(uint32_t smcIndex, uint32_t listIndex)
         tree->usedlist.next->prev = &tree->usedlist;
     }
     leafs = s_cache.leafs[treeIndex];
-    index = ((char*)block - (char*)leafs) / 8;
+    // Leaf-size stride: static_model_leaf_t is 8 bytes on the ILP32
+    // reference ABI but 16 on LP64 (static_model_node_list_t's two
+    // pointers); the old ILP32 literal doubled every index and corrupted
+    // cacheIndex (caught live: cacheIndex 16459 > 16384 leaves).
+    index = ((char*)block - (char*)leafs) / sizeof(s_cache.leafs[0][0]);
     bcassert(index, ARRAY_COUNT(s_cache.leafs[treeIndex]));
     if (block != (static_model_node_list_t *)&leafs[index])
         MyAssertHandler(
@@ -244,7 +293,9 @@ uint16_t __cdecl SMC_Allocate(uint32_t smcIndex, uint32_t bitCount)
     iassert(block->prev->next == block);
     block->next->prev = block->prev;
     block->prev->next = block->next;
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
     static_assert(sizeof(s_cache.leafs[0]) == 256);
+#endif
     treeIndex = ((char *)block - (char *)s_cache.leafs) / sizeof(s_cache.leafs[0]);
     bcassert(treeIndex, ARRAY_COUNT(s_cache.trees));
     tree = &s_cache.trees[treeIndex];
@@ -256,7 +307,7 @@ uint16_t __cdecl SMC_Allocate(uint32_t smcIndex, uint32_t bitCount)
         tree->usedlist.next->prev = &tree->usedlist;
     }
     leafs = s_cache.leafs[treeIndex];
-    index = ((char *)block - (char *)leafs) / 8;
+    index = ((char *)block - (char *)leafs) / sizeof(s_cache.leafs[0][0]);
     bcassert(index, ARRAY_COUNT(s_cache.leafs[treeIndex]));
     iassert(block == &leafs[index].freenode);
     nodeIndex = ((index + 32) >> (5 - listIndex)) - 1;
@@ -306,7 +357,7 @@ uint16_t __cdecl R_CacheStaticModelSurface(
     if (cacheIndex)
     {
         cachedSurf = &SMC_GetLeaf(cacheIndex)->cachedSurf;
-        tree = &s_cache.trees[((char*)cachedSurf - (char*)s_cache.leafs) / 256];
+        tree = &s_cache.trees[((char*)cachedSurf - (char*)s_cache.leafs) / sizeof(s_cache.leafs[0])];
         if (tree->frameCount != rg.frontEndFrameCount)
         {
             tree->frameCount = rg.frontEndFrameCount;
@@ -352,9 +403,14 @@ uint16_t __cdecl R_CacheStaticModelSurface(
 
                 skinSmodelCmd.firstPatchVert = smcPatchVertsUsed;
                 frontEndDataOut->smcPatchVertsUsed += cachedVertsNeeded;
+                if (Killhouse_DiagMarkers())
+                    Com_Printf(0, "SMC_ALLOC_DIAG smodel=%u lod=%u allocBits=%u smcIdx+1=%u needed=%u patchUsed=%u cacheIndex=%u baseVert=%u\n",
+                           smodelIndex, lodInfo->lod, lodInfo->smcAllocBits,
+                           lodInfo->smcIndexPlusOne, cachedVertsNeeded, smcPatchVertsUsed,
+                           cacheIndexa, cachedSurfa->baseVertIndex);
                 R_AddWorkerCmd(WRKCMD_SKIN_CACHED_STATICMODEL, (unsigned char*)&skinSmodelCmd);
                 R_CacheStaticModelIndices(cachedSurfa->smodelIndex, cachedSurfa->lodIndex, cachedSurfa->baseVertIndex);
-                treea = &s_cache.trees[((char*)cachedSurfa - (char*)s_cache.leafs) / 256];
+                treea = &s_cache.trees[((char*)cachedSurfa - (char*)s_cache.leafs) / sizeof(s_cache.leafs[0])];
                 treea->frameCount = rg.frontEndFrameCount;
                 
                 iassert(treea->usedlist.prev->prev->next == treea->usedlist.prev);

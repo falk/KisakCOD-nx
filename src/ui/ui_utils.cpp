@@ -405,7 +405,9 @@ const char *__cdecl String_Alloc(const char *p)
         last = stra;
         stra = stra->next;
     }
-    strb = (stringDef_s *)UI_Alloc(8u, 4);
+    // LP64: stringDef_s is two pointers (16 bytes); the ILP32 UI_Alloc(8, 4)
+    // let the `str` store run into the next hunk allocation.
+    strb = (stringDef_s *)UI_Alloc(sizeof(stringDef_s), alignof(stringDef_s));
     strb->next = 0;
     strb->str = (const char *)s;
     if (last)

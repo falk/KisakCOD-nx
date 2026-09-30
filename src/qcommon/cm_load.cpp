@@ -9,8 +9,8 @@
 
 //Line 53199 : 0006 : 006e75b8       struct clipMap_t cm        82e975b8     cm_load.obj
 clipMap_t cm;
-cbrush_t g_box_brush[THREAD_CONTEXT_TRACE_COUNT];
-cmodel_t g_box_model[THREAD_CONTEXT_TRACE_COUNT];
+cbrush_t g_box_brush[THREAD_CONTEXT_COUNT];
+cmodel_t g_box_model[THREAD_CONTEXT_COUNT];
 
 void __cdecl TRACK_cm_load()
 {
@@ -32,6 +32,12 @@ static void CM_InitAllThreadData()
 
 #ifdef KISAK_SP
     CM_InitThreadData(THREAD_CONTEXT_SERVER);
+    // This port materializes delayed/generated images (R_DelayLoadImage ->
+    // Image_MaterializeBuiltin -> R_GenerateOutdoorImage -> Outdoor_TraceHeightInWorld)
+    // on the database thread at the end of every zone load, so that thread
+    // needs the same partition stamps and box scratch the other tracing
+    // contexts get. Without it every generated outdoor image asserts.
+    CM_InitThreadData(THREAD_CONTEXT_DATABASE);
 #endif
 }
 
@@ -50,7 +56,7 @@ void __cdecl CM_InitThreadData(uint32_t threadContext)
 {
     TraceThreadInfo *traceThreadInfo; // [esp+8h] [ebp-4h]
 
-    bcassert(threadContext, THREAD_CONTEXT_TRACE_COUNT);
+    bcassert(threadContext, THREAD_CONTEXT_COUNT);
 
     traceThreadInfo = &g_traceThreadInfo[threadContext];
     traceThreadInfo->checkcount.global = 0;
@@ -85,7 +91,7 @@ void __cdecl CM_Shutdown()
     const char *savedName; // [esp+0h] [ebp-4h]
 
     savedName = cm.name;
-    Com_Memset((uint32_t *)&cm, 0, 284);
+    Com_Memset((uint32_t *)&cm, 0, sizeof(cm)); // LP64: was the ILP32 sizeof(clipMap_t)
     cm.name = savedName;
     iassert( !cm.isInUse );
 }

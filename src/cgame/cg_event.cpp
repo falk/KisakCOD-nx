@@ -12,6 +12,8 @@
 #include <DynEntity/DynEntity_client.h>
 #include <ragdoll/ragdoll.h>
 #include <client/client.h>
+#include <universal/com_math.h>
+#include <port/switch_rumble.h>
 
 #ifdef KISAK_MP
 #include <cgame_mp/cg_local_mp.h>
@@ -24,6 +26,7 @@
 #include "cg_compassfriendlies.h"
 #endif
 #include <universal/com_sndalias.h>
+#include <sound/snd_public.h>
 
 
 int32_t __cdecl CG_GetBoneIndex(
@@ -59,6 +62,23 @@ void __cdecl CG_PlayBoltedEffect(
         FX_PlayBoltedEffect(localClientNum, fxDef, time, dobjHandle, boneIndex);
     }
 }
+
+#if defined(__SWITCH__)
+// Nearby-explosion rumble: local player's distance from the blast origin
+// against the weapon's iExplosionRadius. Called from the grenade/rocket
+// explosion cases below, which already have `position` and `weaponDef` in
+// scope; a no-op for any other local client (split-screen never exists on
+// Switch, so localClientNum is always 0 in practice, but the check is
+// cheap and correct either way).
+static void Switch_CG_NotifyExplosionRumble(int32_t localClientNum, const cg_s *cgameGlob,
+                                             const float *position, float radius)
+{
+    if (localClientNum != 0 || radius <= 0.0f)
+        return;
+    const float distance = Vec3Distance(position, cgameGlob->refdef.vieworg);
+    Switch_RumbleNotifyExplosion(distance, radius);
+}
+#endif
 
 void __cdecl CG_EntityEvent(int32_t localClientNum, centity_s *cent, int32_t event)
 {
@@ -206,17 +226,20 @@ void __cdecl CG_EntityEvent(int32_t localClientNum, centity_s *cent, int32_t eve
                 if (ent->eventParm)
                 {
                     ConfigString = CL_GetConfigString(localClientNum, CS_SOUNDALIASES + ent->eventParm);
-                    CG_PlaySoundAliasByName(localClientNum, ent->number, ent->lerp.pos.trBase, ConfigString);
+                    const int id = CG_PlaySoundAliasByName(localClientNum, ent->number, ent->lerp.pos.trBase, ConfigString);
+                    if (SND_DebugStartsEnabled())
+                        Com_Printf(CON_CHANNEL_SOUND, "SND_CGDBG alias=%s ent=%d ev=%d id=%d\n", ConfigString ? ConfigString : "(null)",
+                                   ent->number, event, id);
                 }
                 return;
             case EV_SOUND_ALIAS_AS_MASTER:
                 if (ent->eventParm)
                 {
-                    CG_PlaySoundAliasAsMasterByName(localClientNum,
-                        ent->number,
-                        ent->lerp.pos.trBase,
-                        CL_GetConfigString(localClientNum, CS_SOUNDALIASES + ent->eventParm)
-                    );
+                    const char *alias = CL_GetConfigString(localClientNum, CS_SOUNDALIASES + ent->eventParm);
+                    const int id = CG_PlaySoundAliasAsMasterByName(localClientNum, ent->number, ent->lerp.pos.trBase, alias);
+                    if (SND_DebugStartsEnabled())
+                        Com_Printf(CON_CHANNEL_SOUND, "SND_CGDBG alias=%s ent=%d ev=%d id=%d\n", alias ? alias : "(null)",
+                                   ent->number, event, id);
                 }
                 return;
             case EV_STOPSOUNDS:
@@ -462,7 +485,10 @@ void __cdecl CG_EntityEvent(int32_t localClientNum, centity_s *cent, int32_t eve
                 return;
 #ifdef KISAK_SP
             case EV_BULLET_TRACER: // 0x29
-                if (cent->nextState.eventParm || (cg_tracerChance->current.value * 32768.0f > (float)rand()))
+                // * 32768.0 assumed 15-bit rand (tracers almost never drew
+                // with 31-bit rand). Threshold in the real rand domain keeps
+                // the retail probability exactly.
+                if (cent->nextState.eventParm || (cg_tracerChance->current.value * (RAND_MAX + 1.0) > (double)rand()))
                 {
                     CG_SpawnTracer(localClientNum, cent->nextState.lerp.pos.trBase, cent->nextState.lerp.u.turret.gunAngles);
                 }
@@ -480,6 +506,8 @@ void __cdecl CG_EntityEvent(int32_t localClientNum, centity_s *cent, int32_t eve
                         v88 = CG_PlaySoundAliasByName(localClientNum, v86, cent->nextState.lerp.pos.trBase, v85);
                     else
                         v88 = CG_PlaySoundAliasAsMasterByName(localClientNum, v86, cent->nextState.lerp.pos.trBase, v85);
+                    if (SND_DebugStartsEnabled())
+                        Com_Printf(CON_CHANNEL_SOUND, "SND_CGDBG alias=%s ent=%d ev=%d id=%d\n", v85 ? v85 : "(null)", v86, event, v88);
                     if (cgArray[0].demoType != DEMO_TYPE_CLIENT)
                         SND_AddLengthNotify(v88, (const snd_alias_t *)cent->nextState.number, SndLengthNotify_Script);
                     Com_SetSoundAliasSeed(SoundAliasSeed);
@@ -566,6 +594,9 @@ void __cdecl CG_EntityEvent(int32_t localClientNum, centity_s *cent, int32_t eve
                     1.0,
                     weaponDef->iExplosionInnerDamage,
                     weaponDef->iExplosionOuterDamage);
+#if defined(__SWITCH__)
+                Switch_CG_NotifyExplosionRumble(localClientNum, cgameGlob, position, p_4);
+#endif
 
                 bcassert(ent->surfType, SURF_TYPECOUNT);
 
@@ -603,6 +634,9 @@ void __cdecl CG_EntityEvent(int32_t localClientNum, centity_s *cent, int32_t eve
                     1.0,
                     weaponDef->iExplosionInnerDamage,
                     weaponDef->iExplosionOuterDamage);
+#if defined(__SWITCH__)
+                Switch_CG_NotifyExplosionRumble(localClientNum, cgameGlob, position, p_4a);
+#endif
 
                 bcassert(ent->surfType, SURF_TYPECOUNT);
 
@@ -652,6 +686,9 @@ void __cdecl CG_EntityEvent(int32_t localClientNum, centity_s *cent, int32_t eve
                     1.0,
                     weaponDef->iExplosionInnerDamage,
                     weaponDef->iExplosionOuterDamage);
+#if defined(__SWITCH__)
+                Switch_CG_NotifyExplosionRumble(localClientNum, cgameGlob, position, p_4b);
+#endif
                 ByteToDir(ent->eventParm, axis[0]);
                 Vec3Basis_RightHanded(axis[0], axis[1], axis[2]);
                 CG_ImpactEffectForWeapon(weaponIdx, ent->surfType, 0, (const FxEffectDef **)&def, &v30);

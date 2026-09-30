@@ -45,7 +45,9 @@ union DevMenuChild // sizeof=0x4
     DevGraph *graph;
     uint16_t menu;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(DevMenuChild) == 0x4);
+#endif
 
 struct DevMenuItem // sizeof=0x28
 {                                       // ...
@@ -58,7 +60,9 @@ struct DevMenuItem // sizeof=0x28
     uint16_t parent;            // ...
     DevMenuChild child;                 // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(DevMenuItem) == 0x28);
+#endif
 
 struct devguiGlob_t // sizeof=0x5E10
 {                                       // ...
@@ -83,7 +87,9 @@ struct devguiGlob_t // sizeof=0x5E10
     int32_t right;                          // ...
     int32_t sliderWidth;                    // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(devguiGlob_t) == 0x5E10);
+#endif
 
 // devgui
 void __cdecl TRACK_devgui();

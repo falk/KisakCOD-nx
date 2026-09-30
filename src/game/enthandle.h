@@ -9,7 +9,9 @@ struct EntHandleInfo // sizeof=0x8 // (SP/MP same)
     uint16_t next;              // ...
     uint16_t prev;              // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(EntHandleInfo) == 0x8);
+#endif
 
 struct EntHandleList // sizeof=0x2 // (SP/MP same)
 {                                       // ...

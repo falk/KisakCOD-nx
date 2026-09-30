@@ -54,7 +54,7 @@ void __cdecl CG_ParseServerInfo(int localClientNum)
 void __cdecl CG_ParseCullDist(int localClientNum)
 {
     const char *ConfigString; // r3
-    long double v2; // fp2
+    double v2; // fp2
 
     ConfigString = CL_GetConfigString(localClientNum, CS_CULLDIST);
     v2 = atof(ConfigString);
@@ -127,6 +127,12 @@ void __cdecl CG_ParseFog(int time)
     const char *halfwayStr = Cmd_Argv(2);
     if (Cmd_Argc() <= 2 || !halfwayStr || !*halfwayStr)
     {
+        static uint32_t s_killhouseFogOffLines = 0;
+        if (s_killhouseFogOffLines < 8)
+        {
+            ++s_killhouseFogOffLines;
+            
+        }
         R_SwitchFog(0, time, (int)start);
         return;
     }
@@ -137,6 +143,19 @@ void __cdecl CG_ParseFog(int time)
     uint8_t blue  = (uint8_t)(int)floorf((float)atof(Cmd_Argv(5)) * 255.0f + 0.5f);
     int transitionTime = atoi(Cmd_Argv(6));
 
+    // the server fog command the client applies, logged so the
+    // renderer fog can be compared against the script value.
+    {
+        static uint32_t s_killhouseFogRecvLines = 0;
+        if (s_killhouseFogRecvLines < 8)
+        {
+            ++s_killhouseFogRecvLines;
+            Com_Printf(0,
+                       "KILLHOUSE_VISION_FOG_RECEIVED start=%g density=%g rgb=%u,%u,%u "
+                       "time=%d\n",
+                       start, halfway, red, green, blue, transitionTime);
+        }
+    }
     R_SetFogFromServer(start, red, green, blue, halfway);
     R_SwitchFog(1, time, transitionTime);
 }
@@ -205,7 +224,7 @@ void __cdecl CG_ConfigStringModifiedInternal(int localClientNum, unsigned int st
     const char *ConfigString; // r3
     const char *v5; // r29
     const char *v6; // r3
-    long double v7; // fp2
+    double v7; // fp2
     cgs_t *cgs; // r30
     const FxEffectDef *v9; // r3
     shellshock_parms_t *ShellshockParms; // r3
@@ -641,8 +660,8 @@ void CG_DeactivateReverbCmd()
     const char *v2; // r3
     int v3; // r31
     const char *v4; // r3
-    long double v5; // fp2
-    long double v6; // fp2
+    double v5; // fp2
+    double v6; // fp2
     int v7; // r11
 
     nesting = cmd_args.nesting;
@@ -686,9 +705,9 @@ void __cdecl CG_SetChannelVolCmd(int localClientNum)
     const char *v6; // r3
     int v7; // r28
     const char *v8; // r3
-    long double v9; // fp2
+    double v9; // fp2
     double v10; // fp31
-    long double v11; // fp2
+    double v11; // fp2
     int v12; // r31
     shellshock_parms_t *ShellshockParms; // r3
 
@@ -743,8 +762,8 @@ void CG_DeactivateChannelVolCmd()
     const char *v2; // r3
     int v3; // r31
     const char *v4; // r3
-    long double v5; // fp2
-    long double v6; // fp2
+    double v5; // fp2
+    double v6; // fp2
     int v7; // r11
 
     nesting = cmd_args.nesting;
@@ -892,7 +911,7 @@ void __cdecl CG_BlurServerCommand(int localClientNum)
     int nesting; // r7
     int v5; // r7
     int time; // r26
-    long double v8; // fp2
+    double v8; // fp2
     int v9; // r7
     double blurEndValue; // fp31
     const char *v11; // r3
@@ -919,29 +938,20 @@ void __cdecl CG_BlurServerCommand(int localClientNum)
 
 void __cdecl CG_SlowServerCommand(int localClientNum)
 {
-    int nesting; // r7
-    const char *v3; // r3
-    int v4; // r3
-    int v5; // r7
-    int v6; // r27
-    const char *v7; // r3
-    long double v8; // fp2
-    int v9; // r7
-    double v10; // fp31
-    const char *v11; // r3
-    long double v12; // fp2
+    int time;
+    double startScale;
+    double endScale;
 
-    v3 = Cmd_Argv(1);
-    v4 = atol(v3);
-    v5 = cmd_args.nesting;
-    v6 = v4;
-    v7 = Cmd_Argv(2);
-    v8 = atof(v7);
-    v9 = cmd_args.nesting;
-    v10 = (float)*(double *)&v8;
-    v11 = Cmd_Argv(3);
-    v12 = atof(v11);
-    CG_AlterTimescale(localClientNum, v6, v10, (float)*(double *)&v12);
+    // Decompiled x87 float reads (`(float)*(double *)&long_double`) are not
+    // valid on LP64: aarch64 double is 128-bit, so reinterpreting its
+    // low 8 bytes as double returned a bogus scale (e.g. atof("1") -> -0.0),
+    // and `slow` then set com_codeTimeScale to 0, freezing level time at
+    // a 1 ms frame time for the rest of the intro. Read the command arguments as
+    // the doubles they are.
+    time = atol(Cmd_Argv(1));
+    startScale = atof(Cmd_Argv(2));
+    endScale = atof(Cmd_Argv(3));
+    CG_AlterTimescale(localClientNum, time, startScale, endScale);
 }
 
 void __cdecl CG_SetClientDvarFromServer(const char *dvarname, const char *value)
@@ -957,23 +967,23 @@ void CG_ParseAmp()
     int nesting; // r7
     int v1; // r5
     const char *v2; // r3
-    long double v3; // fp2
+    double v3; // fp2
     const char *v4; // r3
-    long double v5; // fp2
+    double v5; // fp2
     const char *v6; // r3
-    long double v7; // fp2
+    double v7; // fp2
     const char *v8; // r3
     int v9; // r31
     const char *v10; // r3
     int v11; // r30
     const char *v12; // r3
-    long double v13; // fp2
+    double v13; // fp2
     double v14; // fp31
     const char *v15; // r3
-    long double v16; // fp2
+    double v16; // fp2
     double v17; // fp30
     const char *v18; // r3
-    long double v19; // fp2
+    double v19; // fp2
     double v20; // fp3
     float v21[6]; // [sp+50h] [-40h] BYREF
 
@@ -1118,21 +1128,21 @@ void __cdecl CG_DispatchServerCommand(int localClientNum)
     const char *v36; // r3
     DynEntityCollType v37; // r30
     const char *v38; // r3
-    long double v39; // fp2
+    double v39; // fp2
     double v40; // fp31
     const char *v41; // r3
-    long double v42; // fp2
+    double v42; // fp2
     double v43; // fp30
     const char *v44; // r3
-    long double v45; // fp2
+    double v45; // fp2
     const char *v46; // r3
-    long double v47; // fp2
+    double v47; // fp2
     double v48; // fp31
     const char *v49; // r3
-    long double v50; // fp2
+    double v50; // fp2
     double v51; // fp30
     const char *v52; // r3
-    long double v53; // fp2
+    double v53; // fp2
     const char *v54; // r10
     const char *v55; // r11
     int v56; // r8
@@ -1193,7 +1203,7 @@ void __cdecl CG_DispatchServerCommand(int localClientNum)
     const char *v115; // r3
     int v116; // r30
     const char *v117; // r3
-    long double v118; // fp2
+    double v118; // fp2
     const char *v119; // r10
     const char *v120; // r11
     int v121; // r8
@@ -2199,7 +2209,7 @@ void __cdecl CG_MapInit(int restart)
     signed int i; // r31
     int j; // r31
     const char *ConfigString; // r3
-    long double v5; // fp2
+    double v5; // fp2
 
     memset(cgArray, 0, sizeof(cgArray));
     memset(cg_entitiesArray, 0, sizeof(cg_entitiesArray));

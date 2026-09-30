@@ -1,0 +1,66 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "host-standalone",
+            "displayName": "Host tests (ASan+UBSan, build dir next to the checkout)",
+            "description": "Configures this project from a plain checkout: no environment variables, no local tooling. Gate tests that need the maintainers' own scripts are left out (KISAK_LOCAL_GATES).",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/../build/host-tests"
+        },
+        {
+            "name": "host",
+            "displayName": "Host tests (ASan+UBSan default)",
+            "description": "Configures tests/ (the standalone host-test CMake project) into the per-worktree state dir ./test already resolves via KISAK_TEST_STATE_DIR, so concurrent worktrees never share build objects.",
+            "generator": "Ninja",
+            "binaryDir": "$env{KISAK_TEST_STATE_DIR}/cmake-build"
+        },
+        {
+            "name": "host-tsan",
+            "displayName": "Host tests (TSan build dir)",
+            "description": "Same project, a separate binary dir, for the handful of tests registered twice (once under ASan+UBSan, once under TSan) -- see core-thread-tsan in tests/host/core_group.cmake. Most TSan tests build fine alongside the ASan ones in one tree since each target picks its own sanitizer flags; this preset exists for a from-scratch TSan-only rebuild.",
+            "inherits": "host",
+            "binaryDir": "$env{KISAK_TEST_STATE_DIR}/cmake-build-tsan"
+        }
+    ],
+    "buildPresets": [
+        { "name": "host-standalone", "configurePreset": "host-standalone" },
+        { "name": "host", "configurePreset": "host" },
+        { "name": "host-tsan", "configurePreset": "host-tsan" }
+    ],
+    "testPresets": [
+        {
+            "name": "host-standalone",
+            "configurePreset": "host-standalone",
+            "output": { "outputOnFailure": true },
+            "execution": { "noTestsAction": "error", "stopOnFailure": false }
+        },
+        {
+            "name": "host",
+            "configurePreset": "host",
+            "output": { "outputOnFailure": true },
+            "execution": { "noTestsAction": "error", "stopOnFailure": false }
+        },
+        {
+            "name": "host-core",
+            "inherits": "host",
+            "filter": { "include": { "label": "core" } }
+        },
+        {
+            "name": "host-script",
+            "inherits": "host",
+            "filter": { "include": { "label": "script" } }
+        },
+        {
+            "name": "host-retail",
+            "inherits": "host",
+            "filter": { "include": { "label": "retail" } }
+        },
+        {
+            "name": "host-corpus",
+            "inherits": "host",
+            "filter": { "include": { "label": "corpus" } }
+        }
+    ]
+}

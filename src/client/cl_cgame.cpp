@@ -521,12 +521,14 @@ void __cdecl CL_LoadServerCommands(SaveGame *save)
 
     if (!save)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\client\\cl_cgame.cpp", 409, 0, "%s", "save");
-    SaveMemory_LoadRead(&clientConnections[0].serverCommands, 12, save);
+    SaveMemory_LoadRead(&clientConnections[0].serverCommands.header,
+                        sizeof(clientConnections[0].serverCommands.header), save);
     for (i = clientConnections[0].serverCommands.header.sent + 1;
         i <= clientConnections[0].serverCommands.header.sequence;
         ++i)
     {
-        SaveMemory_LoadRead((char *)clientConnections[0].serverCommands.commands + ((4 * i) & 0x3FC), 4, save);
+        SaveMemory_LoadRead((char *)clientConnections[0].serverCommands.commands + ((4 * i) & 0x3FC),
+                            sizeof(clientConnections[0].serverCommands.commands[0]), save);
     }
     SaveMemory_LoadRead(clientConnections[0].serverCommands.buf, clientConnections[0].serverCommands.header.rover, save);
 }
@@ -957,23 +959,83 @@ void __cdecl CL_InitCGame(int localClientNum, int savegame)
     Con_InitGameMsgChannels();
 }
 
+// P3 (movementplan): prove the normal SP client path actually reaches an
+// active cgame with a decoded snapshot, not just a loaded map. Killhouse's
+// retail start runs the flying_intro cinematic, so the marker is emitted once
+// CL_SetActive runs (after CL_FirstSnapshot -> CG_FirstSnapshot ->
+// CG_ProcessNextSnap), when cgameInitialized is set and clients[0] holds a
+// valid parsed snapshot for the local player.
+static void CL_KillhouseActiveClientCheckpoint()
+{
+    const char *mapName = Dvar_GetString("mapname");
+    if (!mapName || I_stricmp(mapName, "killhouse") != 0)
+        return;
+
+    const clSnapshot_t *snap = &clients[0].snap;
+    const bool initialized = CL_IsCgameInitialized(0) != 0;
+    const bool active = clientUIActives[0].connectionState == CA_ACTIVE;
+    const bool snapValid = snap->valid != 0;
+    const bool snapNum = snap->messageNum >= 1;
+    const bool serverTime = snap->serverTime > 0;
+    const bool localPlayer = snap->ps.clientNum == 0;
+
+    if (initialized && active && snapValid && snapNum && serverTime && localPlayer)
+    {
+        
+        return;
+    }
+
+    Com_Printf(0,
+               "FAIL: map=%s initialized=%d active=%d "
+               "snap_valid=%d messageNum=%d serverTime=%d ps_clientNum=%d state=%d\n",
+               mapName, initialized ? 1 : 0, active ? 1 : 0, snapValid ? 1 : 0,
+               snap->messageNum, snap->serverTime, snap->ps.clientNum,
+               (int)clientUIActives[0].connectionState);
+}
+
 void __cdecl CL_FirstSnapshot()
 {
     if (!clientUIActives[0].isRunning)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\client\\cl_cgame.cpp", 886, 0, "%s", "clUI->isRunning");
     clients[0].serverTime = com_time;
     Con_TimeJumped(0, com_time);
+    
     CL_ResetSkeletonCache();
     if (cls.demoplaying)
         CL_StartPlayingDemo();
+    
     CG_FirstSnapshot(0);
+    
     //__lwsync();
     clientUIActives[0].cgameInitialized = 1;
+    
 }
+
+#ifdef __SWITCH__
+#include <platform/switch/switch_input.h>
+extern "C" void Switch_InputScriptPad(float leftX, float leftY, float rightX, float rightY,
+                                      uint64_t buttons, int frames);
+#endif
 
 void __cdecl CL_SetActive()
 {
     clientUIActives[0].connectionState = CA_ACTIVE;
+    CL_KillhouseActiveClientCheckpoint();
+#ifdef __SWITCH__
+    // CL_StartLoading pauses the client for the load screen; Win32 releases
+    // it on window activation, which Horizon has no equivalent of. Becoming
+    // active here IS the activation event, so release it the same way.
+    if (cl_paused->current.integer)
+        Dvar_SetInt(cl_paused, 0);
+    {
+        // Audit every image asset against the D3D texture it became, once,
+        // now that the level is up (gated on com_diagMarkers inside).
+        extern void R_SwitchAuditImages(void);
+        R_SwitchAuditImages();
+    }
+    if (Dvar_GetBool("switch_killhouse_pressA"))
+        Switch_InputScriptPad(0.0f, 0.0f, 0.0f, 0.0f, SWITCH_INPUT_BUTTON_A, 3);
+#endif
 }
 
 void __cdecl CL_CreateNextSnap()

@@ -692,9 +692,6 @@ unsigned int Path_InitLinkCounts()
     pathnode_t *nodes; // r7
     int v2; // r4
     unsigned int v3; // r6
-    int v4; // r11
-    int v5; // r9
-    int v6; // r7
 
     result = 0;
     if (gameWorldSp.path.nodeCount)
@@ -703,24 +700,15 @@ unsigned int Path_InitLinkCounts()
         v2 = 0;
         do
         {
-            v3 = 0;
-            nodes[v2].dynamic.wLinkCount = nodes[v2].constant.totalLinkCount;
-            nodes = gameWorldSp.path.nodes;
-            if (gameWorldSp.path.nodes[v2].constant.totalLinkCount)
+            pathnode_t *node = &nodes[v2];
+            node->dynamic.wLinkCount = node->constant.totalLinkCount;
+            for (v3 = 0; v3 < node->constant.totalLinkCount; ++v3)
             {
-                v4 = 0;
-                v5 = v2 * 128 + 64;
-                do
-                {
-                    ++v3;
-                    *(_BYTE *)(*(nodeType *)((char *)&nodes->constant.type + v5) + v4 + 8) = 0;
-                    *(_BYTE *)(*(nodeType *)((char *)&gameWorldSp.path.nodes->constant.type + v5) + v4 + 9) = 0;
-                    *(_BYTE *)(*(nodeType *)((char *)&gameWorldSp.path.nodes->constant.type + v5) + v4 + 10) = 0;
-                    v6 = *(nodeType *)((char *)&gameWorldSp.path.nodes->constant.type + v5) + v4;
-                    v4 += 12;
-                    *(_BYTE *)(v6 + 11) = 0;
-                    nodes = gameWorldSp.path.nodes;
-                } while (v3 < gameWorldSp.path.nodes[v2].constant.totalLinkCount);
+                pathlink_s *link = &node->constant.Links[v3];
+                link->ubBadPlaceCount[0] = 0;
+                link->ubBadPlaceCount[1] = 0;
+                link->ubBadPlaceCount[2] = 0;
+                link->ubBadPlaceCount[3] = 0;
             }
             ++result;
             ++v2;
@@ -753,34 +741,17 @@ void Path_InitLinkInfoArray()
 
 void __cdecl Path_InitNodeDynamic(pathnode_t *loadNode)
 {
-    pathnode_dynamic_t *p_dynamic; // r11
-    int v3; // ctr
-    pathnode_transient_t *p_transient; // r11
-    int v5; // ctr
-    double v6; // fp13
     float v7[4]; // [sp+50h] [-20h] BYREF
 
-    p_dynamic = &loadNode->dynamic;
-    v3 = 8;
-    do
-    {
-        p_dynamic->pOwner = (SentientHandle)0;
-        p_dynamic = (pathnode_dynamic_t *)((char *)p_dynamic + 4);
-        --v3;
-    } while (v3);
-    p_transient = &loadNode->transient;
-    v5 = 7;
-    do
-    {
-        p_transient->iSearchFrame = 0;
-        p_transient = (pathnode_transient_t *)((char *)p_transient + 4);
-        --v5;
-    } while (v5);
+    // LP64: the decompiled dword-count loops covered only the ILP32 sizes.
+    // Zero the native records so the transient search pointers/floats are
+    // defined before the first path query.
+    memset(&loadNode->dynamic, 0, sizeof(loadNode->dynamic));
+    memset(&loadNode->transient, 0, sizeof(loadNode->transient));
 
     YawVectors(loadNode->constant.fAngle, v7, NULL);
-    v6 = v7[1];
     loadNode->constant.forward[0] = v7[0];
-    loadNode->constant.forward[1] = v6;
+    loadNode->constant.forward[1] = v7[1];
     loadNode->dynamic.turretEntNumber = -1;
 }
 
@@ -789,10 +760,6 @@ void __cdecl Path_InitNodesDynamic()
     unsigned int v1; // r28
     int v2; // r30
     pathnode_t *v3; // r31
-    pathnode_dynamic_t *p_dynamic; // r11
-    int v5; // ctr
-    pathnode_transient_t *p_transient; // r11
-    int v7; // ctr
     float v8[16]; // [sp+50h] [-40h] BYREF
 
     v1 = 0;
@@ -802,22 +769,9 @@ void __cdecl Path_InitNodesDynamic()
         do
         {
             v3 = &gameWorldSp.path.nodes[v2];
-            p_dynamic = &gameWorldSp.path.nodes[v2].dynamic;
-            v5 = 8;
-            do
-            {
-                p_dynamic->pOwner = (SentientHandle)0;
-                p_dynamic = (pathnode_dynamic_t *)((char *)p_dynamic + 4);
-                --v5;
-            } while (v5);
-            p_transient = &v3->transient;
-            v7 = 7;
-            do
-            {
-                p_transient->iSearchFrame = 0;
-                p_transient = (pathnode_transient_t *)((char *)p_transient + 4);
-                --v7;
-            } while (v7);
+            // LP64: native record sizes, not the ILP32 dword counts.
+            memset(&v3->dynamic, 0, sizeof(v3->dynamic));
+            memset(&v3->transient, 0, sizeof(v3->transient));
 
             YawVectors(v3->constant.fAngle, v8, NULL);
             v3->constant.forward[0] = v8[0];
@@ -876,23 +830,23 @@ void Path_DrawDebugLink(const pathnode_t *node, const int i, bool bShowAll)
         node->constant.vOrigin[2] + 16.0f
     };
 
-    float *destNode = (float *)((char *)gameWorldSp.path.nodes + (nodeNum << 7));
+    // LP64: the ILP32 node stride was 128 bytes; address the array directly.
+    const pathnode_t *otherNode = &gameWorldSp.path.nodes[nodeNum];
 
     float end[3] =
     {
-        destNode[5],
-        destNode[6],
-        destNode[7] + 16.0f
+        otherNode->constant.vOrigin[0],
+        otherNode->constant.vOrigin[1],
+        otherNode->constant.vOrigin[2] + 16.0f
     };
 
-    const pathnode_t *otherNode = (const pathnode_t *)destNode;
     int linkCount = bShowAll ? otherNode->constant.totalLinkCount : otherNode->dynamic.wLinkCount;
     int found = 0;
     int reverseIndex = 0;
 
     for (; reverseIndex < linkCount; ++reverseIndex)
     {
-        const pathnode_t *linked = (const pathnode_t *)((char *)gameWorldSp.path.nodes + (otherNode->constant.Links[reverseIndex].nodeNum << 7));
+        const pathnode_t *linked = &gameWorldSp.path.nodes[otherNode->constant.Links[reverseIndex].nodeNum];
         if (linked == node)
         {
             found = 1;
@@ -946,7 +900,7 @@ void Path_DrawDebugLink(const pathnode_t *node, const int i, bool bShowAll)
         return;
     }
 
-    if (node <= (const pathnode_t *)destNode)
+    if (node <= otherNode)
         return;
 
     int flags = 0;
@@ -1045,7 +999,7 @@ float __cdecl Path_GetDebugStringScale(const float *cameraPos, const float *orig
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\game\\pathnode.cpp", 1662, 0, "%s", "cameraPos");
     if (!origin)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\game\\pathnode.cpp", 1663, 0, "%s", "origin");
-    v4 = G_Find(0, 284, scr_const.player);
+    v4 = G_Find(0, offsetof(gentity_s, classname), scr_const.player);
     if (v4)
     {
         v5 = (float)(cameraPos[1] - origin[1]);
@@ -1066,14 +1020,14 @@ float __cdecl Path_GetDebugStringScale(const float *cameraPos, const float *orig
 
 void __cdecl Path_DrawDebugNodeBox(const pathnode_t *node)
 {
-    long double v5; // fp2
+    double v5; // fp2
     double v6; // fp31
     double v7; // fp12
     double v8; // fp13
-    long double v9; // fp2
+    double v9; // fp2
     double v10; // fp0
     double v11; // fp31
-    long double v12; // fp2
+    double v12; // fp2
     nodeType type; // r11
     float maxs[3]; // [sp+50h] [-70h] BYREF
     float mins[3]; // [sp+60h] [-60h] BYREF
@@ -1303,7 +1257,7 @@ void __cdecl Path_DrawFriendlyChain()
     float v19[4]; // [sp+60h] [-80h] BYREF
 
     CL_GetViewPos(v18);
-    v2 = G_Find(0, 284, scr_const.player);
+    v2 = G_Find(0, offsetof(gentity_s, classname), scr_const.player);
     v3 = v2;
     if (v2)
     {
@@ -1569,7 +1523,7 @@ pathnode_t *__cdecl Path_FindChainPos(const float *vOrigin, pathnode_t *pPrevCha
         v6 = 4 * v9;
         do
         {
-            v10 = (pathnode_t *)((char *)gameWorldSp.path.nodes + __ROL4__(*(v8 - 2), 7));
+            v10 = &gameWorldSp.path.nodes[*(v8 - 2)];
             if (v10->constant.wChainId == wChainId)
             {
                 v13 = (float)(v10->constant.vOrigin[2] - vOrigin[2]);
@@ -1583,7 +1537,7 @@ pathnode_t *__cdecl Path_FindChainPos(const float *vOrigin, pathnode_t *pPrevCha
                     result = v10;
                 }
             }
-            v15 = (pathnode_t *)((char *)gameWorldSp.path.nodes + __ROL4__(*(v8 - 1), 7));
+            v15 = &gameWorldSp.path.nodes[*(v8 - 1)];
             if (v15->constant.wChainId == wChainId)
             {
                 v18 = (float)(v15->constant.vOrigin[2] - vOrigin[2]);
@@ -1597,7 +1551,7 @@ pathnode_t *__cdecl Path_FindChainPos(const float *vOrigin, pathnode_t *pPrevCha
                     result = v15;
                 }
             }
-            v20 = (pathnode_t *)((char *)gameWorldSp.path.nodes + __ROL4__(*v8, 7));
+            v20 = &gameWorldSp.path.nodes[*v8];
             if (v20->constant.wChainId == wChainId)
             {
                 v23 = (float)(v20->constant.vOrigin[2] - vOrigin[2]);
@@ -1611,7 +1565,7 @@ pathnode_t *__cdecl Path_FindChainPos(const float *vOrigin, pathnode_t *pPrevCha
                     result = v20;
                 }
             }
-            v25 = (pathnode_t *)((char *)gameWorldSp.path.nodes + __ROL4__(v8[1], 7));
+            v25 = &gameWorldSp.path.nodes[v8[1]];
             if (v25->constant.wChainId == wChainId)
             {
                 v28 = (float)(v25->constant.vOrigin[2] - vOrigin[2]);
@@ -1635,7 +1589,7 @@ pathnode_t *__cdecl Path_FindChainPos(const float *vOrigin, pathnode_t *pPrevCha
         v31 = gameWorldSp.path.chainNodeCount - v6;
         do
         {
-            v32 = (pathnode_t *)((char *)gameWorldSp.path.nodes + __ROL4__(*v30, 7));
+            v32 = &gameWorldSp.path.nodes[*v30];
             if (v32->constant.wChainId == wChainId)
             {
                 v35 = (float)(v32->constant.vOrigin[2] - vOrigin[2]);
@@ -1731,7 +1685,7 @@ void __cdecl Path_AttachSentientToChainNode(sentient_s *sentient, unsigned __int
                 v9 = gameWorldSp.path.nodeForChainNode;
                 while (1)
                 {
-                    v10 = (pathnode_t *)((char *)gameWorldSp.path.nodes + __ROL4__(*v9, 7));
+                    v10 = &gameWorldSp.path.nodes[*v9];
                     if (v10->constant.targetname == targetname)
                         break;
                     ++v6;
@@ -1750,7 +1704,7 @@ void __cdecl Path_AttachSentientToChainNode(sentient_s *sentient, unsigned __int
                     v12 = v6;
                     do
                     {
-                        if (*(unsigned __int16 *)((char *)&nodes->constant.targetname + __ROL4__(nodeForChainNode[v12], 7)) == v4)
+                        if (nodes[nodeForChainNode[v12]].constant.targetname == v4)
                         {
                             v13 = SL_ConvertToString(v4);
                             Com_Error(ERR_DROP, "\x15Node '%s' is not part of a friendly chain\n", v13);
@@ -2312,7 +2266,7 @@ void __cdecl Path_DisconnectPath(pathnode_t *node, pathlink_s *link)
     int v4; // r11
     pathlink_s *v5; // r11
     int wLinkCount; // r5
-    unsigned int v7; // r9
+    uintptr_t v7; // r9
     unsigned int v8; // r11
     const char *v9; // r3
     int v10; // r11
@@ -2381,8 +2335,8 @@ void __cdecl Path_DisconnectPath(pathnode_t *node, pathlink_s *link)
     {
         v5 = node->constant.Links;
         wLinkCount = node->dynamic.wLinkCount;
-        v7 = (unsigned int)&v5[wLinkCount];
-        if (v7 > (unsigned int)link)
+        v7 = (uintptr_t)&v5[wLinkCount];
+        if (v7 > (uintptr_t)link) // LP64: full-width compare
         {
             v8 = (int)((unsigned __int64)(715827883LL * ((char *)link - (char *)v5)) >> 32) >> 1;
             v9 = va(
@@ -2507,7 +2461,7 @@ void __cdecl Path_ConnectPathsForEntity(gentity_s *ent)
         {
             v5 = next;
             Path_ConnectPath_0(
-                (pathnode_t *)((char *)gameWorldSp.path.nodes + __ROL4__(g_path.pathLinkInfoArray[next].from, 7)),
+                &gameWorldSp.path.nodes[g_path.pathLinkInfoArray[next].from],
                 g_path.pathLinkInfoArray[next].to);
             next = g_path.pathLinkInfoArray[v5].next;
         } while (g_path.pathLinkInfoArray[v5].next);
@@ -2596,7 +2550,7 @@ void __cdecl Path_DisconnectPathsForEntity(gentity_s *ent)
                         v10,
                         disconnectMins,
                         disconnectMaxs,
-                        (float *)((char *)gameWorldSp.path.nodes->constant.vOrigin + __ROL4__(v9->nodeNum, 7)),
+                        gameWorldSp.path.nodes[v9->nodeNum].constant.vOrigin,
                         number,
                         42074129))
                     {
@@ -2689,7 +2643,7 @@ void Path_UpdateArcBadPlaceCount(badplace_arc_t *arc, int teamFlags, int delta)
         for (unsigned int linkIdx = 0; linkIdx < node->constant.totalLinkCount; ++linkIdx)
         {
             pathlink_s *link = &node->constant.Links[linkIdx];
-            float *vOtherOrigin = (float *)((char *)gameWorldSp.path.nodes + __ROL4__(link->nodeNum, 7)) + 5;
+            float *vOtherOrigin = gameWorldSp.path.nodes[link->nodeNum].constant.vOrigin;
             float dx2 = (float)(vOtherOrigin[0] - arc->origin[0]);
             float dy2 = (float)(vOtherOrigin[1] - arc->origin[1]);
             float dz2 = (float)(vOtherOrigin[2] - arc->origin[2]);
@@ -3326,7 +3280,7 @@ void __cdecl Path_DrawVisData()
     float v15[32]; // [sp+50h] [-80h] BYREF
 
     CL_GetViewPos(v15);
-    v0 = G_Find(0, 284, scr_const.player);
+    v0 = G_Find(0, offsetof(gentity_s, classname), scr_const.player);
     if (v0)
     {
         v3 = Sentient_NearestNode(v0->sentient);
@@ -3435,7 +3389,7 @@ void __cdecl Path_MarkNodeInvalid(pathnode_t *node, team_t eTeam)
 void __cdecl G_SetPathnodeScriptVariable(const char *key, const char *value, pathnode_t *ent)
 {
     unsigned int Field; // r30
-    long double v6; // fp2
+    double v6; // fp2
     int v7; // r3
     unsigned int v8; // r3
     const char *v9; // r3
@@ -3549,23 +3503,10 @@ void __cdecl G_SpawnPathnodeDynamic()
                 v1 = &gameWorldSp.path.nodes[g_path.actualNodeCount++];
                 if (g_path.actualNodeCount > gameWorldSp.path.nodeCount)
                 {
-                    p_dynamic = &v1->dynamic;
-                    v3 = 8;
-                    do
-                    {
-                        p_dynamic->pOwner = (SentientHandle)0;
-                        p_dynamic = (pathnode_dynamic_t *)((char *)p_dynamic + 4);
-                        --v3;
-                    } while (v3);
-
-                    p_transient = &v1->transient;
-                    v5 = 7;
-                    do
-                    {
-                        p_transient->iSearchFrame = 0;
-                        p_transient = (pathnode_transient_t *)((char *)p_transient + 4);
-                        --v5;
-                    } while (v5);
+                    // LP64: whole-struct clears; the 8/7-word loops were the
+                    // ILP32 sizes and left transient.pParent/fCost stale here.
+                    memset(&v1->dynamic, 0, sizeof(v1->dynamic));
+                    memset(&v1->transient, 0, sizeof(v1->transient));
                 }
                 G_ParsePathnodeScriptFields(v1);
                 YawVectors(v1->constant.fAngle, forward, NULL);
@@ -3732,7 +3673,7 @@ pathnode_t *__cdecl Path_ChooseSubsequentChainNode_r(
         v16 = v14;
         do
         {
-            v17 = (pathnode_t *)((char *)gameWorldSp.path.nodes + __ROL4__(gameWorldSp.path.nodeForChainNode[v16], 7));
+            v17 = &gameWorldSp.path.nodes[gameWorldSp.path.nodeForChainNode[v16]];
             if (v17->constant.wChainId != v15)
                 break;
             wChainDepth = v17->constant.wChainDepth;
@@ -3805,7 +3746,7 @@ pathnode_t *__cdecl Path_ChooseAnyChainNodeIfDeadEnd(
         v12 = v10;
         do
         {
-            v13 = (pathnode_t *)((char *)gameWorldSp.path.nodes + __ROL4__(gameWorldSp.path.nodeForChainNode[v12], 7));
+            v13 = &gameWorldSp.path.nodes[gameWorldSp.path.nodeForChainNode[v12]];
             if (v13->constant.wChainId != v11)
                 break;
             wChainDepth = v13->constant.wChainDepth;
@@ -3905,7 +3846,7 @@ pathnode_t *__cdecl Path_ChooseDesperationChainNode(
         v13 = v11;
         do
         {
-            v14 = (pathnode_t *)((char *)nodes + __ROL4__(gameWorldSp.path.nodeForChainNode[v13], 7));
+            v14 = &nodes[gameWorldSp.path.nodeForChainNode[v13]];
             if (v14->constant.wChainId != refPos->constant.wChainId)
                 return (pathnode_t *)v8;
             wChainDepth = v14->constant.wChainDepth;
@@ -3981,7 +3922,7 @@ pathnode_t *__cdecl Path_ChooseDesperationNewChainNode(
         v13 = v11;
         do
         {
-            v14 = (pathnode_t *)((char *)nodes + __ROL4__(gameWorldSp.path.nodeForChainNode[v13], 7));
+            v14 = &nodes[gameWorldSp.path.nodeForChainNode[v13]];
             if (v14->constant.wChainId != refPos->constant.wChainId)
                 break;
             if (level.time <= v14->dynamic.iFreeTime)

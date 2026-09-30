@@ -1,4 +1,5 @@
 #include <universal/q_shared.h>
+#include <port/switch_perf.h>
 #include "r_add_staticmodel.h"
 #include <qcommon/qcommon.h>
 #include "r_dvars.h"
@@ -6,6 +7,7 @@
 #include <win32/win_local.h>
 #include "r_init.h"
 #include "r_scene.h"
+#include <database/db_retail_frame_evidence.h>
 #include <xanim/xmodel.h>
 #include "r_model_lighting.h"
 #include "r_staticmodel.h"
@@ -16,6 +18,7 @@
 #include <universal/profile.h>
 #include "r_buffers.h"
 #include "r_staticmodelcache.h"
+#include "r_draw_staticmodel.h"
 #include <cgame/cg_local.h>
 
 int g_dumpStaticModelCount;
@@ -43,10 +46,42 @@ char __cdecl R_PreTessStaticModelCachedList(
     uint32_t surfIndexCount; // [esp+54h] [ebp-4h]
 
     xsurf = XModelGetSurface(model, lod, surfaceIndex);
+    if (R_StaticPretessModels() && R_StaticModelSurfHasStaticIndices(xsurf))
+    {
+        // r_deko9StaticPretess(Models), r_pretess.h: no copy; the draw side
+        // reads the list and draws the surface's zone index range once per
+        // instance with the instance's cache slot as base vertex.
+#ifdef __SWITCH__
+        if (SwitchPerf_g_enabled)
+        {
+            SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_SMODEL_LISTS, 1);
+            SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_SMODEL_INST, count);
+            SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_SMODEL_STATIC_INST, count);
+        }
+#endif
+        drawSurf.fields.surfType = SF_STATICMODEL_PRETESS;
+        if (R_AllocDrawSurf(delayedCmdBuf, drawSurf, drawSurfList, 3u + ((count + 1) >> 1)))
+        {
+            preTessSurf = (uint8_t)surfaceIndex | ((uint32_t)(uint8_t)lod << 8) | ((uint32_t)*list << 16);
+            R_WritePrimDrawSurfInt(delayedCmdBuf, count);
+            R_WritePrimDrawSurfInt(delayedCmdBuf, preTessSurf);
+            R_WritePrimDrawSurfInt(delayedCmdBuf, R_PRETESS_STATIC_FLAG);
+            R_WritePrimDrawSurfData(delayedCmdBuf, (uint8_t *)list, (count + 1) >> 1);
+        }
+        return 1;
+    }
     surfIndexCount = 3 * xsurf->triCount;
     preTessIndices = R_AllocPreTessIndices(surfIndexCount * count);
     if (!preTessIndices)
         return 0;
+#ifdef __SWITCH__
+    if (SwitchPerf_g_enabled)
+    {
+        SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_SMODEL_LISTS, 1);
+        SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_SMODEL_INST, count);
+        SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_BYTES, 2ull * surfIndexCount * count);
+    }
+#endif
 
     {
         PROF_SCOPED("R_memcpy");
@@ -87,6 +122,70 @@ char __cdecl R_PreTessStaticModelCachedList(
     return 1;
 }
 
+// Cumulative funnel decisions, read as deltas by the PERF_RENDER report so a
+// hardware run shows *why* instances land in the unbatched rigid funnel.
+uint32_t g_smodelFunnelStats[SMODEL_FUNNEL_COUNT];
+
+#ifdef __SWITCH__
+// The linker decides per LOD whether a static model may use the cache
+// (smcIndexPlusOne/smcAllocBits in the fastfile). On Killhouse it left out
+// hundreds of tiny, single-surface props -- a link-time budget for the map,
+// not a geometric limit -- and each of those costs one rigid draw per
+// instance. Through the D3D9 layer that is the single largest
+// draw-call source in the frame (well over half the draws in a typical scene). Admit any
+// such LOD that satisfies the same constraints the cache already imposes on
+// linker-admitted ones: <= 512 verts (block class 4..9), the index copy fits
+// in the 4-slots-per-vert index region, rigid, and indices present.
+// lodInfo->unused is only ever copied from the wire, so it serves as the
+// "already evaluated" marker.
+static bool R_AdmitUnlinkedLodToStaticModelCache(XModel *model, XModelLodInfo *lodInfo, int lod)
+{
+    enum { EVAL_PENDING = 0, EVAL_REJECTED = 1 };
+    if (lodInfo->unused == EVAL_REJECTED)
+        return false;
+    if (!r_smc_admitUnlinked->current.enabled)
+        return false;
+
+    XSurface *surfs = nullptr;
+    const int surfCount = XModelGetSurfaces(model, &surfs, lod);
+    uint32_t totalVerts = 0;
+    uint32_t totalTris = 0;
+    bool ok = surfCount >= 1;
+    for (int i = 0; ok && i < surfCount; ++i)
+    {
+        const XSurface &s = surfs[i];
+        ok = !s.deformed && s.triIndices && s.verts0 && s.vertCount && s.triCount;
+        totalVerts += s.vertCount;
+        totalTris += s.triCount;
+    }
+    uint32_t allocBits = 4;
+    while (ok && (1u << allocBits) < totalVerts && allocBits < 9)
+        ++allocBits;
+    ok = ok && totalVerts <= (1u << allocBits) && 3u * totalTris <= 4u * (1u << allocBits);
+    if (!ok)
+    {
+        lodInfo->unused = EVAL_REJECTED;
+        return false;
+    }
+
+    uint32_t baseTri = 0;
+    uint32_t baseVert = 0;
+    for (int i = 0; i < surfCount; ++i)
+    {
+        surfs[i].baseTriIndex = (uint16_t)baseTri;
+        surfs[i].baseVertIndex = (uint16_t)baseVert;
+        baseTri += surfs[i].triCount;
+        baseVert += surfs[i].vertCount;
+    }
+    // The four pools are fixed 64K-vert partitions with their own LRU;
+    // spread admitted LODs across them so one pool does not thrash alone.
+    static uint32_t s_nextPool;
+    lodInfo->smcAllocBits = (uint8_t)allocBits;
+    lodInfo->smcIndexPlusOne = (uint8_t)((s_nextPool++ & 3u) + 1u);
+    return true;
+}
+#endif
+
 GfxStaticModelId __cdecl R_GetStaticModelId(uint32_t smodelIndex, int lod)
 {
     const XModelLodInfo *lodInfo; // [esp+8h] [ebp-20h]
@@ -101,10 +200,20 @@ GfxStaticModelId __cdecl R_GetStaticModelId(uint32_t smodelIndex, int lod)
     model = rgp.world->dpvs.smodelDrawInsts[smodelIndex].model;
     iassert( R_StaticModelHasLighting( smodelIndex ) );
     if (!r_smc_enable->current.enabled)
+    {
+        ++g_smodelFunnelStats[SMODEL_FUNNEL_RIGID_DISABLED];
         goto LABEL_9;
+    }
     lodInfo = XModelGetLodInfo(model, lod);
+#ifdef __SWITCH__
     if (!lodInfo->smcIndexPlusOne)
+        R_AdmitUnlinkedLodToStaticModelCache(model, const_cast<XModelLodInfo *>(lodInfo), lod);
+#endif
+    if (!lodInfo->smcIndexPlusOne)
+    {
+        ++g_smodelFunnelStats[SMODEL_FUNNEL_RIGID_INELIGIBLE];
         goto LABEL_9;
+    }
     if (smodelIndex >= rgp.world->dpvs.smodelCount)
         MyAssertHandler(
             ".\\r_add_staticmodel.cpp",
@@ -117,10 +226,12 @@ GfxStaticModelId __cdecl R_GetStaticModelId(uint32_t smodelIndex, int lod)
     if (staticModelId.objectId)
     {
         staticModelId.surfType = SF_STATICMODEL_CACHED;
+        ++g_smodelFunnelStats[SMODEL_FUNNEL_CACHED];
         return staticModelId;
     }
     else
     {
+        ++g_smodelFunnelStats[SMODEL_FUNNEL_RIGID_ALLOC_FAIL];
     LABEL_9:
         staticModelIda.surfType = SF_STATICMODEL_RIGID;
         staticModelIda.objectId = smodelIndex;
@@ -132,6 +243,7 @@ GfxStaticModelId __cdecl R_GetStaticModelId(uint32_t smodelIndex, int lod)
             if (xsurf->deformed || !IsFastFileLoad())
             {
                 staticModelIda.surfType = SF_STATICMODEL_SKINNED;
+                ++g_smodelFunnelStats[SMODEL_FUNNEL_SKINNED];
                 return staticModelIda;
             }
         }
@@ -146,7 +258,7 @@ void __cdecl R_AddDelayedStaticModelDrawSurf(
     uint32_t count)
 {
     R_WritePrimDrawSurfInt(delayedCmdBuf, count);
-    R_WritePrimDrawSurfInt(delayedCmdBuf, (uint32_t)xsurf);
+    R_WritePrimDrawSurfPtr(delayedCmdBuf, xsurf);
     R_WritePrimDrawSurfData(delayedCmdBuf, list, (count + 1) >> 1);
 }
 
@@ -249,6 +361,16 @@ void __cdecl R_AddAllStaticModelSurfacesCamera()
         }
 
         model = inst->model;
+        if (!model)
+        {
+            // A wire model slot that decoded null (a real, if unusual,
+            // retail shape -- WidenGfxStaticModelDrawInst passes the caller's
+            // resolved XModel through verbatim and never substitutes). A null
+            // here means no geometry exists to draw; skip instead of
+            // dereferencing null the way XModelGetLodForDist below would.
+            visData[smodelIndex] = 0;
+            continue;
+        }
         primaryLightIndex = inst->primaryLightIndex;
         reflectionProbeIndex = inst->reflectionProbeIndex;
         if (model != currentModel || reflectionProbeIndex != currentProbeIndex || primaryLightIndex != currentLightIndex)
@@ -395,7 +517,7 @@ void __cdecl R_SkinStaticModelsCameraForLod(
                         &surfData->drawSurf[region],
                         &surfData->delayedCmdBuf)))
             {
-                if (!R_AllocDrawSurf(&surfData->delayedCmdBuf, drawSurf, &surfData->drawSurf[region], ((count + 1) >> 1) + 2))
+                if (!R_AllocDrawSurf(&surfData->delayedCmdBuf, drawSurf, &surfData->drawSurf[region], R_StaticModelDrawSurfWordCount(count)))
                     return;
                 R_AddDelayedStaticModelDrawSurf(&surfData->delayedCmdBuf, &surfaces[surfaceIndex], list, count);
             }
@@ -413,6 +535,9 @@ void __cdecl R_SkinStaticModelsCamera(
 {
     uint32_t surfTypeIndex; // [esp+0h] [ebp-4h]
 
+#ifdef __SWITCH__
+    SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SMODEL_SKIN);
+#endif
     for (surfTypeIndex = 0; surfTypeIndex < SF_END_STATICMODEL - SF_BEGIN_STATICMODEL; ++surfTypeIndex)
         R_SkinStaticModelsCameraForSurface(
             model,
@@ -546,7 +671,7 @@ void __cdecl R_StaticModelWriteInfo(int fileHandle, const GfxStaticModelDrawInst
     iassert( xmodel );
     iassert( xmodel->name );
     iassert( xmodel->numLods > 0 );
-    lodDist = *((float *)&xmodel->parentList + 7 * xmodel->numLods);
+    lodDist = xmodel->lodInfo[xmodel->numLods - 1].dist; // LP64: was the ILP32 (float *)&parentList + 7 * numLods
     iassert( lodDist > 0.0f );
     v6 = radius2pixels * xmodel->radius / lodDist;
     v8 = radius2pixels * xmodel->radius;
@@ -666,6 +791,14 @@ void __cdecl R_AddAllStaticModelSurfacesRangeSunShadow(uint32_t partitionIndex, 
         }
 
         nextModel = inst->model;
+        // A wire model slot that decoded null binds null; the instance
+        // has no geometry to shadow. Skip like the camera path's null-model
+        // guard instead of dereferencing null below.
+        if (!nextModel)
+        {
+            visData[i] = 0;
+            continue;
+        }
         if (nextModel != currentModel)
         {
             if (allocatedLighting)
@@ -798,7 +931,7 @@ void __cdecl R_SkinStaticModelsShadowForLod(
                         &surfData->drawSurfList,
                         &surfData->delayedCmdBuf)))
             {
-                if (!R_AllocDrawSurf(&surfData->delayedCmdBuf, drawSurf, &surfData->drawSurfList, ((count + 1) >> 1) + 2))
+                if (!R_AllocDrawSurf(&surfData->delayedCmdBuf, drawSurf, &surfData->drawSurfList, R_StaticModelDrawSurfWordCount(count)))
                     return;
                 R_AddDelayedStaticModelDrawSurf(&surfData->delayedCmdBuf, &surfaces[0][surfaceIndex], list, count);
             }
@@ -877,6 +1010,9 @@ void __cdecl R_AddAllStaticModelSurfacesSpotShadow(uint32_t spotShadowIndex, uin
     uint32_t v28; // [esp+10B0h] [ebp-8h]
     int surfCount; // [esp+10B4h] [ebp-4h]
 
+#ifdef __SWITCH__
+    SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SMODEL_SPOTSHADOW);
+#endif
     smodelCount = rgp.world->dpvs.smodelCount;
     smodelDrawInsts = rgp.world->dpvs.smodelDrawInsts;
     iassert(rg.lodParms.valid);
@@ -902,9 +1038,14 @@ void __cdecl R_AddAllStaticModelSurfacesSpotShadow(uint32_t spotShadowIndex, uin
             Vec3Sub(a, smodelDrawInst->placement.origin, diff);
             v2 = Vec3Length(diff);
             v13 = v2 * scale + bias;
-            if (smodelDrawInst->cullDist > (double)v13)
+            if (smodelDrawInst->cullDist > v13)
             {
                 model = smodelDrawInst->model;
+                // A wire model slot that decoded null binds null; the
+                // instance has no geometry to shadow -- skip instead of
+                // dereferencing null below.
+                if (!model)
+                    continue;
                 val = smodelDrawInst->placement.scale;
                 iassert( val );
                 v4 = 1.0 / val;

@@ -82,7 +82,9 @@ bool __cdecl ClampScreenPosToEdges(
 
     if (!a12)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\cgame\\cg_hudelem.cpp", 1070, 0, "%s", "resultDist");
-    v20 = &scrPlaceView[(unsigned int)localClientNum];
+    // SP has one local client; this legacy helper's first parameter is the
+    // point pointer (despite the decompiler name), not a client index.
+    v20 = &scrPlaceView[0];
     if (localClientNum)
         MyAssertHandler(
             "c:\\trees\\cod3\\cod3src\\src\\cgame\\cg_local.h",
@@ -898,7 +900,7 @@ int __cdecl CG_GetTargetPos(int localClientNum, int targetEntNum, float *outPos)
     {
         ++targets;
         ++v6;
-        if ((int)targets >= (int)&cgArray[0].shellshock)
+        if (v6 >= static_cast<int>(ARRAY_COUNT(cgArray[0].targets)))
             return 0;
     }
     Entity = CG_GetEntity(localClientNum, targetEntNum);
@@ -1150,4 +1152,3 @@ void __cdecl CG_TargetsChanged(int localClientNum, unsigned int num)
         v8->entNum = ENTITYNUM_NONE;
     }
 }
-

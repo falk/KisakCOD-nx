@@ -113,7 +113,7 @@ int __cdecl FS_CompareIwds(char *needediwds, int len, int dlstring)
     char *v4; // eax
     const char *v5; // [esp+8h] [ebp-20h]
     const char *string; // [esp+Ch] [ebp-1Ch]
-    uint32_t v7; // [esp+Ch] [ebp-1Ch]
+    const char *v7; // [esp+Ch] [ebp-1Ch] (LP64: was a truncated uint32_t address)
     int haveiwd; // [esp+1Ch] [ebp-Ch]
     searchpath_s *j; // [esp+20h] [ebp-8h]
     int i; // [esp+24h] [ebp-4h]
@@ -123,11 +123,11 @@ int __cdecl FS_CompareIwds(char *needediwds, int len, int dlstring)
     *needediwds = 0;
     string = fs_gameDirVar->current.string;
     v5 = string + 1;
-    v7 = (uint32_t)&string[strlen(string) + 1];
+    v7 = &string[strlen(string) + 1];
     for (i = 0; i < fs_numServerReferencedIwds; ++i)
     {
         haveiwd = 0;
-        if ((const char *)v7 == v5 || !FS_serverPak(fs_serverReferencedIwdNames[i]))
+        if (v7 == v5 || !FS_serverPak(fs_serverReferencedIwdNames[i]))
         {
             for (j = fs_searchpaths; j; j = j->next)
             {
@@ -139,8 +139,8 @@ int __cdecl FS_CompareIwds(char *needediwds, int len, int dlstring)
             }
             if (!haveiwd && fs_serverReferencedIwdNames[i] && *fs_serverReferencedIwdNames[i])
             {
-                if ((const char *)v7 == v5
-                    || I_strnicmp(fs_serverReferencedIwdNames[i], fs_gameDirVar->current.string, v7 - (_DWORD)v5)
+                if (v7 == v5
+                    || I_strnicmp(fs_serverReferencedIwdNames[i], fs_gameDirVar->current.string, (int)(v7 - v5))
                     || FS_iwIwd((char *)fs_serverReferencedIwdNames[i], (char*)"main"))
                 {
                     I_strncpyz(needediwds, (char *)fs_serverReferencedIwdNames[i], len);
@@ -182,7 +182,7 @@ int __cdecl FS_CompareFFs(char *neededFFs, int len, int dlstring)
     int v4; // eax
     const char *v5; // [esp+18h] [ebp-28h]
     const char *string; // [esp+1Ch] [ebp-24h]
-    uint32_t v7; // [esp+1Ch] [ebp-24h]
+    const char *v7; // [esp+1Ch] [ebp-24h] (LP64: was a truncated uint32_t address)
     char *ffName; // [esp+2Ch] [ebp-14h]
     const char *ffNamea; // [esp+2Ch] [ebp-14h]
     int fileSize; // [esp+30h] [ebp-10h]
@@ -193,7 +193,7 @@ int __cdecl FS_CompareFFs(char *neededFFs, int len, int dlstring)
     *neededFFs = 0;
     string = fs_gameDirVar->current.string;
     v5 = string + 1;
-    v7 = (uint32_t)&string[strlen(string) + 1];
+    v7 = &string[strlen(string) + 1];
     for (i = 0; i < fs_numServerReferencedFFs; ++i)
     {
         if (I_strncmp(fs_serverReferencedFFNames[i], "mods", 4)
@@ -211,8 +211,8 @@ int __cdecl FS_CompareFFs(char *neededFFs, int len, int dlstring)
         fileSize = v4;
         if (v4 != fs_serverReferencedFFCheckSums[i] && fs_serverReferencedFFNames[i] && *fs_serverReferencedFFNames[i])
         {
-            if ((const char *)v7 == v5
-                || I_strnicmp(fs_serverReferencedFFNames[i], fs_gameDirVar->current.string, v7 - (_DWORD)v5))
+            if (v7 == v5
+                || I_strnicmp(fs_serverReferencedFFNames[i], fs_gameDirVar->current.string, (int)(v7 - v5)))
             {
                 I_strncpyz(neededFFs, (char *)fs_serverReferencedFFNames[i], len);
                 I_strncat(neededFFs, len, ".ff");

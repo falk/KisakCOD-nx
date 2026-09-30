@@ -1,6 +1,7 @@
 #include <universal/q_shared.h>
 #include "qcommon.h"
 #include "mem_track.h"
+#include "cm_cull.h"
 #include <xanim/xanim.h>
 
 #include <Windows.h>
@@ -315,11 +316,11 @@ void __cdecl CM_PickProjectionAxes(const float *normal, int *i, int *j)
 
     v6 = I_fabs(*normal);
     v5 = I_fabs(normal[1]);
-    k = v5 > (double)v6;
+    k = v5 > v6;
     v4 = I_fabs(normal[k]);
     v3 = I_fabs(normal[2]);
 
-    if (v3 > (double)v4)
+    if (v3 > v4)
     {
         //LOBYTE(k) = 2;
         k = 2;
@@ -344,7 +345,7 @@ void __cdecl CM_AddExteriorPointToWindingProjected(winding_t *w, float *pt, int 
     for (index = 0; index < w->numpoints; ++index)
     {
         signedArea = CM_SignedAreaForPointsProjected(w->p[indexPrev], pt, w->p[index], i, j);
-        if (signedArea < (double)bestSignedArea)
+        if (signedArea < bestSignedArea)
         {
             bestSignedArea = signedArea;
             bestIndex = index;
@@ -402,7 +403,7 @@ void __cdecl CM_AddColinearExteriorPointToWindingProjected(
     dj = w->p[index1][j] - w->p[index0][j];
     v7 = I_fabs(v13);
     v6 = I_fabs(dj);
-    if (v6 > (double)v7)
+    if (v6 > v7)
     {
         axis = j;
         delta = w->p[index1][j] - w->p[index0][j];
@@ -415,9 +416,9 @@ void __cdecl CM_AddColinearExteriorPointToWindingProjected(
     if (delta <= 0.0)
     {
         iassert( w->p[index0][axis] > w->p[index1][axis] );
-        if (w->p[index0][axis] >= (double)pt[axis])
+        if (w->p[index0][axis] >= pt[axis])
         {
-            if (w->p[index1][axis] > (double)pt[axis])
+            if (w->p[index1][axis] > pt[axis])
             {
                 v8 = w->p[index1];
                 *v8 = *pt;
@@ -436,9 +437,9 @@ void __cdecl CM_AddColinearExteriorPointToWindingProjected(
     else
     {
         iassert( w->p[index0][axis] < w->p[index1][axis] );
-        if (w->p[index0][axis] <= (double)pt[axis])
+        if (w->p[index0][axis] <= pt[axis])
         {
-            if (w->p[index1][axis] < (double)pt[axis])
+            if (w->p[index1][axis] < pt[axis])
             {
                 v10 = w->p[index1];
                 *v10 = *pt;
@@ -483,7 +484,7 @@ double __cdecl CM_RepresentativeTriangleFromWinding(const winding_t *w, const fl
                 Vec3Cross(va, vb, vc);
                 v7 = Vec3Dot(vc, normal);
                 v6 = I_fabs(v7);
-                if (areaBest < (double)v6)
+                if (areaBest < v6)
                 {
                     areaBest = v6;
                     *i0 = i;
@@ -592,85 +593,24 @@ char __cdecl CM_BrushInView(const cbrush_t *brush, cplane_s *frustumPlanes, int 
 
 int bops_initialized;
 int Ljmptab[8];
+// signbits > 7: the retail switch asserted, broke, and then returned a value
+// built from uninitialised sums; report "both sides" instead.
+static int BoxOnPlaneSideInvalid(const float *emins, const float *emaxs, const cplane_s *p)
+{
+    if (!alwaysfails)
+        MyAssertHandler(".\\universal\\com_math.cpp", 3473, 1, "BoxOnPlaneSide: invalid signbits for plane");
+
+    __debugbreak();
+    __debugbreak();
+    __debugbreak();
+    __debugbreak();
+    __debugbreak();
+    return 3;
+}
+
 BOOL __cdecl BoxOnPlaneSide(const float *emins, const float *emaxs, const cplane_s *p)
 {
-    // KISAKTODO: Needs ASM jump table and assembly bits (Probably critical function lmao)
-    // 
-    //int signbits; // eax
-    //
-    //if (bops_initialized != 1)
-    //{
-    //    bops_initialized = 1;
-    //    Ljmptab[0] = (int)&Lcase0;
-    //    Ljmptab[1] = (int)&Lcase1;
-    //    Ljmptab[2] = (int)&Lcase2;
-    //    Ljmptab[3] = (int)&Lcase3;
-    //    Ljmptab[4] = (int)&Lcase4;
-    //    Ljmptab[5] = (int)&Lcase5;
-    //    Ljmptab[6] = (int)&Lcase6;
-    //    Ljmptab[7] = (int)&Lcase7;
-    //}
-    //signbits = p->signbits;
-    //if ((uint8_t)signbits < 8u)
-    //    __asm { jmp     Ljmptab[eax * 4] }
-    //__debugbreak();
-
-    float v3;
-    float v4;
-
-    // LWSS: Note that this is not generic-able. The maths are slightly changed for each case.
-    // These are opposite per-line
-    // v3 = MAX, MAX, MAX
-    // v4 = MIN, MIN, MIN
-    // ... 
-    // v3 = MIN, MAX, MIN
-    // v4 = MAX, MIN, MAX
-    switch (p->signbits)
-    {
-    case 0:
-        v3 = (p->normal[0] * emaxs[0]) + (emaxs[1] * p->normal[1]) + (emaxs[2] * p->normal[2]); 
-        v4 = (p->normal[0] * emins[0]) + (emins[1] * p->normal[1]) + (emins[2] * p->normal[2]);
-        break;
-    case 1:
-        v3 = (p->normal[0] * emins[0]) + (emaxs[1] * p->normal[1]) + (emaxs[2] * p->normal[2]);
-        v4 = (p->normal[0] * emaxs[0]) + (emins[1] * p->normal[1]) + (emins[2] * p->normal[2]);
-        break;
-    case 2:
-        v3 = (p->normal[0] * emaxs[0]) + (emaxs[2] * p->normal[2]) + (emins[1] * p->normal[1]);
-        v4 = (p->normal[0] * emins[0]) + (emins[2] * p->normal[2]) + (emaxs[1] * p->normal[1]);
-        break;
-    case 3:
-        v3 = (p->normal[0] * emins[0]) + (emaxs[2] * p->normal[2]) + (emins[1] * p->normal[1]);
-        v4 = (p->normal[0] * emaxs[0]) + (emins[2] * p->normal[2]) + (emaxs[1] * p->normal[1]);
-        break;
-    case 4:
-        v3 = (p->normal[0] * emaxs[0]) + (emaxs[1] * p->normal[1]) + (emins[2] * p->normal[2]);
-        v4 = (p->normal[0] * emins[0]) + (emins[1] * p->normal[1]) + (emaxs[2] * p->normal[2]);
-        break;
-    case 5:
-        v3 = (p->normal[0] * emins[0]) + (emaxs[1] * p->normal[1]) + (emins[2] * p->normal[2]);
-        v4 = (p->normal[0] * emaxs[0]) + (emins[1] * p->normal[1]) + (emaxs[2] * p->normal[2]);
-        break;
-    case 6:
-        v3 = (p->normal[0] * emaxs[0]) + (emins[1] * p->normal[1]) + (emins[2] * p->normal[2]);
-        v4 = (p->normal[0] * emins[0]) + (emaxs[1] * p->normal[1]) + (emaxs[2] * p->normal[2]);
-        break;
-    case 7:
-        v3 = (p->normal[0] * emins[0]) + (emins[1] * p->normal[1]) + (emins[2] * p->normal[2]);
-        v4 = (p->normal[0] * emaxs[0]) + (emaxs[1] * p->normal[1]) + (emaxs[2] * p->normal[2]);
-        break;
-    default:
-        if (!alwaysfails)
-            MyAssertHandler(".\\universal\\com_math.cpp", 3473, 1, "BoxOnPlaneSide: invalid signbits for plane");
-
-        __debugbreak();
-        __debugbreak();
-        __debugbreak();
-        __debugbreak();
-        __debugbreak();
-        break;
-    }
-    
-    return (2 * (v4 < p->dist)) | (v3 > p->dist); // KISAKTODO: probably BoxDistSqrdExceeds()
-    //return BoxDistSqrdExceeds(emins, emaxs, p->normal, *(float *)&pa);
+    // The retail x86 build used an asm jump table on p->signbits; the per-case sums live in BoxOnPlaneSideInline
+    // (qcommon/cm_cull.h) so hot callers inline them.
+    return BoxOnPlaneSideInline(emins, emaxs, p, BoxOnPlaneSideInvalid);
 }

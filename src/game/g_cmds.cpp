@@ -731,7 +731,6 @@ void __cdecl Cmd_JumpToNode_f(gentity_s *ent)
     int ok; // r30
     int v3; // r3
     const char *v4; // r4
-    int v5; // r11
     int v6; // r30
     pathnode_t *v7; // r3
     int v8; // r3
@@ -765,20 +764,17 @@ void __cdecl Cmd_JumpToNode_f(gentity_s *ent)
             }
             v8 = Path_NodeCount();
             v4 = va(aPrint, v8);
-            v5 = (unsigned __int64)(875407347LL * ((char *)ent - (char *)g_entities)) >> 32;
         }
         else
         {
             v4 = aPrintGameUsage;
-            v5 = (unsigned __int64)(875407347LL * ((char *)ent - (char *)g_entities)) >> 32;
         }
     }
     else
     {
         v4 = "print \"GAME_CHEATSNOTENABLED\"";
-        v5 = (unsigned __int64)(875407347LL * ((char *)ent - (char *)g_entities)) >> 32;
     }
-    SV_GameSendServerCommand((v5 >> 7) + ((unsigned int)v5 >> 31), v4);
+    SV_GameSendServerCommand(ent - g_entities, v4); // LP64: was a magic divide by the ILP32 sizeof(gentity_s)
 }
 
 void __cdecl Cmd_InterruptCamera_f(gentity_s *ent)
@@ -856,8 +852,8 @@ void Cmd_VisionSetNaked_f()
     unsigned int nesting; // r7
     int v1; // r11
     const char *v2; // r3
-    long double v3; // fp2
-    long double v4; // fp2
+    double v3; // fp2
+    double v4; // fp2
     const char *v5; // r4
     int v7; // [sp+50h] [-30h]
 
@@ -912,8 +908,8 @@ void Cmd_VisionSetNight_f()
     unsigned int nesting; // r7
     int v1; // r11
     const char *v2; // r3
-    long double v3; // fp2
-    long double v4; // fp2
+    double v3; // fp2
+    double v4; // fp2
     const char *v5; // r4
     int v7; // [sp+50h] [-30h]
 

@@ -195,6 +195,20 @@ void __cdecl R_CmdBufSet2D(GfxCmdBufSourceState* source, GfxViewport* viewport)
     //invHeight = retaddr;
     iassert(viewport->width > 0);
     iassert(viewport->height > 0);
+#ifdef __SWITCH__
+    {
+        static int s_set2DDumpCount = 0;
+        if (s_set2DDumpCount < 10)
+        {
+            ++s_set2DDumpCount;
+            char dbuf[160];
+            snprintf(dbuf, sizeof(dbuf),
+                     "R_CmdBufSet2D[%d]: ortho viewport=%dx%d renderTargetWidth=%d renderTargetHeight=%d behavior=%d\n",
+                     s_set2DDumpCount, viewport->width, viewport->height,
+                     source->renderTargetWidth, source->renderTargetHeight, source->viewportBehavior);
+        }
+    }
+#endif
     v7 = 1.0 / (double)viewport->width;
     transform_60 = 1.0 / (double)viewport->height;
     transform_56 = &source->viewParms;

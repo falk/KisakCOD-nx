@@ -1,5 +1,13 @@
+#include "r_dynres.h"
+#include <time.h>
 #include <universal/q_shared.h>
+#include <port/switch_perf.h>
+#if defined(__SWITCH__)
+#include <switch.h>
+#endif
 #include "r_init.h"
+#include <deko9/deko9_native.h>
+#include <universal/timing.h>
 #include <qcommon/mem_track.h>
 #include <qcommon/threads.h>
 #include <win32/win_local.h>
@@ -316,6 +324,25 @@ const dvar_t *r_mode;
 const dvar_t *r_displayRefresh;
 const dvar_t* r_noborder;
 
+// deko9: with no worker commands left to help with, sleep on the GPU fence
+// for a short slice instead of re-polling it in a tight loop. The slice is capped
+// by the remaining smoothing budget (gpuSyncDelay), so R_GpuFenceTimeout
+// still ends the sync on time, and by 250 us, so newly queued worker
+// commands wait at most that long for the main thread's help (the worker
+// threads process them meanwhile).
+static void R_SyncGpuWaitSlice()
+{
+    if (!dx.flushGpuQueryIssued)
+        return;
+    const uint64_t elapsed = __rdtsc() - dx.gpuSyncStart;
+    if (elapsed >= dx.gpuSyncDelay)
+        return;
+    const double remainingNs = (double)(dx.gpuSyncDelay - elapsed) * msecPerRawTimerTick * 1e6;
+    const int64_t sliceNs = remainingNs < 250000.0 ? (int64_t)remainingNs : 250000;
+    if (sliceNs > 0)
+        Deko9_WaitFrame(dx.device, dx.gpuSyncFrame, sliceNs);
+}
+
 void __cdecl R_SyncGpu(int(__cdecl *WorkCallback)(unsigned __int64))
 {
     int useWorkCallback; // [esp+30h] [ebp-4h]
@@ -325,9 +352,15 @@ void __cdecl R_SyncGpu(int(__cdecl *WorkCallback)(unsigned __int64))
         PROF_SCOPED("R_SyncGpu");
         useWorkCallback = WorkCallback != 0;
         dx.gpuSyncStart = __rdtsc();
+#ifdef __SWITCH__
+        SwitchPerf_AddEvent(SWITCH_PERF_EV_SYNCGPU_CALLS, 1);
+#endif
         R_AcquireGpuFenceLock();
         while (!R_GpuFenceTimeout())
         {
+#ifdef __SWITCH__
+            SwitchPerf_AddEvent(SWITCH_PERF_EV_SYNCGPU_WAITS, 1);
+#endif
             if (useWorkCallback)
             {
                 R_ReleaseGpuFenceLock();
@@ -337,6 +370,7 @@ void __cdecl R_SyncGpu(int(__cdecl *WorkCallback)(unsigned __int64))
             else
             {
                 R_ProcessWorkerCmdsWithTimeout((int(*)())R_GpuFenceTimeout, 0);
+                R_SyncGpuWaitSlice();
             }
         }
         R_ReleaseGpuFenceLock();
@@ -358,7 +392,6 @@ void __cdecl TRACK_r_init()
 
 void __cdecl Sys_DirectXFatalError()
 {
-    HWND ActiveWindow; // eax
     char *v1; // [esp-Ch] [ebp-Ch]
     char *v2; // [esp-8h] [ebp-8h]
 
@@ -367,9 +400,15 @@ void __cdecl Sys_DirectXFatalError()
     Sys_EnterCriticalSection(CRITSECT_FATAL_ERROR);
     v2 = Win_LocalizeRef("WIN_DIRECTX_INIT_TITLE");
     v1 = Win_LocalizeRef("WIN_DIRECTX_INIT_BODY");
-    ActiveWindow = GetActiveWindow();
+#if defined(__SWITCH__)
+    // No message-box/help-doc shell on Horizon: log the same localized text
+    // and exit the same way.
+    Com_PrintError(0, "%s: %s\n", v2, v1);
+#else
+    HWND ActiveWindow = GetActiveWindow(); // eax
     MessageBoxA(ActiveWindow, v1, v2, 0x10u);
     ShellExecuteA(0, "open", "Docs\\TechHelp\\Tech Help\\Information\\DirectX.htm", 0, 0, 3);
+#endif
     exit(-1);
 }
 
@@ -2903,8 +2942,10 @@ void R_ShutdownDirect3D()
     {
         if (!dx.windows[--dx.windowCount].hwnd)
             MyAssertHandler(".\\r_init.cpp", 2205, 0, "%s", "dx.windows[dx.windowCount].hwnd");
+#if !defined(__SWITCH__)
         if (IsWindow(dx.windows[dx.windowCount].hwnd))
             DestroyWindow(dx.windows[dx.windowCount].hwnd);
+#endif
         dx.windows[dx.windowCount].hwnd = 0;
     }
     if (dx.device)
@@ -2950,6 +2991,42 @@ void __cdecl R_BeginRegistration(vidConfig_t *vidConfigOut)
     r_glob.startedRenderThread = 1;
     R_ReleaseThreadOwnership();
 }
+
+#ifdef __SWITCH__
+// deko3d backend (src/deko9): drains its queue directly.
+void Deko9_WaitForGpuIdle(IDirect3DDevice9 *device);
+
+void R_SwitchWaitForGpuIdle()
+{
+    if (!dx.device)
+        return;
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    Deko9_WaitForGpuIdle(dx.device);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    {
+        // Diagnostic: how much of the frame is the forced full-idle sync.
+        static uint64_t s_calls = 0, s_sumUs = 0, s_maxUs = 0, s_windowUs = 0;
+        // Signed ns first: tv_nsec wraps each second, and a negative nsec
+        // difference cast to uint64 printed avg_us=3e14.
+        uint64_t us = (uint64_t)(((int64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ll
+                                  + (int64_t)(t1.tv_nsec - t0.tv_nsec)) / 1000ll);
+        s_calls++;
+        s_sumUs += us;
+        s_windowUs += us;
+        if (us > s_maxUs) s_maxUs = us;
+        if (s_windowUs >= 1000000ull)
+        {
+            Com_Printf(0, "SWITCH_WAITIDLE calls=%llu avg_us=%llu max_us=%llu\n",
+                       (unsigned long long)s_calls,
+                       (unsigned long long)(s_sumUs / (s_calls ? s_calls : 1)),
+                       (unsigned long long)s_maxUs);
+            s_calls = 0; s_sumUs = 0; s_maxUs = 0; s_windowUs = 0;
+        }
+    }
+}
+#endif
 
 void R_Init()
 {
@@ -3123,23 +3200,23 @@ void __cdecl R_EnumDisplayModes(uint32_t adapterIndex)
             &dx.displayModes[dx.displayModeCount]);
         if (hr >= 0)
         {
-            if (!dx.resolutionNameTable[4 * dx.displayModeCount - 1022])
-                dx.resolutionNameTable[4 * dx.displayModeCount - 1022] = (const char *)60;
+            if (!dx.displayModes[dx.displayModeCount].RefreshRate)
+                dx.displayModes[dx.displayModeCount].RefreshRate = 60;
             ++dx.displayModeCount;
         }
     }
-    qsort(dx.displayModes, dx.displayModeCount, 0x10u, (int(__cdecl *)(const void *, const void *))R_CompareDisplayModes);
+    qsort(dx.displayModes, dx.displayModeCount, sizeof(_D3DDISPLAYMODE), (int(__cdecl *)(const void *, const void *))R_CompareDisplayModes);
     resolutionCount = 0;
     refreshRateCount = 0;
     for (modeIndex = 0; modeIndex < dx.displayModeCount; ++modeIndex)
     {
         resolutionCount = R_AddValidResolution(
             dx.displayModes[modeIndex].Width,
-            (int)dx.resolutionNameTable[4 * modeIndex - 1023],
+            dx.displayModes[modeIndex].Height,
             resolutionCount,
             availableResolutions);
         refreshRateCount = R_AddValidRefreshRate(
-            (int)dx.resolutionNameTable[4 * modeIndex - 1022],
+            dx.displayModes[modeIndex].RefreshRate,
             refreshRateCount,
             availableRefreshRates);
     }
@@ -3409,7 +3486,7 @@ void __cdecl R_GetDirect3DCaps(uint32_t adapterIndex, _D3DCAPS9 *caps)
         hr = dx.d3d9->GetDeviceCaps(adapterIndex, D3DDEVTYPE_HAL, caps);
         if (hr >= 0)
             break;
-        Sleep(0x64u);
+        NET_Sleep(0x64u);
         if (++attempt == 20)
         {
             v2 = R_ErrorDescription(hr);
@@ -3473,6 +3550,7 @@ void __cdecl R_SetShadowmapFormats_DX(uint32_t adapterIndex)
     gfxMetrics.shadowmapSamplerState = (SAMPLER_CLAMP_V | SAMPLER_CLAMP_U | SAMPLER_FILTER_NEAREST);
 }
 
+#if !defined(__SWITCH__)
 struct GfxEnumMonitors // sizeof=0x8
 {                                       // ...
     int monitorIndex;                   // ...
@@ -3491,7 +3569,22 @@ int __stdcall R_MonitorEnumCallback(HMONITOR__ *monitorHandle, HDC__ *hdc, tagRE
         return 0;
     }
 }
+#endif
 
+#if defined(__SWITCH__)
+// Horizon has exactly one fixed display and no monitor-enumeration API: the
+// bootstrap proof's device creation (switch_sp_bootstrap.cpp) already
+// establishes the real pattern of skipping monitor/adapter choice entirely
+// and using D3DADAPTER_DEFAULT with the NWindow handle directly.  There is
+// no R_ChooseMonitor here (its HMONITOR__ return type does not exist on
+// Switch and nothing else in this file calls it) or R_MonitorEnumCallback
+// above; only R_ChooseAdapter is declared in r_init.h and reachable
+// elsewhere.
+uint32_t __cdecl R_ChooseAdapter()
+{
+    return 0;
+}
+#else
 HMONITOR__ *__cdecl R_ChooseMonitor()
 {
     POINT pt; // [esp+0h] [ebp-10h]
@@ -3537,7 +3630,26 @@ uint32_t __cdecl R_ChooseAdapter()
     }
     return foundAdapterIndex;
 }
+#endif
 
+#if defined(__SWITCH__)
+// There is no real window on Horizon: the hardware-proven bootstrap device
+// (switch_sp_bootstrap.cpp) uses the default NWindow handle directly as the
+// D3D9 device window, with no CreateWindowEx/AdjustWindowRectEx equivalent.
+char __cdecl R_CreateWindow(GfxWindowParms *wndParms)
+{
+    iassert( wndParms );
+    iassert( wndParms->hwnd == NULL );
+    wndParms->hwnd = reinterpret_cast<HWND>(nwindowGetDefault());
+    if (wndParms->hwnd)
+    {
+        Com_Printf(8, "Game window successfully created.\n");
+        return 1;
+    }
+    Com_Printf(8, "Couldn't create a window.\n");
+    return 0;
+}
+#else
 char __cdecl R_CreateWindow(GfxWindowParms *wndParms)
 {
     DWORD exStyle; // [esp+0h] [ebp-1Ch]
@@ -3611,7 +3723,18 @@ char __cdecl R_CreateWindow(GfxWindowParms *wndParms)
         return 0;
     }
 }
+#endif
 
+#if defined(__SWITCH__)
+// No taskbar/splash window concept on Horizon.
+void __cdecl Sys_HideSplashWindow()
+{
+}
+
+void __cdecl Sys_DestroySplashWindow()
+{
+}
+#else
 void __cdecl Sys_HideSplashWindow()
 {
     if (g_splashWnd)
@@ -3627,6 +3750,7 @@ void __cdecl Sys_DestroySplashWindow()
         g_splashWnd = 0;
     }
 }
+#endif
 
 char __cdecl R_CreateGameWindow(GfxWindowParms *wndParms)
 {
@@ -3635,7 +3759,9 @@ char __cdecl R_CreateGameWindow(GfxWindowParms *wndParms)
     if (!R_InitHardware(wndParms))
         return 0;
     dx.targetWindowIndex = 0;
+#if !defined(__SWITCH__)
     ShowWindow(wndParms->hwnd, 5);
+#endif
     Sys_HideSplashWindow();
     return 1;
 }
@@ -3693,6 +3819,14 @@ void __cdecl R_UpdateGpuSyncType()
 {
     int integer; // [esp+0h] [ebp-4h]
 
+#ifdef __SWITCH__
+    const dvar_t *performance = Dvar_FindVar("performance");
+    if (performance && performance->type == DVAR_TYPE_BOOL && performance->current.enabled)
+    {
+        dx.gpuSync = 1;
+        return;
+    }
+#endif
     if (r_multiGpu->current.enabled)
         integer = 0;
     else
@@ -3732,28 +3866,224 @@ void __cdecl R_FinishAttachingToWindow(const GfxWindowParms *wndParms)
     dx.windows[dx.windowCount++].height = wndParms->displayHeight;
 }
 
+static bool R_MaterializeImageResource(GfxImage *image, bool strict)
+{
+    if (!image || !dx.device)
+        return false;
+    if (strict && image->substitutedTexture)
+    {
+        Com_PrintError(8, "Required image previously substituted: %s\n", image->name ? image->name : "<unnamed>");
+        return false;
+    }
+    if (!image->texture.basemap || !Image_IsLiveD3DTexture(image->texture.basemap))
+    {
+        // Builtins are generated by constructorTable callbacks.  A retail
+        // zone may register a header with the same name but no live texture;
+        // sending it through Image_LoadFromFile would manufacture a false
+        // missing-IWI error.  An inline payload wins over the builtin
+        // generator (retail loads fastfile images from their loadDef; the
+        // baked `$outdoor` height map in particular), see R_DelayLoadImage.
+        if (!Image_HasInlinePayload(image) && Image_MaterializeBuiltin(image))
+            return true;
+        GfxImageLoadDef *loadDef = image->texture.loadDef;
+        bool created = false;
+        // Lightmap payload probe: is the baked lightmap data itself near-zero,
+        // or is it present but sampled/darkened wrong? DXT block data is
+        // nonzero whenever the page holds any real lighting; an all-zero
+        // first chunk means the copy/format is the problem.
+        if (loadDef && image->name && image->name[0] == '*' &&
+            !strncmp(image->name, "*lightmap", 9))
+        {
+            const int rs = loadDef->resourceSize;
+            const int probe = rs > 0 ? (rs < 4096 ? rs : 4096) : 0;
+            uint64_t sum = 0;
+            uint32_t nonzero = 0;
+            for (int i = 0; i < probe; ++i)
+            {
+                const uint8_t b = loadDef->data[i];
+                sum += b;
+                nonzero += b != 0;
+            }
+            
+        }
+        // G3 external-image activation: retail fastfile images carry only header +
+        // loadDef here; their pixels live in images/*.iwi inside the IWDs. Prefer real
+        // IWI pixels through the proven loadobj path; fall back to an empty sized
+        // texture (or placeholder below) when no IWI exists. Every map type adopts,
+        // not just 2D: killhouse's sky cube (sp_killhouse_ft, images/sp_killhouse_ft.iwi
+        // in iw_03.iwd) and water volume (watersetup0) are named non-2D images the
+        // original engine loads from IWI through this same Image_LoadFromFile path
+        // (Image_LoadFromFileWithReader -> Image_LoadFromData handles 2D/3D/cube).
+        // A named non-2D image with no IWI on disk (watersetup0's generated water
+        // setup) simply fails the load and keeps the existing placeholder handling.
+        if (image->name && image->name[0] &&
+            !(loadDef && loadDef->resourceSize > 0))
+        {
+            GfxImage *donor = Image_Alloc(const_cast<char *>(image->name), 3u, image->semantic, image->track);
+            if (donor && Image_LoadFromFile(donor)
+                && donor->texture.basemap && Image_IsLiveD3DTexture(donor->texture.basemap))
+            {
+                donor->texture.basemap->AddRef();
+                image->texture.basemap = donor->texture.basemap;
+                image->width = donor->width;
+                image->height = donor->height;
+                image->depth = donor->depth;
+                image->mapType = donor->mapType;
+                image->category = donor->category;
+                image->semantic = donor->semantic;
+                image->delayLoadPixels = false;
+                created = true;
+                {
+                    static int s_iwiAdoptLog = 0;
+                    if (s_iwiAdoptLog < 40)
+                    {
+                        ++s_iwiAdoptLog;
+                        char ibuf[160];
+                        snprintf(ibuf, sizeof(ibuf), "IWI-ADOPT[%d]: image=%s donor=%ux%u\n",
+                                 s_iwiAdoptLog, image->name, donor->width, donor->height);
+                    }
+                }
+            }
+        }
+        // Inline images (no name, no on-disk .iwi -- icons/logos/etc. embedded
+        // directly in the material's fastfile block) carry their real pixels
+        // in loadDef's trailing data now that RetailWidenImageFromWire copies
+        // them in. Upload through the original Load_Texture path rather than
+        // creating an empty texture: an uninitialized D3D texture samples
+        // whatever GPU memory was last freed there (observed in practice as
+        // menu buttons/logo showing leftover background pixels).
+        if (!created && loadDef && loadDef->resourceSize > 0)
+        {
+            // Load_Texture reads image->texture.loadDef (a union with
+            // basemap) into its own local before clearing basemap itself --
+            // do not null image->texture.basemap here first, or the union
+            // write destroys the loadDef pointer Load_Texture needs.
+            Load_Texture(&image->texture, image);
+            if (image->texture.basemap && Image_IsLiveD3DTexture(image->texture.basemap))
+                created = true;
+        }
+        // No dims-only Image_Create2DTexture_PC fallback here: for a retail
+        // fastfile image reaching this point (no name donor, no resourceSize
+        // pixels), there is no real pixel source left to size a texture
+        // around -- creating one anyway leaves it genuinely uninitialized
+        // (samples whatever GPU memory was last freed there), which is worse
+        // than the defined white/black placeholder below.
+        if (!created)
+        {
+            if (strict)
+            {
+                Com_PrintError(8, "Required image upload failed: %s\n", image->name ? image->name : "<unnamed>");
+                return false;
+            }
+            image->substitutedTexture = true;
+            image->texture.basemap = nullptr;
+            {
+                static uint32_t s_substLog = 0;
+                if (s_substLog < 48u)
+                {
+                    ++s_substLog;
+                    Com_Printf(0,
+                               "KILLHOUSE_IMAGE_SUBST name=%s mapType=%u dims=%ux%ux%u resourceSize=%d\n",
+                               image->name ? image->name : "<unnamed>", (unsigned)image->mapType,
+                               (unsigned)image->width, (unsigned)image->height, (unsigned)image->depth,
+                               loadDef ? loadDef->resourceSize : -1);
+                }
+            }
+            if (image->mapType == MAPTYPE_CUBE && rgp.blackImageCube && rgp.blackImageCube->texture.basemap)
+                image->texture.basemap = rgp.blackImageCube->texture.basemap;
+            else if (image->mapType == MAPTYPE_3D && rgp.blackImage3D && rgp.blackImage3D->texture.basemap)
+                image->texture.basemap = rgp.blackImage3D->texture.basemap;
+            else
+                Image_AssignDefaultTexture(image);
+        }
+        if (!image->texture.basemap && rgp.whiteImage && rgp.whiteImage->texture.basemap)
+        {
+            image->substitutedTexture = true;
+            image->texture.basemap = rgp.whiteImage->texture.basemap;
+        }
+    }
+    const bool materialized = image->texture.basemap &&
+                              Image_IsLiveD3DTexture(image->texture.basemap) &&
+                              !image->substitutedTexture;
+    // Lightmap/embedded-image materialization diagnostic: a fastfile-embedded
+    // '*'-named image (the six '*lightmap*' pages) has no on-disk .iwi donor,
+    // so it must upload through the loadDef embedded-pixel path. If it lands
+    // in the substitute branch, the frame renders near-black. One capped line
+    // per image, printed after that decision, says which happened.
+    if (image->name && image->name[0] == '*')
+    {
+        static int s_embeddedImageLog = 0;
+        if (s_embeddedImageLog < 64)
+        {
+            ++s_embeddedImageLog;
+            
+        }
+    }
+    return materialized;
+}
+
+bool R_MaterializeImageStrict(GfxImage *image)
+{
+    return R_MaterializeImageResource(image, true);
+}
+
+static void R_MaterializeImage(XAssetHeader header, void *)
+{
+    R_MaterializeImageResource(header.image, false);
+}
+
+void R_MaterializeAllImages()
+{
+    if (dx.device)
+    {
+        DB_EnumXAssets(ASSET_TYPE_IMAGE, (void(__cdecl *)(XAssetHeader, void *))R_MaterializeImage, nullptr, 1);
+    }
+}
+
 char __cdecl R_InitHardware(const GfxWindowParms *wndParms)
 {
     uint32_t workerIndex; // [esp+4h] [ebp-4h]
 
     if (!R_CreateDevice(wndParms))
         return 0;
+    Com_Printf(0, "R_InitHardware: device created\n");
     if (IsFastFileLoad())
+    {
+        Com_Printf(0, "R_InitHardware: initializing code images...\n");
+        R_InitCodeImages();
+        Com_Printf(0, "R_InitHardware: calling R_LoadGraphicsAssets\n");
         R_LoadGraphicsAssets();
+        Com_Printf(0, "R_InitHardware: syncing database assets...\n");
+        DB_SyncXAssets();
+        Com_Printf(0, "R_InitHardware: database assets synced!\n");
+        Com_Printf(0, "R_InitHardware: materializing retail images...\n");
+        R_MaterializeAllImages();
+        Com_Printf(0, "R_InitHardware: retail images materialized!\n");
+    }
     R_UpdateGpuSyncType();
     R_StoreWindowSettings(wndParms);
     RB_InitSceneViewport();
     KISAK_NULLSUB();
+    Com_Printf(0, "R_InitHardware: calling R_CreateForInitOrReset\n");
     if (!R_CreateForInitOrReset())
+    {
+        Com_Printf(0, "R_InitHardware: R_CreateForInitOrReset FAILED\n");
         return 0;
+    }
+    Com_Printf(0, "R_InitHardware: R_CreateForInitOrReset succeeded\n");
     R_Cinematic_Init();
-    Com_Printf(CON_CHANNEL_GFX, "Setting initial state...\n");
+    Com_Printf(0, "R_InitHardware: RB_SetInitialState...\n");
     RB_SetInitialState();
+    Com_Printf(0, "R_InitHardware: R_InitGamma...\n");
     R_InitGamma();
+    Com_Printf(0, "R_InitHardware: R_InitScene...\n");
     R_InitScene();
+    Com_Printf(0, "R_InitHardware: R_InitSystems...\n");
     R_InitSystems();
     KISAK_NULLSUB();
+    Com_Printf(0, "R_InitHardware: R_FinishAttachingToWindow...\n");
     R_FinishAttachingToWindow(wndParms);
+    Com_Printf(0, "R_InitHardware: done!\n");
     for (workerIndex = 0; workerIndex < 2; ++workerIndex)
     {
         iassert( r_smp_worker_thread[workerIndex] );
@@ -3918,7 +4248,11 @@ char __cdecl R_CreateDevice(const GfxWindowParms *wndParms)
     iassert( wndParms->hwnd );
     hwnd = wndParms->hwnd;
     iassert( dx.device == NULL );
+#ifdef __SWITCH__
+    dx.depthStencilFormat = (D3DFORMAT)R_GetDepthStencilFormat(D3DFMT_X8R8G8B8);
+#else
     dx.depthStencilFormat = (D3DFORMAT)R_GetDepthStencilFormat(D3DFMT_A8R8G8B8);
+#endif
     R_SetD3DPresentParameters(&d3dpp, wndParms);
     behavior = 70;
     hr = R_CreateDeviceInternal(hwnd, 0x46u, &d3dpp);
@@ -3945,6 +4279,21 @@ void __cdecl R_SetD3DPresentParameters(_D3DPRESENT_PARAMETERS_ *d3dpp, const Gfx
     memset((uint8_t *)d3dpp, 0, sizeof(_D3DPRESENT_PARAMETERS_));
     d3dpp->BackBufferWidth = wndParms->displayWidth;
     d3dpp->BackBufferHeight = wndParms->displayHeight;
+#ifdef __SWITCH__
+    d3dpp->BackBufferFormat = D3DFMT_X8R8G8B8;
+    d3dpp->BackBufferCount = 3;
+    d3dpp->MultiSampleType = D3DMULTISAMPLE_NONE;
+    d3dpp->MultiSampleQuality = 0;
+    d3dpp->SwapEffect = D3DSWAPEFFECT_DISCARD;
+    d3dpp->EnableAutoDepthStencil = 0;
+    d3dpp->AutoDepthStencilFormat = dx.depthStencilFormat;
+    d3dpp->PresentationInterval = D3DPRESENT_INTERVAL_ONE;
+    iassert( wndParms->hwnd );
+    d3dpp->hDeviceWindow = wndParms->hwnd;
+    d3dpp->Flags = 0;
+    d3dpp->Windowed = 1;
+    d3dpp->FullScreen_RefreshRateInHz = 0;
+#else
     d3dpp->BackBufferFormat = D3DFMT_A8R8G8B8;
     d3dpp->BackBufferCount = 1;
     d3dpp->MultiSampleType = dx.multiSampleType;
@@ -3966,6 +4315,7 @@ void __cdecl R_SetD3DPresentParameters(_D3DPRESENT_PARAMETERS_ *d3dpp, const Gfx
         d3dpp->Windowed = 1;
         d3dpp->FullScreen_RefreshRateInHz = 0;
     }
+#endif
 }
 
 void __cdecl R_SetupAntiAliasing(const GfxWindowParms *wndParms)
@@ -4008,6 +4358,17 @@ void __cdecl R_SetupAntiAliasing(const GfxWindowParms *wndParms)
     dx.multiSampleQuality = 0;
 }
 
+#if defined(__SWITCH__)
+bool __cdecl R_GetMonitorDimensions(int *width, int *height)
+{
+    // Horizon has one fixed display and no monitor-info API; match the
+    // hardware-proven bootstrap device's fixed backbuffer size until R2
+    // queries the real docked/handheld resolution from libnx.
+    *width = 1280;
+    *height = 720;
+    return true;
+}
+#else
 bool __cdecl R_GetMonitorDimensions(int *width, int *height)
 {
     tagMONITORINFO mi; // [esp+0h] [ebp-2Ch] BYREF
@@ -4028,6 +4389,7 @@ bool __cdecl R_GetMonitorDimensions(int *width, int *height)
         return *width > 0 && *height > 0;
     }
 }
+#endif
 
 HRESULT __cdecl R_CreateDeviceInternal(HWND__ *hwnd, uint32_t behavior, _D3DPRESENT_PARAMETERS_ *d3dpp)
 {
@@ -4042,10 +4404,17 @@ HRESULT __cdecl R_CreateDeviceInternal(HWND__ *hwnd, uint32_t behavior, _D3DPRES
     {
         dx.adapterNativeIsValid = R_GetMonitorDimensions(&dx.adapterNativeWidth, &dx.adapterNativeHeight);
         DeviceType = (_D3DDEVTYPE)R_GetDeviceType();
+        // Before CreateDevice: the back buffer is a render target too.
+        Deko9_SetRtCompression(r_deko9RtCompression && r_deko9RtCompression->current.enabled);
         hr = dx.d3d9->CreateDevice(dx.adapterIndex, DeviceType, hwnd, behavior, d3dpp, &dx.device);
         if (hr >= 0)
+        {
+            // r_deko9GpuMap from the start: the render targets are created
+            // before the first frame applies the per-frame settings.
+            Deko9_SetGpuMap(dx.device, r_deko9GpuMap ? (uint32_t)r_deko9GpuMap->current.integer : 0u);
             break;
-        Sleep(100);
+        }
+        NET_Sleep(100);
         if (++attempt == 20)
         {
             if (!dx.adapterIndex)
@@ -4101,7 +4470,7 @@ const char *__cdecl R_ClosestRefreshRateForMode(uint32_t width, uint32_t height,
     const char *v4; // eax
     int top; // [esp+0h] [ebp-10h]
     int bot; // [esp+4h] [ebp-Ch]
-    const char *comparison; // [esp+8h] [ebp-8h]
+    int comparison; // [esp+8h] [ebp-8h]
     int mid; // [esp+Ch] [ebp-4h]
 
     bot = 0;
@@ -4109,36 +4478,36 @@ const char *__cdecl R_ClosestRefreshRateForMode(uint32_t width, uint32_t height,
     while (bot <= top)
     {
         mid = (bot + top) / 2;
-        comparison = (const char *)(dx.displayModes[mid].Width - width);
+        comparison = (int)(dx.displayModes[mid].Width - width);
         if (!comparison)
         {
-            comparison = &dx.resolutionNameTable[4 * mid - 1023][-(int)height];
+            comparison = (int)(dx.displayModes[mid].Height - height);
             if (!comparison)
             {
-                comparison = &dx.resolutionNameTable[4 * mid - 1022][-refreshRate];
+                comparison = (int)(dx.displayModes[mid].RefreshRate - refreshRate);
                 if (!comparison)
-                    return (const char *)refreshRate;
+                    return (const char *)(intptr_t)refreshRate;
             }
         }
-        if ((int)comparison >= 0)
+        if (comparison >= 0)
             top = mid - 1;
         else
             bot = mid + 1;
     }
     iassert( (top >= 0) );
     iassert( top == bot - 1 );
-    if (dx.displayModes[top].Width == width && dx.resolutionNameTable[4 * top - 1023] == (const char *)height)
-        return dx.resolutionNameTable[4 * top - 1022];
-    if (dx.displayModes[bot].Width != width || dx.resolutionNameTable[4 * bot - 1023] != (const char *)height)
+    if (dx.displayModes[top].Width == width && dx.displayModes[top].Height == height)
+        return (const char *)(intptr_t)dx.displayModes[top].RefreshRate;
+    if (dx.displayModes[bot].Width != width || dx.displayModes[bot].Height != height)
     {
         v4 = va(
             "%i = (%i %i), %i = (%i %i), want (%i %i)",
             top,
             dx.displayModes[top].Width,
-            dx.resolutionNameTable[4 * bot - 1023],
+            dx.displayModes[top].Height,
             bot,
             dx.displayModes[bot].Width,
-            dx.resolutionNameTable[4 * bot - 1023],
+            dx.displayModes[bot].Height,
             width,
             height);
         MyAssertHandler(
@@ -4149,7 +4518,48 @@ const char *__cdecl R_ClosestRefreshRateForMode(uint32_t width, uint32_t height,
             "dx.displayModes[bot].Width == width && dx.displayModes[bot].Height == height",
             v4);
     }
-    return dx.resolutionNameTable[4 * bot - 1022];
+    return (const char *)(intptr_t)dx.displayModes[bot].RefreshRate;
+}
+
+// r_renderResolution: the whole game renders at this size exactly as if the
+// screen were that size -- vidConfig, the D3D back buffer, every engine
+// render target, viewports and HUD placement all derive from displayWidth/
+// displayHeight here. deko9 keeps its swapchain at the adapter's display mode
+// and upscales the finished back buffer at present with the r_fsrMode pass
+// (src/deko9/deko9_fsr.cpp). Runs after the display mode and refresh rate
+// are resolved against the adapter's (display-size) mode list.
+static void R_SwitchApplyRenderResolution(GfxWindowParms *wndParms)
+{
+    if (!r_renderResolution)
+        return;
+    // r_dynres: the targets are allocated for the display size and the
+    // scene size is chosen per frame (r_dynres.h); r_renderResolution does
+    // not apply.
+    if (R_DynResEnabled())
+    {
+        Com_Printf(CON_CHANNEL_GFX, "R_SetWndParms: r_dynres on: scene up to %dx%d, sized per frame, "
+                   "r_renderResolution %s ignored\n", wndParms->displayWidth, wndParms->displayHeight,
+                   Dvar_EnumToString(r_renderResolution));
+        return;
+    }
+    int width = 0, height = 0;
+    if (sscanf(Dvar_EnumToString(r_renderResolution), "%ix%i", &width, &height) != 2 || width <= 0 || height <= 0)
+    {
+        Com_Error(ERR_FATAL, "r_renderResolution: unparseable mode '%s'", Dvar_EnumToString(r_renderResolution));
+        return;
+    }
+    if (width == wndParms->displayWidth && height == wndParms->displayHeight)
+        return;
+    if (width > wndParms->displayWidth || height > wndParms->displayHeight)
+    {
+        Com_Error(ERR_FATAL, "r_renderResolution %dx%d exceeds the display mode %dx%d", width, height,
+                  wndParms->displayWidth, wndParms->displayHeight);
+        return;
+    }
+    Com_Printf(CON_CHANNEL_GFX, "R_SetWndParms: render resolution %dx%d, upscaled to %dx%d at present\n", width,
+               height, wndParms->displayWidth, wndParms->displayHeight);
+    wndParms->displayWidth = wndParms->sceneWidth = width;
+    wndParms->displayHeight = wndParms->sceneHeight = height;
 }
 
 void __cdecl R_SetWndParms(GfxWindowParms *wndParms)
@@ -4170,16 +4580,24 @@ void __cdecl R_SetWndParms(GfxWindowParms *wndParms)
     {
         refreshRateString = Dvar_EnumToString(r_displayRefresh);
         sscanf(refreshRateString, "%i Hz", &refreshRate);
-        wndParms->hz = (int)R_ClosestRefreshRateForMode(wndParms->displayWidth, wndParms->displayHeight, refreshRate);
+        wndParms->hz = (int)(intptr_t)R_ClosestRefreshRateForMode(wndParms->displayWidth, wndParms->displayHeight, refreshRate);
     }
     else
     {
         wndParms->hz = 60;
     }
+    R_SwitchApplyRenderResolution(wndParms);
     wndParms->x = Dvar_GetInt("vid_xpos");
     wndParms->y = Dvar_GetInt("vid_ypos");
     wndParms->hwnd = 0;
+#ifdef __SWITCH__
+    const dvar_t *performance = Dvar_FindVar("performance");
+    wndParms->aaSamples = performance && performance->type == DVAR_TYPE_BOOL && performance->current.enabled
+        ? 1
+        : r_aaSamples->current.integer;
+#else
     wndParms->aaSamples = r_aaSamples->current.integer;
+#endif
 }
 
 void R_Register()
@@ -4360,7 +4778,14 @@ void R_ResetDevice()
     wndParms.sceneHeight = dx.windows[0].height;
     wndParms.hz = vidConfig.displayFrequency;
     wndParms.fullscreen = vidConfig.isFullscreen != 0;
+#ifdef __SWITCH__
+    const dvar_t *performance = Dvar_FindVar("performance");
+    wndParms.aaSamples = performance && performance->type == DVAR_TYPE_BOOL && performance->current.enabled
+        ? 1
+        : r_aaSamples->current.integer;
+#else
     wndParms.aaSamples = r_aaSamples->current.integer;
+#endif
     R_SetD3DPresentParameters(&d3dpp, &wndParms);
     R_ReleaseForShutdownOrReset();
     //hr = dx.device->Reset(dx.device, &d3dpp);

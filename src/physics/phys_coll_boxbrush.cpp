@@ -2080,12 +2080,15 @@ void __cdecl Phys_CollideOrientedBrushWithBrush_Wrapper(const cbrush_t *oriented
 
     if (!userData)
         MyAssertHandler(".\\physics\\phys_coll_boxbrush.cpp", 1673, 0, "%s", "userData");
-    results = (Results *)*((uint32_t *)userData + 2);
+    // LP64: index BrushBrushData by struct (the decompiled form mixed
+    // 4-byte and pointer-width strides).
+    const BrushBrushData *data = (const BrushBrushData *)userData;
+    results = data->results;
     if (results->contactCount < results->maxContacts)
         Phys_CollideOrientedBrushWithBrush(
             orientedBrush,
-            *(const cbrush_t **)userData,
-            *((const objInfo **)userData + 1),
+            data->fixedBrush,
+            data->input,
             results);
 }
 
@@ -2593,14 +2596,16 @@ void __cdecl Phys_CollideOrientedBrushWithTriangleList_Wrapper(const cbrush_t *o
 {
     if (!userData)
         MyAssertHandler(".\\physics\\phys_coll_boxbrush.cpp", 1855, 0, "%s", "userData");
+    // LP64: index BrushTrimeshData by struct.
+    const BrushTrimeshData *data = (const BrushTrimeshData *)userData;
     Phys_CollideOrientedBrushWithTriangleList(
         orientedBrush,
-        *(const unsigned __int16 **)userData,
-        *((const float (**)[3])userData + 1),
-        *((uint32_t *)userData + 2),
-        *((const objInfo **)userData + 3),
-        *((uint32_t *)userData + 4),
-        *((Results **)userData + 5));
+        data->indices,
+        data->verts,
+        data->triCount,
+        data->input,
+        data->surfaceFlags,
+        data->results);
 }
 
 void __cdecl Phys_CollideBoxWithTriangleList(

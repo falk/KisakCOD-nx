@@ -5,8 +5,8 @@
 struct Glyph // sizeof=0x18
 {
     uint16_t letter;
-    char x0;
-    char y0;
+    int8_t x0;
+    int8_t y0;
     uint8_t dx;
     uint8_t pixelWidth;
     uint8_t pixelHeight;
@@ -26,7 +26,9 @@ struct Font_s // sizeof=0x18 // (SP/MP same)
     struct Material *glowMaterial;
     Glyph *glyphs;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(Font_s) == 24);
+#endif
 
 const Glyph *__cdecl R_GetCharacterGlyph(Font_s *font, uint32_t letter);
 uint32_t __cdecl R_FontGetRandomLetter(Font_s *font, int seed);

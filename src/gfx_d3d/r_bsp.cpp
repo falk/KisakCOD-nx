@@ -1,4 +1,5 @@
 #include <universal/q_shared.h>
+#include <qcommon/qcommon.h>
 #include "r_bsp.h"
 #include "r_init.h"
 #include "r_dvars.h"
@@ -11,6 +12,8 @@
 #include "r_shadowcookie.h"
 #include "r_sky.h"
 #include <database/database.h>
+#include "r_world_vertex_buffers.h"
+#include "r_pretess.h"
 
 
 //struct GfxWorld s_world    85b28080     gfx_d3d : r_bsp.obj // LWSS: moved to db_registry for DEDICATED
@@ -38,6 +41,7 @@ void __cdecl R_ShutdownWorld()
 
 void __cdecl R_ReleaseWorld()
 {
+    R_StaticPretessRelease();
     if (rgp.world)
     {
         R_ResetModelLighting();
@@ -46,14 +50,27 @@ void __cdecl R_ReleaseWorld()
     if (s_world.vertexCount)
     {
         iassert( s_world.vd.worldVb != NULL_VERTEX_BUFFER );
-        R_FreeStaticVertexBuffer(s_world.vd.worldVb);
+        // A Com_Error during zone load can strand a widened vertexCount
+        // with world buffers never created (R_LoadWorld/R_ReloadWorld never
+        // ran). Freeing null here faulted inside Com_ErrorCleanup and
+        // replaced the true error screen with a Data Abort, so skip loudly
+        // instead: the original error stays visible.
+        if (s_world.vd.worldVb != NULL_VERTEX_BUFFER)
+            R_FreeStaticVertexBuffer(s_world.vd.worldVb);
+        else
+            Com_Printf(0, "R_ReleaseWorld: worldVb null with vertexCount=%u; world buffers were never created\n",
+                       s_world.vertexCount);
         s_world.vd.worldVb = 0;
     }
     iassert( s_world.vd.worldVb == NULL_VERTEX_BUFFER );
     if (s_world.vertexLayerDataSize)
     {
         iassert( s_world.vld.layerVb != NULL_VERTEX_BUFFER );
-        R_FreeStaticVertexBuffer(s_world.vld.layerVb);
+        if (s_world.vld.layerVb != NULL_VERTEX_BUFFER)
+            R_FreeStaticVertexBuffer(s_world.vld.layerVb);
+        else
+            Com_Printf(0, "R_ReleaseWorld: layerVb null with vertexLayerDataSize=%u; world buffers were never created\n",
+                       s_world.vertexLayerDataSize);
         s_world.vld.layerVb = 0;
     }
     iassert( s_world.vld.layerVb == NULL_VERTEX_BUFFER );
@@ -221,6 +238,10 @@ void __cdecl R_SetWorldPtr_LoadObj(const char *name)
 void __cdecl R_SetWorldPtr_FastFile(const char *name)
 {
     rgp.world = DB_FindXAssetHeader(ASSET_TYPE_GFXWORLD, name).gfxWorld;
+    if (r_loadForRenderer->current.enabled &&
+        !R_MaterializeWorldVertexBuffers(rgp.world, R_CreateWorldVertexBuffer))
+        Com_Error(ERR_FATAL, "Fastfile world '%s' has incomplete vertex resources", name);
+    R_StaticPretessSetWorld(rgp.world);
     rgp.needSortMaterials = 1;
 }
 

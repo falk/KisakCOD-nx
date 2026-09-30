@@ -10,6 +10,9 @@
 #include <ode/objects.h>
 #include <physics/ode/collision_kernel.h>
 #include <win32/win_local.h>
+#ifdef __SWITCH__
+#include <platform/switch/switch_diag_dvars.h>
+#endif
 #include <gfx_d3d/r_dpvs.h>
 #include "ode/odeext.h"
 #include <universal/profile.h>
@@ -122,7 +125,17 @@ void __cdecl Phys_Init()
     if (!physInited)
     {
         memset((uint8_t *)&physGlob, 0, sizeof(physGlob));
-        Pool_Init((char *)physGlob.userData, &physGlob.userDataPool, 0x70u, 0x200u);
+        // LP64: the pool's item stride must be the *native* sizeof, not the
+        // decompiler's ILP32 literal 0x70.  PhysObjUserData holds a dxBody*
+        // pointer, so it is 0x78 bytes here; with the 0x70 stride the free list
+        // was built in 0x70 steps while every consumer memsets/writes
+        // sizeof(PhysObjUserData), so each item's tail overwrote the next
+        // item's `next` link and Pool_Alloc eventually followed garbage.
+        // That is the watermelon-melee crash (Data Abort in Pool_Alloc with
+        // PC 0x3e3a50, Atmosphere report 01790025090_010046701b488000): melee
+        // spawns an FX model-physics body, which is the first user of this
+        // pool.  INIT_STATIC_POOL keeps the two sizes from ever disagreeing.
+        INIT_STATIC_POOL(physGlob.userData, &physGlob.userDataPool);
         ODE_Init();
         for (worldIndex = PHYS_WORLD_DYNENT; worldIndex < PHYS_WORLD_COUNT; ++worldIndex)
         {
@@ -929,9 +942,9 @@ void __cdecl Phys_ObjAddGeomBrush(PhysWorld worldIndex, dxBody *id, const cbrush
         MyAssertHandler(".\\physics\\phys_ode.cpp", 798, 0, "%s", "id");
     body = id;
     geomState.type = PHYS_GEOM_BRUSH;
-    geomState.u.cylinderState.direction = (int)brush;
-    geomState.u.cylinderState.radius = physMass->momentsOfInertia[0];
-    geomState.u.cylinderState.halfHeight = physMass->momentsOfInertia[1];
+    geomState.u.brushState.u.brush = brush; // LP64: through the union's pointer member
+    geomState.u.brushState.momentsOfInertia[0] = physMass->momentsOfInertia[0];
+    geomState.u.brushState.momentsOfInertia[1] = physMass->momentsOfInertia[1];
     geomState.u.brushState.momentsOfInertia[2] = physMass->momentsOfInertia[2];
     geomState.u.brushState.productsOfInertia[0] = physMass->productsOfInertia[0];
     geomState.u.brushState.productsOfInertia[1] = physMass->productsOfInertia[1];
@@ -1213,7 +1226,7 @@ void __cdecl Phys_ObjAddForce(PhysWorld worldIndex, dxBody *id, float *worldPos,
     dBodyEnable(id);
     userData = (PhysObjUserData *)dBodyGetData(id);
     odeWorld = ODE_BodyGetWorld(id);
-    userData->timeLastAsleep = (int)physGlob.space[51 * Phys_IndexFromODEWorld(odeWorld) - 152];
+    userData->timeLastAsleep = physGlob.worldData[Phys_IndexFromODEWorld(odeWorld)].timeLastUpdate; // LP64: was an ILP32 byte-offset index trick
 }
 
 int __cdecl Phys_IndexFromODEWorld(dxWorld *world)
@@ -1476,7 +1489,7 @@ void __cdecl dxPostProcessIslands(PhysWorld worldIndex)
         }
     }
     dJointGroupEmpty(physGlob.contactgroup[worldIndex]);
-    physGlob.space[51 * worldIndex - 149] = 0;
+    physGlob.worldData[worldIndex].numJitterRegions = 0; // LP64: was an ILP32 byte-offset index trick
     seconds = world->seconds;
     bodyEnableCount = 0;
     for (bodyIter = world->firstbody; bodyIter; bodyIter = (dxBody *)bodyIter->next)
@@ -1812,6 +1825,24 @@ void __cdecl Phys_RunToTime(int localClientNum, PhysWorld worldIndex, int timeNo
             dxPostProcessIslands(worldIndex);
         } while (data->timeLastUpdate < timeNow);
         ODE_ForEachBody(world, Phys_DoBodyOncePerRun);
+#ifdef __SWITCH__
+        // Simulation evidence: the ODE world this port used to stub is
+        // stepping real bodies.  Printed at most every 5 s per world under
+        // com_diagMarkers so a device log can show it.
+        {
+            static int s_lastEmit[3] = {-100000, -100000, -100000};
+            static uint32_t s_steps[3];
+            ++s_steps[worldIndex];
+            if (com_diagMarkers && com_diagMarkers->current.enabled &&
+                timeNow - s_lastEmit[worldIndex] >= 5000)
+            {
+                s_lastEmit[worldIndex] = timeNow;
+                Com_Printf(0, "PHYS_ODE_EVIDENCE world=%d bodies=%d joints=%d steps=%u geoms=%d\n",
+                           (int)worldIndex, world->nb, world->nj, s_steps[worldIndex],
+                           physGlob.space[worldIndex] ? (int)physGlob.space[worldIndex]->count : -1);
+            }
+        }
+#endif
     }
     if (phys_drawAwake->current.enabled || phys_drawCollisionObj->current.enabled)
         ODE_ForEachBody(world, Phys_ObjDraw);

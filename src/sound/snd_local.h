@@ -1,14 +1,22 @@
 #pragma once
 
-#ifndef KISAK_OPENAL
+// The Switch target builds the OpenAL-shaped sound front end (KISAK_OPENAL is
+// forced on by scripts/sp/CMakeLists.txt), against the devkitPro
+// switch-openal-soft portlib's AL/al.h + AL/efx.h headers for the OpenAL
+// types (ALuint, AL_GAIN, ...) -- but every al* call is routed to the audren
+// DSP backend (src/sound/snd_audren_al.cpp) via snd_al_dispatch.h, so
+// libopenal.a itself is never linked there. Non-Switch KISAK_OPENAL builds
+// statically link the real openal-soft (scripts/extern/openal.cmake).
+#if !defined(KISAK_OPENAL) && !defined(__SWITCH__)
 #include <msslib/mss.h>
 #else
 #include <AL/al.h>
 #include <AL/alc.h>
 // efx.h only declares its functions as directly-linkable (rather than just LPALGENEFFECTS-
 // style function-pointer typedefs meant for dynamic alGetProcAddress loading) when this is
-// defined first. Since we statically link openal-soft ourselves and know EFX is compiled
-// in, direct linkage is simpler than the usual portable-extension-loading dance.
+// defined first. Non-Switch statically links openal-soft with EFX compiled in, so direct
+// linkage is simpler than the usual portable-extension-loading dance; on Switch nothing here
+// is ever actually linked (see above), so this only affects how the declarations look.
 #define AL_ALEXT_PROTOTYPES
 #include <AL/efx.h>
 #endif
@@ -42,7 +50,7 @@ struct snd_save_stream_t // sizeof=0x20
     float org[3];                       // ...
 };
 
-#ifndef KISAK_OPENAL
+#if !defined(KISAK_OPENAL) && !defined(__SWITCH__)
 // Miles' file-callback bridge (see MSS_File*Callback in snd_mss.cpp). The OpenAL path reads
 // directly via FS_Read when refilling stream buffers, so it has no equivalent bookkeeping.
 struct MssFileHandle // sizeof=0x9C
@@ -81,7 +89,7 @@ struct MssEqInfo // sizeof=0xF00
     SndEqParams params[3][64];
 };
 
-#ifndef KISAK_OPENAL
+#if !defined(KISAK_OPENAL) && !defined(__SWITCH__)
 typedef struct _SAMPLE FAR *HSAMPLE;           // Handle to sample
 
 struct MssLocal // sizeof=0x26D0
@@ -111,11 +119,9 @@ struct AlLocal
     ALCdevice *device;
     ALCcontext *context;
     ALuint source[53];
-    // Per-channel AL buffer, generated fresh each time SND_StartAlias2D/3DSample plays a
-    // "loaded" sound and deleted when the channel is stopped/reused. Simpler than caching
-    // one buffer per SoundFile (which would need a lifetime-safe cache key working for both
-    // the raw-CSV load path and fastfile-preloaded LoadedSounds - see WORK.md Phase 4), at
-    // the cost of re-uploading PCM to the driver on every replay of the same sound.
+    // The loaded sound's shared AL buffer this channel is playing (0 when idle).
+    // Owned by the per-sound cache in snd_driver_openal.cpp (SND_GetLoadedSoundBuffer,
+    // retired on zone unload); a channel only attaches and detaches it.
     ALuint channelBuffer[53];
 
     MssEqInfo eq[2];                    // same EQ band data as Miles; DSP application TBD
@@ -123,6 +129,15 @@ struct AlLocal
 #ifndef KISAK_XBOX
     float eqLerp;
 #endif
+
+    // Dedicated 2D source for the cinematic (Bink movie) audio track, fed by
+    // SND_PushCinematicPCM from the FFmpeg backend.  Separate from the 53
+    // alias channels because a movie has no sound alias: the backend owns the
+    // source's lifetime (start/push/stop) rather than the alias machinery.
+    ALuint cinematicSource;
+    int cinematicRate;
+    int cinematicChannels;
+    bool cinematicActive;
 
     ALuint auxSlot;                     // global reverb auxiliary effect slot
     ALuint reverbEffect;                // global reverb effect object (EAXREVERB, one room preset active at a time)
@@ -218,7 +233,7 @@ void SND_SetEqLerp(float lerp);
 // Function names keep their historical MSS_ prefix even on the OpenAL side, so that shared
 // callers (snd.cpp, snd_driver.cpp) can call them without their own #ifdef KISAK_OPENAL -
 // only one of snd_mss.cpp/snd_al.cpp is compiled for a given build, and it provides the body.
-#ifndef KISAK_OPENAL
+#if !defined(KISAK_OPENAL) && !defined(__SWITCH__)
 // Miles routes all its file I/O (including stream reads) through these callbacks, bridged
 // to FS_* in snd_mss.cpp. OpenAL has no equivalent hook; its streaming path (added in a later
 // phase) calls FS_Read directly when refilling buffers, so these have no OpenAL counterpart.
@@ -237,13 +252,13 @@ bool __cdecl MSS_Startup();
 void MSS_ShutdownCleanup();
 float MSS_GetDryLevel();
 float MSS_GetWetLevel(const snd_alias_t *pAlias);
-#ifndef KISAK_OPENAL
+#if !defined(KISAK_OPENAL) && !defined(__SWITCH__)
 void __cdecl MSS_ApplyEqFilter(_SAMPLE *s, int entchannel);
 #else
 void __cdecl MSS_ApplyEqFilter(ALuint source, int entchannel);
 #endif
 void __cdecl MSS_ResumeSample(int i, int frametime);
-#ifndef KISAK_OPENAL
+#if !defined(KISAK_OPENAL) && !defined(__SWITCH__)
 _DIG_DRIVER *__cdecl MSS_GetDriver();
 #endif
 int __cdecl MSS_DigitalFormatType(int waveFormat, int bits, int channels);
@@ -252,7 +267,7 @@ uint8_t *__cdecl MSS_Alloc_LoadObj(uint32_t bytes, uint32_t rate);
 uint32_t *__cdecl MSS_Alloc_FastFile(int bytes);
 
 
-#ifndef KISAK_OPENAL
+#if !defined(KISAK_OPENAL) && !defined(__SWITCH__)
 extern MssLocal milesGlob;
 #else
 extern AlLocal alGlob;

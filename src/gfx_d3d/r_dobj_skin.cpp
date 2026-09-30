@@ -11,11 +11,14 @@
 #include "r_buffers.h"
 #include "r_model_pose.h"
 #include "r_dpvs.h"
+#include <universal/spin_pause.h>
 
 static void __cdecl R_FlagXModelAsSkinned(GfxSceneEntity *sceneEnt, uint32_t surfaceCount)
 {
     iassert(sceneEnt->cull.state == CULL_STATE_SKINNED_PENDING);
-    sceneEnt->cull.state = surfaceCount + 4;
+    // Release: publishes the skinned surfaces before the state other threads
+    // spin on (acquire in R_SkinSceneDObj's wait).
+    __atomic_store_n(&sceneEnt->cull.state, surfaceCount + 4, __ATOMIC_RELEASE);
 }
 
 #ifdef KISAK_MP
@@ -166,6 +169,24 @@ int  R_SkinSceneDObjModels(
             iassert(surfaces);
             iassert(surfaceCount);
 
+#ifdef __SWITCH__
+            // surfsBuffer holds at most this many surfaces, and a skinned
+            // surface is the smallest per-surface record.  A stale/garbage
+            // cull lods[] entry indexes model->lodInfo OOB and returns a
+            // bogus (huge) surfaceCount whose walk overruns the stack buffer;
+            // fail loudly per entity instead of corrupting the frame.
+            if (surfaceCount > sizeof(surfsBuffer) / sizeof(GfxModelSkinnedSurface))
+            {
+                static int s_skinSurfCountFaults = 0;
+                if (s_skinSurfCountFaults < 16)
+                {
+                    ++s_skinSurfCountFaults;
+                    
+                }
+                return 0;
+            }
+#endif
+
             totalSurfaceCount += surfaceCount;
 
             boneIndex_div32 = boneIndex >> 5;
@@ -214,11 +235,28 @@ int  R_SkinSceneDObjModels(
                 skinCmd.surfacePartBits[2] |= partBitsCheck[2];
                 skinCmd.surfacePartBits[3] |= partBitsCheck[3];
 
+#ifdef __SWITCH__
+                // Rigid records are larger than the skinned stride the buffer
+                // was sized with, so a model with many rigid surfaces can
+                // still overrun even when surfaceCount is legal.
+                if ((size_t)((char *)surfPos - (char *)surfsBuffer) + sizeof(GfxModelRigidSurface)
+                    > sizeof(surfsBuffer))
+                {
+                    static int s_skinSurfBufFaults = 0;
+                    if (s_skinSurfBufFaults < 16)
+                    {
+                        ++s_skinSurfBufFaults;
+                        
+                    }
+                    return 0;
+                }
+#endif
+
                 // Sets *surfPos to a Rigidsurface or SkinnedSurface
                 // returns either sizeof(GfxModelRigidSurface) [56] OR sizeof(GfxModelSkinnedSurface) [24] 
                 // Both of them have the same 1st member `int skinnedCachedOffset`
                 // In case of Rigid(56 bytes), the int is set to "-2"
-                // Otherwise, the int is set to value of `numSkinnedVerts`
+                // Otherwise, it is set to value of `numSkinnedVerts`
                 int surfBufSize = R_PreSkinXSurface(obj, surface, &targBoneIndexHigh, &numSkinnedVerts, surfPos);
 
                 GfxModelSkinnedSurface *skinnedSurface = (GfxModelSkinnedSurface *)surfPos;
@@ -315,7 +353,9 @@ int  R_SkinSceneDObjModels(
                 }
                 else
                 {
-                    surfPos2->oldSkinnedCachedOffset = (int)&frontEndDataOut->tempSkinBuf[sizeof(GfxPackedVertex) * surfPos2->skinnedCachedOffset + firstSurf];
+                    // LP64: write the pointer member of the union; the int
+                    // member only covers the low 32 bits of skinnedVert.
+                    surfPos2->skinnedVert = (GfxPackedVertex *)&frontEndDataOut->tempSkinBuf[sizeof(GfxPackedVertex) * surfPos2->skinnedCachedOffset + firstSurf];
                     surfPos2->skinnedCachedOffset = -1;
                     ++surfPos2;
                 }
@@ -396,9 +436,13 @@ void __cdecl R_SkinSceneDObj(
         }
         else if (waitForCullState)
         {
+            uint32_t spin = 0;
             do
             {
-                state = sceneEnt->cull.state;
+                if (spin)
+                    Sys_SpinPause(spin);
+                ++spin;
+                state = __atomic_load_n(&sceneEnt->cull.state, __ATOMIC_ACQUIRE);
                 iassert(state >= CULL_STATE_SKINNED_PENDING);
             } while (state == CULL_STATE_SKINNED_PENDING);
 

@@ -3,11 +3,18 @@
 #include "r_state.h"
 #include "rb_logfile.h"
 #include "r_dvars.h"
+#include "rb_ab_tour.h"
+#include "rb_halfres_particles.h"
 #include "rb_shade.h"
 #include <universal/profile.h>
 #include "r_buffers.h"
 #include "r_utils.h"
 #include "r_water.h"
+#include <qcommon/qcommon.h>
+#include "r_init.h" // dx.device
+#include <deko9/deko9_native.h> // Deko9Span, Deko9_FrameAlloc, Deko9_BindWindow, Deko9_FrameRecording
+
+
 #include "r_image.h"
 
 
@@ -41,7 +48,6 @@ int __cdecl R_SetIndexData(GfxCmdBufPrimState *state, uint8_t *indices, int triC
 {
     int baseIndex; // [esp+60h] [ebp-18h]
     int indexDataSize; // [esp+64h] [ebp-14h]
-    uint32_t lockFlags; // [esp+68h] [ebp-10h]
     IDirect3DIndexBuffer9 *ib; // [esp+70h] [ebp-8h]
     uint8_t *bufferData; // [esp+74h] [ebp-4h]
 
@@ -52,21 +58,30 @@ int __cdecl R_SetIndexData(GfxCmdBufPrimState *state, uint8_t *indices, int triC
     ib = gfxBuf.dynamicIndexBuffer->buffer;
     iassert(ib);
 
-    if (gfxBuf.dynamicIndexBuffer->used)
+    if (!gfxBuf.dynamicIndexBuffer->used)
     {
-        PROF_SCOPED("LockIndexBufferNoOverwrite");
-        lockFlags = D3DLOCK_NOOVERWRITE;
-        bufferData = (uint8_t *)R_LockIndexBuffer(ib, 2 * gfxBuf.dynamicIndexBuffer->used, indexDataSize, lockFlags);
+        // Frame arena (deko9_arena.h):
+        // wrap or first use this frame -- one span covering the whole
+        // ring, windowed onto `ib`. No Lock, no Unlock, no rename; later
+        // calls this frame just write through the cached CPU pointer.
+        PROF_SCOPED("FrameAllocIndexBuffer");
+        Deko9Span span;
+        const uint32_t ringBytes = 2u * (uint32_t)gfxBuf.dynamicIndexBuffer->total;
+        if (!Deko9_FrameAlloc(dx.device, Deko9_FrameRecording(dx.device), ringBytes, 256, &span))
+            Com_Error(ERR_FATAL, "R_SetIndexData: Deko9_FrameAlloc failed (ringBytes=%u)\n", ringBytes);
+        Deko9_BindWindow(ib, span);
+        gfxBuf.dynamicIndexBuffer->indices = (uint16_t *)span.cpu;
     }
-    else
-    {
-        PROF_SCOPED("LockIndexBufferDiscard");
-        lockFlags = D3DLOCK_DISCARD;
-        bufferData = (uint8_t *)R_LockIndexBuffer(ib, 2 * gfxBuf.dynamicIndexBuffer->used, indexDataSize, lockFlags);
-    }
+    bufferData = (uint8_t *)gfxBuf.dynamicIndexBuffer->indices + 2 * gfxBuf.dynamicIndexBuffer->used;
 
     memcpy(bufferData, indices, indexDataSize);
-    R_UnlockIndexBuffer(ib);
+#ifdef __SWITCH__
+    if (SwitchPerf_g_enabled)
+    {
+        SwitchPerf_AddEvent(SWITCH_PERF_EV_SETIDX_CALLS, 1);
+        SwitchPerf_AddEvent(SWITCH_PERF_EV_SETIDX_BYTES, (uint64_t)indexDataSize);
+    }
+#endif
     if (state->indexBuffer != ib)
         R_ChangeIndices(state, ib);
     gfxBuf.dynamicIndexBuffer->used += 3 * triCount;
@@ -367,7 +382,12 @@ void __cdecl R_OverrideImage(GfxImage **image, const MaterialTextureDef *texdef)
     }
 }
 
-#ifdef KISAK_RADIANT
+// Radiant only; Switch (deko9) skips this: MojoShader compiles every def into
+// the program as a GLSL constant (D3D9 semantics: defs are local to the
+// shader), so re-parsing the bytecode and re-uploading defs on each shader
+// change was pure per-bind cost (and it reset the engine's constant
+// tracking, forcing extra constant uploads).
+#if defined(KISAK_RADIANT)
 // DOCUMENTED DIVERGENCE (white-xmodel root cause, 2026-07-02): many tools shaders keep
 // load-bearing constants as `def` immediates in their bytecode — e.g. the _dtex model
 // shaders' packed-UV half-float decompress (vs c8..c12; CTAB only binds the c0/c4
@@ -446,7 +466,7 @@ void __cdecl R_SetPixelShader(GfxCmdBufState *state, const MaterialPixelShader *
 
         R_HW_SetPixelShader(state->prim.device, pixelShader);
         state->pixelShader = pixelShader;
-#ifdef KISAK_RADIANT
+#if defined(KISAK_RADIANT)
         R_ApplyShaderDefConstants(state, pixelShader->prog.loadDef.program,
                                   pixelShader->prog.loadDef.programSize, true);
 #endif
@@ -464,7 +484,7 @@ void __cdecl R_SetVertexShader(GfxCmdBufState *state, const MaterialVertexShader
 
         R_HW_SetVertexShader(state->prim.device, vertexShader);
         state->vertexShader = vertexShader;
-#ifdef KISAK_RADIANT
+#if defined(KISAK_RADIANT)
         R_ApplyShaderDefConstants(state, vertexShader->prog.loadDef.program,
                                   vertexShader->prog.loadDef.programSize, false);
 #endif
@@ -520,17 +540,13 @@ void __cdecl R_SetupPass(GfxCmdBufContext context, uint32_t passIndex)
     refStateBits = &material->stateBitsTable[passIndex + material->stateBitsEntry[context.state->techType]];
     stateBits[0] = refStateBits->loadBits[0];
     stateBits[1] = refStateBits->loadBits[1];
+    // r_halfResParticles: a redirected soft particle keeps its colour blend
+    // and writes transmittance to alpha (rb_halfres_particles.h).
+    if (g_hrpRedirecting)
+        stateBits[0] = RB_HrpRemapStateBits0(material, stateBits[0]);
     iassert( context.source->viewMode != VIEW_MODE_NONE );
-#ifdef KISAK_RADIANT
-    // IDB R_SetupPass @0x53c563: for 2D draws the binary forces the low 6 (depth-state) bits of
-    // stateBits[1] to 2 — BEFORE the state change — so every 2D pass gets the engine's 2D depth
-    // state regardless of the material's authored loadBits. The kisak port dropped this; restore it
-    // (gated to the editor: r_shade is shared with the CoD3-based game, which I can't verify against
-    // the CoD4Radiant IDB). Pixel-neutral for the depth-cleared texture browser, but correct for any
-    // 2D draw over a populated depth buffer (camera/XY overlays).
     if ( context.source->viewMode == VIEW_MODE_2D )
-        stateBits[1] = stateBits[1] & 0xFFFFFFC0 | 2;
-#endif
+        stateBits[1] = (stateBits[1] & 0xFFFFFFC0) | 2;
     R_SetState(context.state, stateBits);
     if (r_logFile->current.integer)
     {
@@ -544,11 +560,15 @@ void __cdecl R_SetupPass(GfxCmdBufContext context, uint32_t passIndex)
     }
     iassert( pass->pixelShader );
     R_SetPixelShader(context.state, pass->pixelShader);
+    if (g_drawCensusOn)
+        RB_DrawCensusLabel(material, context.state->technique, pass->pixelShader);
     if (pass->stableArgCount)
+    {
         R_SetPassShaderStableArguments(
             context,
             pass->stableArgCount,
             &pass->args[pass->perPrimArgCount + pass->perObjArgCount]);
+    }
 }
 
 void __cdecl R_SetState(GfxCmdBufState *state, uint32_t *stateBits)
@@ -649,7 +669,7 @@ static const GfxImage *R_GetCaseTexture(const Material *material)
     {
         for (int ti = 0; ti < material->textureCount; ++ti)
         {
-            const GfxImage *img = material->textureTable[ti].u.image;
+            const GfxImage *img = MaterialTextureImage(material->textureTable[ti]);
             if (img && img->width)
             {
                 colorMap = img;
@@ -894,19 +914,20 @@ void __cdecl R_ChangeObjectPlacement(GfxCmdBufSourceState *source, const GfxScal
     iassert( placement != source->objectPlacement );
     iassert( placement );
     UnitQuatToAxis(placement->base.quat, axis);
-    if (!Vec3IsNormalized(axis[0]))
+    // Debug-build asserts (retail release skips them): r_portDebugChecks only.
+    if (r_portDebugChecks->current.enabled && !Vec3IsNormalized(axis[0]))
     {
         scale = Vec3Length(axis[0]);
         v2 = va("(%g %g %g) len %g", axis[0][0], axis[0][1], axis[0][2], scale);
         MyAssertHandler(".\\r_state.cpp", 280, 0, "%s\n\t%s", "Vec3IsNormalized( axis[0] )", v2);
     }
-    if (!Vec3IsNormalized(axis[1]))
+    if (r_portDebugChecks->current.enabled && !Vec3IsNormalized(axis[1]))
     {
         scalea = Vec3Length(axis[1]);
         v3 = va("(%g %g %g) len %g", axis[1][0], axis[1][1], axis[1][2], scalea);
         MyAssertHandler(".\\r_state.cpp", 281, 0, "%s\n\t%s", "Vec3IsNormalized( axis[1] )", v3);
     }
-    if (!Vec3IsNormalized(axis[2]))
+    if (r_portDebugChecks->current.enabled && !Vec3IsNormalized(axis[2]))
     {
         scaleb = Vec3Length(axis[2]);
         v4 = va("(%g %g %g) len %g", axis[2][0], axis[2][1], axis[2][2], scaleb);
@@ -922,7 +943,6 @@ int __cdecl R_SetVertexData(GfxCmdBufState *state, const void *data, int vertexC
 {
     IDirect3DVertexBuffer9 *vb; // [esp+6Ch] [ebp-14h]
     volatile int vertexOffset; // [esp+70h] [ebp-10h]
-    uint32_t lockFlags; // [esp+74h] [ebp-Ch]
     void *bufferData; // [esp+78h] [ebp-8h]
     int totalSize; // [esp+7Ch] [ebp-4h]
 
@@ -940,19 +960,31 @@ int __cdecl R_SetVertexData(GfxCmdBufState *state, const void *data, int vertexC
             "(totalSize <= gfxBuf.dynamicVertexBuffer->total)",
             totalSize);
     // Binary 0x53C600 @0x53c66c: when the next write would run past the end, WRAP the
-    // dynamic VB ring to 0 (the used==0 path below then locks with DISCARD, renaming the
-    // buffer).  The port had replaced this wrap with an assert — after continuing past it,
-    // Lock(used, totalSize) ran off the buffer end -> D3DERR_INVALIDCALL -> R_FatalLockError.
-    // R_ReserveIndexData (above) kept the binary's identical wrap for the index ring.
+    // dynamic VB ring to 0 (the used==0 path below then allocates a fresh frame-arena
+    // span, windowed onto the buffer -- see deko9_arena.h; originally this locked with
+    // DISCARD, renaming the buffer).  The port had replaced this wrap with an assert —
+    // after continuing past it, Lock(used, totalSize) ran off the buffer end ->
+    // D3DERR_INVALIDCALL -> R_FatalLockError. R_ReserveIndexData (above) kept the
+    // binary's identical wrap for the index ring.
     if (totalSize + gfxBuf.dynamicVertexBuffer->used > gfxBuf.dynamicVertexBuffer->total)
         gfxBuf.dynamicVertexBuffer->used = 0;
     vb = gfxBuf.dynamicVertexBuffer->buffer;
     iassert( vb );
-    lockFlags = gfxBuf.dynamicVertexBuffer->used != 0 ? 4096 : 0x2000;
+    if (!gfxBuf.dynamicVertexBuffer->used)
     {
-        PROF_SCOPED("LockVertexBuffer");
-        bufferData = R_LockVertexBuffer(vb, gfxBuf.dynamicVertexBuffer->used, totalSize, lockFlags);
+        // Frame arena (deko9_arena.h
+        // 2.2): wrap or first use this frame -- one span covering the whole
+        // ring, windowed onto `vb`. No Lock, no Unlock, no rename; later
+        // calls this frame just write through the cached CPU pointer.
+        PROF_SCOPED("FrameAllocVertexBuffer");
+        Deko9Span span;
+        const uint32_t ringBytes = (uint32_t)gfxBuf.dynamicVertexBuffer->total;
+        if (!Deko9_FrameAlloc(dx.device, Deko9_FrameRecording(dx.device), ringBytes, 256, &span))
+            Com_Error(ERR_FATAL, "R_SetVertexData: Deko9_FrameAlloc failed (ringBytes=%u)\n", ringBytes);
+        Deko9_BindWindow(vb, span);
+        gfxBuf.dynamicVertexBuffer->verts = (uint8_t *)span.cpu;
     }
+    bufferData = gfxBuf.dynamicVertexBuffer->verts + gfxBuf.dynamicVertexBuffer->used;
     iassert( bufferData );
     //Profile_Begin(167);
     //Profile_Begin(171);
@@ -963,7 +995,6 @@ int __cdecl R_SetVertexData(GfxCmdBufState *state, const void *data, int vertexC
     }
     //Profile_EndInternal(0);
     //Profile_EndInternal(0);
-    R_UnlockVertexBuffer(vb);
     vertexOffset = gfxBuf.dynamicVertexBuffer->used;
     gfxBuf.dynamicVertexBuffer->used += totalSize;
     return vertexOffset;

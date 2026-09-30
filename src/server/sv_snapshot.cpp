@@ -32,8 +32,11 @@ void __cdecl SV_WriteSnapshotToClient(client_t *client, msg_t *msg)
             "(client->state == CS_ACTIVE)",
             client->state);
     MSG_WriteByte(msg, svs.snapFlagServerBit);
+    
     MSG_WriteDeltaPlayerstate(msg, client->frames);
+    
     numSnapshotEntities = sv.entityNumbers.numSnapshotEntities;
+    
     if (sv.entityNumbers.numSnapshotEntities > 0x800u)
     {
         MyAssertHandler(
@@ -66,6 +69,7 @@ void __cdecl SV_WriteSnapshotToClient(client_t *client, msg_t *msg)
         } while (v6 < sv.entityNumbers.numSnapshotEntities);
     }
     MSG_WriteBits(msg, ENTITYNUM_NONE, 12);
+    
 }
 
 void __cdecl SV_UpdateServerCommandsToClient(client_t *client)
@@ -157,12 +161,14 @@ void __cdecl SV_BuildAndSendClientSnapshot(client_t *client)
     SV_BuildClientSnapshot(client);
     MSG_Init(&msg, msgbuf, 0x4000);
     SV_WriteSnapshotToClient(client, &msg);
+    
     if (msg.overflowed)
         Com_Error(ERR_DROP, "SV_BuildAndSendClientSnapshot: bad gEnt");
     MSG_WriteByte(&msg, 4);
     outgoingSequence = client->netchan.outgoingSequence;
     client->netchan.outgoingSequence = outgoingSequence + 1;
     CL_PacketEvent(&msg, outgoingSequence);
+    
 }
 
 void __cdecl SV_SendClientMessages()
@@ -189,8 +195,10 @@ void __cdecl SV_SendClientMessages()
         p_reliableCommands->header.rover = 0;
         //Profile_Begin(31);
         SV_BuildAndSendClientSnapshot(svs.clients);
+        
         //Profile_EndInternal(0);
     }
+    
 }
 
 void __cdecl SV_WriteSnapshotToClientCmd(void *cmdData)

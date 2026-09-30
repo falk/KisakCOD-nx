@@ -3,6 +3,7 @@
 
 #include <qcommon/mem_track.h>
 #include <qcommon/threads.h>
+#include <universal/critical_section.h>
 
 #include <physics/phys_local.h>
 
@@ -17,10 +18,13 @@
 #include <cgame/cg_main.h>
 #endif
 
+#ifndef __SWITCH__
 #include <win32/win_local.h>
+#endif
 #include <gfx_d3d/r_model.h>
 
 #include <universal/profile.h>
+#include <universal/spin_pause.h>
 
 int32_t fx_maxLocalClients;
 int32_t fx_serverVisClient;
@@ -190,15 +194,6 @@ void __cdecl FX_ShutdownSystem(int32_t localClientNum)
     FX_UnregisterAll();
 }
 
-void __cdecl FX_RelocateSystem(FxSystem *system, int32_t relocationDistance)
-{
-    if (relocationDistance)
-    {
-        system->visStateBufferRead = (const FxVisState *)((char *)system->visStateBufferRead + relocationDistance);
-        system->visStateBufferWrite = (FxVisState *)((char *)system->visStateBufferWrite + relocationDistance);
-    }
-}
-
 void __cdecl FX_EffectNoLongerReferenced(FxSystem *system, FxEffect *remoteEffect)
 {
     const char *v2; // eax
@@ -325,7 +320,7 @@ void __cdecl FX_FreePool_Generic_FxTrail_(FxTrail *item, volatile long *firstFre
 {
     volatile uint32_t freedIndex; // [esp+4h] [ebp-4h]
 
-    freedIndex = ((char *)item - (char *)pool) >> 3;
+    freedIndex = ((char *)item - (char *)pool) / sizeof(FxPool<FxTrail>);
     if (freedIndex >= 0x80)
         MyAssertHandler(
             ".\\EffectsCore\\fx_system.cpp",
@@ -430,6 +425,9 @@ FxPool<FxTrail>* __cdecl FX_AllocPool_Generic_FxTrail_(
     {
         item = &pool[itemIndex];
         if (item->nextFree != -1 && item->nextFree >= 0x80u)
+            Com_Printf(0, "FX_POOL FxTrail alloc corrupt: firstFree=%d nextFree=%d active=%ld\n",
+                       itemIndex, item->nextFree, (long)*activeCount);
+        if (item->nextFree != -1 && item->nextFree >= 0x80u)
             MyAssertHandler(
                 ".\\EffectsCore\\fx_system.cpp",
                 200,
@@ -469,6 +467,9 @@ FxPool<FxTrailElem>* __cdecl FX_AllocPool_Generic_FxTrailElem_(
     else
     {
         item = &pool[itemIndex];
+        if (item->nextFree != -1 && item->nextFree >= 0x800u)
+            Com_Printf(0, "FX_POOL FxTrailElem alloc corrupt: firstFree=%d nextFree=%d active=%ld\n",
+                       itemIndex, item->nextFree, (long)*activeCount);
         if (item->nextFree != -1 && item->nextFree >= 0x800u)
             MyAssertHandler(
                 ".\\EffectsCore\\fx_system.cpp",
@@ -510,6 +511,9 @@ FxPool<FxElem>* __cdecl FX_AllocPool_Generic_FxElem_(
     {
         item = &pool[itemIndex];
         if (item->nextFree != -1 && item->nextFree >= 0x800u)
+            Com_Printf(0, "FX_POOL FxElem alloc corrupt: firstFree=%d nextFree=%d active=%ld\n",
+                       itemIndex, item->nextFree, (long)*activeCount);
+        if (item->nextFree != -1 && item->nextFree >= 0x800u)
             MyAssertHandler(
                 ".\\EffectsCore\\fx_system.cpp",
                 200,
@@ -527,7 +531,11 @@ void __cdecl FX_FreePool_Generic_FxElem_(FxElem* item, volatile long* firstFreeI
 {
     volatile uint32_t freedIndex; // [esp+4h] [ebp-4h]
 
-    freedIndex = ((char*)item - (char*)pool) / 40;
+    // The decompiled literal 40 is the ILP32 sizeof(FxElem); the union with
+    // physObjId (uintptr_t) makes it 48 on LP64, so every free landed at
+    // index*40/48 and a later alloc handed out a live element (FX_POOL
+    // FxElem alloc corrupt: nextFree held an element header).
+    freedIndex = ((char*)item - (char*)pool) / sizeof(FxPool<FxElem>);
     if (freedIndex >= 0x800)
         MyAssertHandler(
             ".\\EffectsCore\\fx_system.cpp",
@@ -555,7 +563,7 @@ void __cdecl FX_FreePool_Generic_FxTrailElem_(
 {
     volatile uint32_t freedIndex; // [esp+4h] [ebp-4h]
 
-    freedIndex = ((char*)item - (char*)pool) >> 5;
+    freedIndex = ((char*)item - (char*)pool) / sizeof(FxPool<FxTrailElem>);
     if (freedIndex >= 0x800)
         MyAssertHandler(
             ".\\EffectsCore\\fx_system.cpp",
@@ -589,6 +597,32 @@ uint16_t __cdecl FX_CalculatePackedLighting(const float *origin)
     R_GetAverageLightingAtPoint(origin, color);
     return ((color[2] & 0xF8) << 8) | (8 * (color[1] & 0xF8)) | ((color[0] & 0xF8) >> 3);
 }
+// FX_POOL diag: walk the trail free list and report the first corrupt link
+// with the effect being spawned, so the "item->nextFree < POOL_SIZE" assert
+// can be tied to the spawn that clobbered it. Gated on com_diagMarkers; one report.
+static void FX_SwitchCheckTrailPool(FxSystem *system, const char *effectName, const char *where)
+{
+    extern const dvar_t *com_diagMarkers;
+    static bool s_reported;
+    if (s_reported || !com_diagMarkers || !com_diagMarkers->current.enabled)
+        return;
+    int index = system->firstFreeTrail;
+    int steps = 0;
+    while (index != -1)
+    {
+        if (index < 0 || index >= (int)MAX_TRAILS || steps > (int)MAX_TRAILS)
+        {
+            s_reported = true;
+            Com_Printf(0, "FX_POOL trail free list corrupt %s effect='%s' firstFree=%ld step=%d index=%d active=%ld\n",
+                       where, effectName ? effectName : "(null)", (long)system->firstFreeTrail, steps, index,
+                       (long)system->activeTrailCount);
+            return;
+        }
+        index = system->trails[index].nextFree;
+        ++steps;
+    }
+}
+
 FxEffect* __cdecl FX_SpawnEffect(
     FxSystem* system,
     const FxEffectDef* remoteDef,
@@ -648,7 +682,9 @@ FxEffect* __cdecl FX_SpawnEffect(
         remoteEffect->distanceTraveled = 0.0;
         FX_SetEffectRandomSeed(remoteEffect, remoteDef);
         remoteEffect->firstTrailHandle = -1;
+        FX_SwitchCheckTrailPool(system, remoteDef->name, "before-alloc-trails");
         FX_SpawnEffect_AllocTrails(system, remoteEffect);
+        FX_SwitchCheckTrailPool(system, remoteDef->name, "after-alloc-trails");
         if (isSpotLightEffect)
             FX_SpawnEffect_AllocSpotLightEffect(system, remoteEffect);
 
@@ -703,13 +739,19 @@ FxEffect* __cdecl FX_SpawnEffect(
         memcpy(&remoteEffect->framePrev, &remoteEffect->frameAtSpawn, sizeof(remoteEffect->framePrev));
         memcpy(&remoteEffect->frameNow, &remoteEffect->frameAtSpawn, sizeof(remoteEffect->frameNow));
         Destination = &system->firstNewEffect;
+        uint32_t spin = 0;
         do
         {
             while (*Destination != allocIndex)
-                ;
+                Sys_SpinPause(spin++);
         } while (InterlockedCompareExchange(Destination, allocIndex + 1, allocIndex) != allocIndex);
         FX_StartNewEffect(system, remoteEffect);
-        InterlockedExchangeAdd(&remoteEffect->status, 0xE0000000);
+        // 0xE0000000 as a 32-bit InterlockedExchangeAdd operand meant
+        // "-0x20000000"; on LP64 the unsigned literal zero-extends and adds
+        // +0xE0000000 instead, pushing flag bits above bit 31 and making the
+        // effect-lock spin in FX_Update unsatisfiable. Use the signed form
+        // used by every other status update in this file.
+        InterlockedExchangeAdd(&remoteEffect->status, -536870912);
         return remoteEffect;
     }
     else
@@ -773,7 +815,11 @@ void __cdecl FX_SetEffectRandomSeed(FxEffect *effect, const FxEffectDef *remoteD
     if (FX_EffectAffectsGameplay(remoteDef))
         effect->randomSeed = (479 * ((uint32_t)(214013 * effect->msecBegin + 2531011) >> 17)) >> 15; // has to be unsigned
     else
-        effect->randomSeed = 479 * rand() / 0x8000;
+        // 479 * rand() overflows 32-bit int now that RAND_MAX is 2^31-1, and
+        // / 0x8000 assumed a 15-bit rand (seed reached ~31M and indexed
+        // fx_randomTable far out of bounds). Keep the retail [0,478] range
+        // with a double scale by the real RAND_MAX.
+        effect->randomSeed = (int)(479.0 * rand() / (RAND_MAX + 1.0));
 
     // LWSS ADD - bounds check
     iassert(effect->randomSeed < ARRAY_COUNT(fx_randomTable));
@@ -1697,12 +1743,105 @@ void __cdecl FX_SpawnElem(
                 }
                 else
                 {
+                    InterlockedIncrement(&fx_elemLimitHits);
                     R_WarnOncePerFrame(R_WARN_FX_ELEM_LIMIT);
                 }
             }
             break;
         }
     }
+}
+
+// FX_CENSUS (fx_census N ms): pool accounting to tell a legitimately full
+// FX_ELEM_LIMIT from a leak.  Every one of the 2048 elems must be either on
+// the free list or linked into an active effect's elem list; `unaccounted`
+// > 0 is a leak.  Runs on the main thread under the exclusive effect
+// iterator (same guard as garbage collection) plus the alloc lock.
+volatile long fx_elemLimitHits;
+static constexpr int32_t kFxCensusElemLimit = 2048; // FX_ELEM_LIMIT
+
+void __cdecl FX_Census(FxSystem *system)
+{
+    static uint32_t s_lastMsec;
+    static long s_lastLimitHits;
+    const int32_t interval = fx_census ? fx_census->current.integer : 0;
+    if (interval <= 0 || !system || !system->isInitialized || system->isArchiving)
+        return;
+    const uint32_t now = Sys_Milliseconds();
+    if (s_lastMsec && now - s_lastMsec < (uint32_t)interval)
+        return;
+    if (!FX_BeginIteratingOverEffects_Exclusive(system))
+        return;
+    s_lastMsec = now;
+
+    int32_t freeCount = 0;
+    Sys_EnterCriticalSection(CRITSECT_FX_ALLOC);
+    for (int32_t index = system->firstFreeElem; index != -1 && freeCount <= kFxCensusElemLimit;
+         index = system->elems[index].nextFree)
+    {
+        if (index < 0 || index >= kFxCensusElemLimit)
+        {
+            freeCount = -1;
+            break;
+        }
+        ++freeCount;
+    }
+    const long activeCount = system->activeElemCount;
+    Sys_LeaveCriticalSection(CRITSECT_FX_ALLOC);
+
+    struct Top
+    {
+        const char *name;
+        int32_t elems;
+    } top[3]{};
+    int32_t ownedCount = 0;
+    int32_t effectCount = 0;
+    for (volatile long activeIndex = system->firstActiveEffect; activeIndex != system->firstNewEffect; ++activeIndex)
+    {
+        const FxEffect *effect = FX_EffectFromHandle(system, system->allEffectHandles[activeIndex & 0x3FF]);
+        int32_t elems = 0;
+        for (int32_t elemClass = 0; elemClass < 3; ++elemClass)
+        {
+            for (uint16_t handle = effect->firstElemHandle[elemClass]; handle != 0xFFFF && elems <= kFxCensusElemLimit;)
+            {
+                const FxPool<FxElem> *elem = FX_PoolFromHandle_Generic<FxElem, 2048>(system->elems, handle);
+                ++elems;
+                handle = elem->item.nextElemHandleInEffect;
+            }
+        }
+        ++effectCount;
+        ownedCount += elems;
+        const char *name = effect->def ? effect->def->name : "?";
+        for (int32_t slot = 0; slot < 3; ++slot)
+        {
+            if (top[slot].name && !strcmp(top[slot].name, name))
+            {
+                top[slot].elems += elems;
+                name = nullptr;
+                break;
+            }
+        }
+        if (name)
+        {
+            int32_t slot = 0;
+            for (int32_t s = 1; s < 3; ++s)
+                if (top[s].elems < top[slot].elems)
+                    slot = s;
+            if (elems > top[slot].elems)
+                top[slot] = Top{ name, elems };
+        }
+    }
+    system->iteratorCount = 0;
+
+    const long limitHits = fx_elemLimitHits;
+    Com_Printf(CON_CHANNEL_FX,
+               "FX_CENSUS t=%u effects=%d elems_active=%ld elems_free=%d elems_owned=%d elems_unaccounted=%d "
+               "trail_elems=%ld limit_hits=%ld (+%ld) top=%s:%d,%s:%d,%s:%d\n",
+               now, effectCount, activeCount, freeCount, ownedCount,
+               freeCount < 0 ? -1 : kFxCensusElemLimit - freeCount - ownedCount, (long)system->activeTrailElemCount,
+               limitHits, limitHits - s_lastLimitHits, top[0].name ? top[0].name : "-", top[0].elems,
+               top[1].name ? top[1].name : "-", top[1].elems, top[2].name ? top[2].name : "-", top[2].elems);
+    s_lastLimitHits = limitHits;
 }
 
 FxPool<FxElem> *__cdecl FX_AllocElem(FxSystem *system)
@@ -1827,14 +1966,14 @@ bool __cdecl FX_SpawnModelPhysics(
     angularVelocity[2] = v6 * 1000.0;
     Sys_EnterCriticalSection(CRITSECT_PHYSICS);
     visuals.anonymous = FX_GetElemVisuals(elemDef, randomSeed).anonymous;
-    if (!*((_DWORD*)visuals.anonymous + 53))
+    if (!visuals.model->physPreset)
         MyAssertHandler(".\\EffectsCore\\fx_system.cpp", 1853, 0, "%s", "visuals.model->physPreset");
-    elem->physObjId = (int)Phys_ObjCreate(
+    elem->physObjId = (uintptr_t)Phys_ObjCreate(
         PHYS_WORLD_FX,
         worldOrigin,
         quat,
         velocity,
-        *((const PhysPreset**)visuals.anonymous + 53));
+        visuals.model->physPreset);
     if (elem->physObjId)
     {
         Phys_ObjSetCollisionFromXModel(visuals.model, PHYS_WORLD_FX, (dxBody*)elem->physObjId);

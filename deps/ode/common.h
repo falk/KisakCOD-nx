@@ -26,10 +26,16 @@
 #define USE_POOL_ALLOCATOR
 
 // make alloca happy
+#ifdef _WIN32
 #include <malloc.h>
 
 #ifndef alloca
 #define alloca _alloca
+#endif
+#elif defined(__APPLE__)
+#include <stdlib.h>  // macOS exposes alloca via stdlib.h
+#else
+#include <alloca.h>
 #endif
 
 // used everywhere

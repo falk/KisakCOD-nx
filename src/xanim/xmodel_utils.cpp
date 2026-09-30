@@ -76,7 +76,10 @@ int __cdecl XModelGetNumLods(const XModel *model)
 
 double __cdecl XModelGetLodOutDist(const XModel *model)
 {
-    return *((float *)&model->parentList + 7 * XModelGetNumLods(model));
+    // LP64: was *((float *)&model->parentList + 7 * numLods), the ILP32
+    // address of lodInfo[numLods - 1].dist (parentList at 12, lodInfo at 40,
+    // 28-byte XModelLodInfo). With 8-byte pointers that read another field.
+    return model->lodInfo[XModelGetNumLods(model) - 1].dist;
 }
 
 int __cdecl XModelNumBones(const XModel *model)

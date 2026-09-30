@@ -255,7 +255,7 @@ void __cdecl SetClientOrigin(gentity_s *ent, float *origin)
     ent->r.currentOrigin[2] = v5->ps.origin[2];
 }
 
-//void __cdecl InitClientDeltaAngles(gclient_s *client, long double a2)
+//void __cdecl InitClientDeltaAngles(gclient_s *client, double a2)
 //{
 //    int v2; // r30
 //    int *angles; // r31
@@ -544,7 +544,7 @@ void __cdecl ClientSpawn(gentity_s *ent)
     int viewmodelIndex; // r25
     int maxHealth; // r11
     int v7; // r11
-    long double v8; // fp2
+    double v8; // fp2
     int v9; // r11
     int time; // r11
     sentient_s *sentient; // r11

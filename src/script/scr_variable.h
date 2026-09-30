@@ -94,15 +94,19 @@ struct VariableStackBuffer // sizeof=0xC
     uint8_t time;
     char buf[1];
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(VariableStackBuffer) == 0xC);
+#endif
 
 union VariableUnion // sizeof=0x4
 {                                       // ...
-    VariableUnion(float f)
+    // LP64: the int/float constructors start from a zeroed pointer-width
+    // carrier so pointerValue/stackValue never read a garbage upper half.
+    VariableUnion(float f) : pointerValue(0)
     {
         floatValue = f;
     }
-    VariableUnion(int i)
+    VariableUnion(int i) : pointerValue(0)
     {
         intValue = i;
     }
@@ -114,7 +118,7 @@ union VariableUnion // sizeof=0x4
     {
         codePosValue = str;
     }
-    VariableUnion()
+    VariableUnion() : pointerValue(0)
     {
         intValue = 0;
     }
@@ -124,11 +128,17 @@ union VariableUnion // sizeof=0x4
     uint32_t stringValue;
     const float *vectorValue;
     const char *codePosValue;
-    uint32_t pointerValue;
+    // Object handles occupy the low 32 bits, but compiler builtin caches
+    // also carry native function pointers through this union.  Keep the
+    // carrier pointer-width so those caches do not lose their high half on
+    // LP64.
+    intptr_t pointerValue;
     VariableStackBuffer *stackValue;
     uint32_t entityOffset;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(VariableUnion) == 0x4);
+#endif
 
 struct VariableValue // sizeof=0x8
 {   
@@ -136,7 +146,9 @@ struct VariableValue // sizeof=0x8
     VariableUnion u;                    // ...
     Vartype_t type;                           // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(VariableValue) == 0x8);
+#endif
 
 union ObjectInfo_u // sizeof=0x2
 {                                       // ...
@@ -187,7 +199,9 @@ union VariableValueInternal_u // sizeof=0x4
     VariableUnion u;
     ObjectInfo o;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(VariableValueInternal_u) == 0x4);
+#endif
 
 union VariableValueInternal_w // sizeof=0x4
 {                                       // ...
@@ -216,7 +230,9 @@ struct VariableValueInternal // sizeof=0x10
     VariableValueInternal_v v;          // ...
     uint16_t nextSibling;       // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(VariableValueInternal) == 0x10);
+#endif
 
 struct scrVarDebugPub_t // sizeof=0xE0004
 {                                       // ...
@@ -229,13 +245,17 @@ struct scrVarDebugPub_t // sizeof=0xE0004
     // padding byte
     // padding byte
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(scrVarDebugPub_t) == 0xE0004);
+#endif
 
 struct scrVarGlob_t // sizeof=0x180000
 {                                       // ...
     VariableValueInternal variableList[0x18000]; // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(scrVarGlob_t) == 0x180000);
+#endif
 
 struct scr_entref_t // sizeof=0x4
 {                                       // ...
@@ -271,7 +291,9 @@ struct scr_classStruct_t // sizeof=0xC
     // padding byte
     const char *name;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(scr_classStruct_t) == 0xC);
+#endif
 
 struct VariableDebugInfo // sizeof=0x10
 {
@@ -280,7 +302,9 @@ struct VariableDebugInfo // sizeof=0x10
     const char *functionName;
     int varUsage;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(VariableDebugInfo) == 0x10);
+#endif
 
 //void  TRACK_scr_variable(void);
 void __cdecl Scr_Cleanup();
@@ -436,7 +460,9 @@ struct ThreadDebugInfo // sizeof=0x8C
     float varUsage;                     // ...
     float endonUsage;                   // ...
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(ThreadDebugInfo) == 0x8C);
+#endif
 
 void  Scr_DumpScriptThreads(void);
 void  Scr_ShutdownVariables(void);
@@ -462,11 +488,13 @@ void  Scr_KillThread(uint32_t parentId);
 void  Scr_CheckLeakRange(uint32_t begin, uint32_t end);
 void  Scr_CheckLeaks(void);
 
-int  ThreadInfoCompare(_DWORD* info1, _DWORD* info2);
+int  ThreadInfoCompare(const ThreadDebugInfo* info1, const ThreadDebugInfo* info2);
 //int  VariableInfoCompare(void const*, void const*);
-int VariableInfoFileNameCompare(_DWORD* info1, _DWORD* info2);
-int VariableInfoCountCompare(_DWORD* info1, _DWORD* info2);
-int VariableInfoFileLineCompare(_DWORD* info1, _DWORD* info2);
+int VariableInfoFileNameCompare(const VariableDebugInfo* info1, const VariableDebugInfo* info2);
+int VariableInfoFunctionCompare(const VariableDebugInfo* info1, const VariableDebugInfo* info2);
+int VariableInfoPosCompare(const VariableDebugInfo* info1, const VariableDebugInfo* info2);
+int VariableInfoCountCompare(const VariableDebugInfo* info1, const VariableDebugInfo* info2);
+int VariableInfoFileLineCompare(const VariableDebugInfo* info1, const VariableDebugInfo* info2);
 uint32_t  FindVariableIndexInternal2(uint32_t name, uint32_t index);
 uint32_t FindVariableIndexInternal(uint32_t parentId, uint32_t name);
 unsigned short  AllocVariable(void);
@@ -489,6 +517,13 @@ uint32_t  GetNewVariableIndexReverseInternal2(uint32_t parentId, uint32_t name, 
 uint32_t  GetNewVariableIndexInternal(uint32_t parentId, uint32_t name);
 uint32_t  GetNewVariableIndexReverseInternal(uint32_t parentId, uint32_t name);
 void  MakeVariableExternal(uint32_t index, VariableValueInternal* parentValue);
+// Depth/stack probe for the savegame removal walk (see scr_readwrite.cpp's
+// Scr_LoadShutdown): Start once before the walk, Enter/Exit around each
+// recursive step in FreeChildValue, Report after.
+void ScrLoadWalkProbeStart();
+void ScrLoadWalkProbeEnter();
+void ScrLoadWalkProbeExit();
+void ScrLoadWalkProbeReport();
 void  FreeChildValue(uint32_t parentId, uint32_t id);
 void  ClearObjectInternal(uint32_t parentId);
 uint32_t  GetNewArrayVariableIndex(uint32_t parentId, uint32_t unsignedValue);

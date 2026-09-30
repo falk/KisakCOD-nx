@@ -117,7 +117,7 @@ void R_SkinXModelCmd(_WORD *data)
 
         if (skinnedSurf->skinnedCachedOffset == -2)
         {
-            surfPos = (GfxModelSkinnedSurface *)((char *)surfPos + 56);
+            surfPos = (GfxModelSkinnedSurface *)((char *)surfPos + sizeof(GfxModelRigidSurface));
             continue;
         }
 
@@ -152,8 +152,16 @@ void R_SkinXModelCmd(_WORD *data)
             {
                 if (skinnedSurf->skinnedCachedOffset >= 0)
                     skinVertNormalOut = &gfxBuf.skinnedCacheNormalsAddr[skinnedSurf->skinnedCachedOffset >> 5];
-                if (skinnedSurf->skinnedVert)
-                    skinVertNormalIn = &gfxBuf.oldSkinnedCacheNormalsAddr[(int)skinnedSurf->skinnedVert >> 5];
+                // With a cache offset the union holds oldSkinnedCachedOffset:
+                // last frame's byte offset, or negative (0x80000001 + size)
+                // when there is none -- always in SP, where only MP's
+                // R_SkinXModel fills in a previous offset. The old test was
+                // `skinnedVert != NULL` through a pointer cast, which took
+                // the SP sentinel as valid (a wild read once the SIMD path
+                // ran with r_fastSkin) and read the union's stale upper
+                // half on LP64.
+                if (skinnedSurf->oldSkinnedCachedOffset >= 0)
+                    skinVertNormalIn = &gfxBuf.oldSkinnedCacheNormalsAddr[skinnedSurf->oldSkinnedCachedOffset >> 5];
             }
             R_SkinXSurfaceSkinnedSse(xsurf, &boneSkelMats[boneIndex], skinVertNormalIn, skinVertNormalOut, skinVerticesOut);
         }

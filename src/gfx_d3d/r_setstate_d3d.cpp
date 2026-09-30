@@ -1,51 +1,17 @@
 #include <universal/q_shared.h>
 #include "r_setstate_d3d.h"
 #include "r_init.h"
+#include <deko9/deko9_native.h>
 
 
 bool __cdecl RB_IsGpuFinished()
 {
-    const char *v1; // eax
-    int hr; // [esp+0h] [ebp-8h]
-
-	// KISAKGPUFENCE: Comment asserts out for now. Sometimes goes off when alt-tabbing.
-    //if (!dx.flushGpuQuery)
-    //    MyAssertHandler(".\\r_setstate_d3d.cpp", 16, 0, "%s", "dx.flushGpuQuery");
-    //if (dx.flushGpuQueryCount != 1)
-    //    MyAssertHandler(".\\r_setstate_d3d.cpp", 17, 0, "%s", "dx.flushGpuQueryCount == 1");
-    hr = dx.flushGpuQuery->GetData(0, 0, 1);
-    if (hr == -2005530520)
-    {
-        --dx.flushGpuQueryCount;
-        return 1;
-    }
-    else
-    {
-        if (hr < 0)
-        {
-            do
-            {
-                ++g_disableRendering;
-                v1 = R_ErrorDescription(hr);
-                Com_Error(
-                    ERR_FATAL,
-                    ".\\r_setstate_d3d.cpp (%i) dx.flushGpuQuery->GetData( 0, 0, (1 << 0) ) failed: %s\n",
-                    28,
-                    v1);
-            } while (alwaysfails);
-        }
-        if ((uint32_t)hr > 1)
-            MyAssertHandler(
-                ".\\r_setstate_d3d.cpp",
-                30,
-                0,
-                "%s\n\t(hr) = %08x",
-                "(hr == ((HRESULT)0L) || hr == ((HRESULT)1L))",
-                hr);
-        if (hr != 1)
-            --dx.flushGpuQueryCount;
-        return hr != 1;
-    }
+    // deko9 native frame pacing: the GPU-sync fence is a frame id
+    // (R_InsertGpuFence), not dx.flushGpuQuery's event query.
+    if (!Deko9_FrameDone(dx.device, dx.gpuSyncFrame))
+        return 0;
+    --dx.flushGpuQueryCount;
+    return 1;
 }
 
 bool __cdecl RB_IsGpuFenceFinished()

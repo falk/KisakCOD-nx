@@ -19,7 +19,9 @@ struct parseInfo_t // sizeof=0x420
     const char *backup_text;
     const char *parseFile;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(struct parseInfo_t) == 0x420);
+#endif
 
 struct ParseThreadInfo // sizeof=0x460C
 {                                       // ...
@@ -29,7 +31,9 @@ struct ParseThreadInfo // sizeof=0x460C
     const char *prevTokenPos;
     char line[1024];
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(struct ParseThreadInfo) == 0x460C);
+#endif
 
 struct com_parse_mark_t // sizeof=0x14
 {                                       // ...
@@ -39,7 +43,9 @@ struct com_parse_mark_t // sizeof=0x14
     int backup_lines;
     const char *backup_text;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(struct com_parse_mark_t) == 0x14);
+#endif
 
 void __cdecl TRACK_q_parse();
 void __cdecl Com_InitParse();

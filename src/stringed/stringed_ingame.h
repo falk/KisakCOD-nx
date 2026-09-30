@@ -363,8 +363,8 @@ struct CStringEdPackage // sizeof=0x78
 
     int ReadLine(char **psParsePos, char *psDest)
     {
-        int v3; // eax
-        int v4; // eax
+        const char *v3; // eax (LP64: was an int-truncated strchr result)
+        const char *v4; // eax (LP64: was an int-truncated strchr result)
         char v5; // cl
         char *v7; // [esp+28h] [ebp-18h]
         char *v8; // [esp+2Ch] [ebp-14h]
@@ -373,16 +373,16 @@ struct CStringEdPackage // sizeof=0x78
 
         if (!**psParsePos)
             return 0;
-        v3 = (int)strchr(*psParsePos, '\n');
+        v3 = strchr(*psParsePos, '\n');
         if (v3)
         {
-            iCharsToCopy = v3 - (_DWORD)*psParsePos;
+            iCharsToCopy = (uint32_t)(v3 - *psParsePos);
             I_strncpyz(psDest, *psParsePos, iCharsToCopy);
             //strncpy(psDest, *psParsePos, iCharsToCopy);
             psDest[iCharsToCopy] = 0;
             for (*psParsePos += iCharsToCopy; **psParsePos; ++*psParsePos)
             {
-                v4 = (int)strchr("\r\n", **psParsePos);
+                v4 = strchr("\r\n", **psParsePos);
                 if (!v4)
                     break;
             }

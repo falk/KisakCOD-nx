@@ -5,6 +5,7 @@
 #include "rb_backend.h"
 #include "r_utils.h"
 #include "r_state.h"
+#include "r_dvars.h"
 
 
 void __cdecl R_DrawLitCallback(const void *userData, GfxCmdBufContext context, GfxCmdBufContext prepassContext)

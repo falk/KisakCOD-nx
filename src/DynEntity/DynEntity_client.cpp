@@ -2,7 +2,7 @@
 #include <universal/surfaceflags.h>
 #include <qcommon/qcommon.h>
 
-#include "dynentity_client.h"
+#include "DynEntity_client.h"
 #include <gfx_d3d/r_scene.h>
 #include <cgame/cg_local.h>
 #include <EffectsCore/fx_system.h>
@@ -1192,7 +1192,7 @@ char __cdecl DynEntCl_DynEntImpactEvent(
         if (!dynEntClient->physObjId)
         {
             PhysObj = DynEntCl_CreatePhysObj(dynEntDef, &dynEntPose->pose);
-            dynEntClient->physObjId = (int)PhysObj;
+            dynEntClient->physObjId = (uintptr_t)PhysObj;
         }
         if (dynEntClient->physObjId)
             Phys_ObjBulletImpact(
@@ -1493,7 +1493,7 @@ void __cdecl DynEntCl_ExplosionEvent(
                         if (!dynEntClient->physObjId)
                         {
                             PhysObj = DynEntCl_CreatePhysObj(dynEntDef, &dynEntPose->pose);
-                            dynEntClient->physObjId = (int)PhysObj;
+                            dynEntClient->physObjId = (uintptr_t)PhysObj;
                         }
                         if (dynEntClient->physObjId)
                         {
@@ -1657,7 +1657,7 @@ void __cdecl DynEntCl_JitterEvent(
                 {
                     dynEntPosea = DynEnt_GetClientPose(dynEntList[i], drawType);
                     PhysObj = DynEntCl_CreatePhysObj(dynEntDef, &dynEntPosea->pose);
-                    ClientEntity->physObjId = (int)PhysObj;
+                    ClientEntity->physObjId = (uintptr_t)PhysObj;
                 }
             }
         }
@@ -1752,7 +1752,7 @@ void DynEntCl_WakeUpAroundPlayer(int localClientNum)
                 if (DynEnt_GetEntityProps(EntityDef->type)->usePhysics && !dynEntClient->physObjId)
                 {
                     ClientPose = DynEnt_GetClientPose(dynEntId, drawType);
-                    dynEntClient->physObjId = (int32_t)DynEntCl_CreatePhysObj(EntityDef, &ClientPose->pose);
+                    dynEntClient->physObjId = (uintptr_t)DynEntCl_CreatePhysObj(EntityDef, &ClientPose->pose);
                 }
             }
 

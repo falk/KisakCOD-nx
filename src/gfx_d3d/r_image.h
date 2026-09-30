@@ -166,6 +166,8 @@ void __cdecl R_GetImageList(ImageList *imageList);
 void __cdecl R_AddImageToList(XAssetHeader header, ImageList *data);
 void __cdecl R_SumOfUsedImages(Image_MemUsage *usage);
 void __cdecl Image_Release(GfxImage *image);
+void Image_RegisterLiveTexture(GfxImage *image);
+void Image_UnregisterLiveTexture(GfxImage *image);
 GfxImage *__cdecl Image_AllocProg(int imageProgType, uint8_t category, uint8_t semantic);
 void __cdecl Image_SetupRenderTarget(
     GfxImage *image,
@@ -181,6 +183,7 @@ char __cdecl Image_ValidateHeader(GfxImageFileHeader *imageFile, const char *fil
 IDirect3DSurface9 *__cdecl Image_GetSurface(GfxImage *image);
 void __cdecl R_InitImages();
 void R_InitCodeImages();
+bool Image_IsLiveD3DTexture(void *tex);
 #ifdef KISAK_RADIANT
 void __cdecl R_LoadCaseTextures();   // editor-only (idb 0x513690); loads bin/case_textures.txt
 #endif
@@ -199,6 +202,11 @@ void __cdecl Image_LoadSolid(
     uint8_t b,
     uint8_t a);
 GfxImage *__cdecl Image_LoadBuiltin(char *name, uint8_t semantic, uint8_t imageTrack);
+// Materialize a registry image through the engine's constructor table.  Retail
+// fastfiles can carry a second GfxImage header for a builtin; that header must
+// share the generated texture rather than probing images/<name>.iwi.
+bool __cdecl Image_MaterializeBuiltin(GfxImage *image);
+bool __cdecl Image_HasInlinePayload(const GfxImage *image);
 double __cdecl Outdoor_TraceHeightInWorld(float worldX, float worldY);
 int __cdecl Outdoor_TransformToTextureClamped(int dimension, float inWorld);
 void __cdecl Image_LoadWhite(GfxImage *image);

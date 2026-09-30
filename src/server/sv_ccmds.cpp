@@ -3,6 +3,7 @@
 #endif
 
 #include <universal/q_shared.h>
+#include <platform/switch/switch_hardware.h>
 #include "server.h"
 #include <qcommon/cmd.h>
 #include <game/g_local.h>
@@ -18,6 +19,13 @@
 #include <universal/com_files.h>
 #include "sv_public.h"
 #include <cgame/cg_main.h>
+
+// Cached instead of a Dvar_FindVar("com_diagMarkers") lookup per call.
+extern const dvar_t *com_diagMarkers;
+static inline bool SvCcmdsDiagMarkers()
+{
+    return com_diagMarkers && com_diagMarkers->current.enabled;
+}
 
 int sv_loadScripts;
 int sv_map_restart;
@@ -358,7 +366,9 @@ void __cdecl ShowLoadErrorsSummary(const char *mapName, unsigned int count)
     }
 
     if (showError)
+    {
         Com_Error(ERR_MAPLOADERRORSUMMARY, errstr);
+    }
 }
 
 void __cdecl SV_ClearLoadGame()
@@ -387,12 +397,23 @@ void __cdecl SV_MapRestart(int savegame, int loadScripts)
         if (loadScripts)
             Con_Close(0);
         v5 = Sys_Milliseconds();
+        // Same savegame stage markers as G_LoadMainState: a stalled load prints
+        // nothing else, so the last line names the step it stalled in.
+        const bool saveDiagOn = SvCcmdsDiagMarkers();
+        if (saveDiagOn)
+            Com_Printf(0, "KISAK_SAVE_STAGE maprestart=begin savegame=%d loadScripts=%d\n", savegame, loadScripts);
         SV_RestartGameProgs(v5, savegame, &v6, loadScripts);
+        if (saveDiagOn)
+            Com_Printf(0, "KISAK_SAVE_STAGE restartgameprogs=done\n");
         CL_Restart();
+        if (saveDiagOn)
+            Com_Printf(0, "KISAK_SAVE_STAGE clrestart=done\n");
         SV_CheckLoadLevel(v6);
         Dvar_SetInt(cl_paused, integer);
         Com_EventLoop();
         SV_InitSnapshot();
+        if (saveDiagOn)
+            Com_Printf(0, "KISAK_SAVE_STAGE maprestart=done\n");
         if (!savegame)
         {
             if (loadScripts)
@@ -404,6 +425,8 @@ void __cdecl SV_MapRestart(int savegame, int loadScripts)
         }
         CL_SetActive();
         Com_ResetFrametime();
+        if (saveDiagOn)
+            Com_Printf(0, "KISAK_SAVE_STAGE maprestart=all=done\n");
     }
     else
     {
@@ -485,15 +508,29 @@ int __cdecl SV_CheckLoadGame()
     {
         v1 = (unsigned __int8)CheckForSaveGame(v4, v3) == 0;
         result = 0;
+        {
+            if (SvCcmdsDiagMarkers())
+                Com_Printf(0, "KISAK_SAVE_CHECKLOADGAME ok=%d mapname='%s' file='%s' svRunning=%d currentMap='%s'\n",
+                           v1 ? 0 : 1, v4, v3,
+                           com_sv_running && com_sv_running->current.enabled ? 1 : 0,
+                           sv_mapname ? sv_mapname->current.string : "(none)");
+        }
         if (!v1)
         {
             SND_StopSounds(SND_STOP_ALL);
             if (!com_sv_running->current.enabled || I_stricmp(v4, sv_mapname->current.string))
             {
+                // Spawn the map the save belongs to: v4 is CheckForSaveGame's
+                // mapName argument (v3 is the file name, "save/<name>.svg", and
+                // is not a map), and CheckForSaveGame has already recorded the
+                // file as the pending load, which is what the spawn reads back.
+                // Passing the file name here spawned nothing at all, so a load
+                // started from the main menu (no running server, i.e. the boot
+                // autoload) never reached a single load stage.
                 if (sv_cheats->current.enabled)
-                    v2 = va("devmap %s\n", v3);
+                    v2 = va("devmap %s\n", v4);
                 else
-                    v2 = va("map %s\n", v3);
+                    v2 = va("map %s\n", v4);
                 Cbuf_AddText(0, v2);
                 return 1;
             }
@@ -575,7 +612,7 @@ void __cdecl SV_LoadGame_f()
     if (sv_cmd_args.argc[nesting] <= 1)
         v1 = "";
     else
-        v1 = (char *)*((unsigned int *)sv_cmd_args.argv[nesting] + 1);
+        v1 = sv_cmd_args.argv[nesting][1] /* LP64: was a 32-bit read of a char* slot */;
     if (!*v1)
     {
         Com_Printf(CON_CHANNEL_DONT_FILTER, "You must specify a savegame to load\n");
@@ -613,6 +650,15 @@ void __cdecl SV_LoadGame_f()
         Com_Printf(CON_CHANNEL_DONT_FILTER, "filename '%s' is too long", v7);
         sv_save_filename[0] = 0;
     }
+    // The menu-load chain, named while com_diagMarkers is on: the UI's load
+    // action is `loadgame <file>` (ui_main.cpp), the client forwards it to the
+    // server, and with no server running this is the only place that can start
+    // the load, so a silent menu load is diagnosable from here on.
+    if (SvCcmdsDiagMarkers())
+        Com_Printf(0, "KISAK_SAVE_LOADGAME from=%s file='%s' svRunning=%d map='%s'\n",
+                   "SV_LoadGame_f", sv_save_filename,
+                   com_sv_running && com_sv_running->current.enabled ? 1 : 0,
+                   sv_mapname ? sv_mapname->current.string : "(none)");
     if (!com_sv_running->current.enabled)
         SV_CheckLoadGame();
 }
@@ -895,7 +941,7 @@ void SV_ScriptProfile_f()
 {
   int nesting; // r7
   const char *v1; // r3
-  long double v2; // fp2
+  double v2; // fp2
 
   nesting = sv_cmd_args.nesting;
   if (sv_cmd_args.nesting >= 8u)
@@ -912,7 +958,7 @@ void SV_ScriptProfile_f()
   if (sv_cmd_args.argc[nesting] <= 1)
     v1 = "";
   else
-    v1 = (const char *)*((unsigned int *)sv_cmd_args.argv[nesting] + 1);
+    v1 = sv_cmd_args.argv[nesting][1] /* LP64: was a 32-bit read of a char* slot */;
   v2 = atof(v1);
   Scr_DoProfile((float)*(double *)&v2);
 }
@@ -921,7 +967,7 @@ void SV_ScriptBuiltin_f()
 {
     int nesting; // r7
     const char *v1; // r3
-    long double v2; // fp2
+    double v2; // fp2
 
     nesting = sv_cmd_args.nesting;
     if (sv_cmd_args.nesting >= 8u)
@@ -938,7 +984,7 @@ void SV_ScriptBuiltin_f()
     if (sv_cmd_args.argc[nesting] <= 1)
         v1 = "";
     else
-        v1 = (const char *)*((unsigned int *)sv_cmd_args.argv[nesting] + 1);
+        v1 = sv_cmd_args.argv[nesting][1] /* LP64: was a 32-bit read of a char* slot */;
     v2 = atof(v1);
     Scr_DoProfileBuiltin((float)*(double *)&v2);
 }
@@ -1211,4 +1257,3 @@ void __cdecl SV_AddOperatorCommands()
         Cmd_AddServerCommandInternal("replay_info", SV_DemoInfo_f, &SV_DemoInfo_f_VAR_SERVER);
     }
 }
-

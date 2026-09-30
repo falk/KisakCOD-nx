@@ -2,6 +2,7 @@
 #include "scr_parsetree.h"
 #include <universal/assertive.h>
 #include <universal/com_memory.h>
+#include <qcommon/com_error.h>
 #include "scr_evaluate.h"
 #include "scr_vm.h"
 
@@ -13,6 +14,8 @@ void __cdecl Scr_InitAllocNode()
 {
     iassert(!g_allocNodeUser);
     g_allocNodeUser = Hunk_UserCreate(0x10000, "Scr_InitAllocNode", 0, 1, 7);
+    if (!g_allocNodeUser)
+        Com_Error(ERR_FATAL, "Scr_InitAllocNode: Hunk_UserCreate failed");
 }
 
 void __cdecl Scr_ShutdownAllocNode()
@@ -27,7 +30,17 @@ void __cdecl Scr_ShutdownAllocNode()
 sval_u *__cdecl Scr_AllocNode(int size)
 {
     iassert(g_allocNodeUser);
-    return (sval_u *)Hunk_UserAlloc(g_allocNodeUser, 4 * size, 4);
+    if (!g_allocNodeUser)
+        Com_Error(ERR_FATAL, "Scr_AllocNode: node hunk was never created");
+    // LP64: `size` is a count of sval_u slots, not bytes. This was
+    // `4 * size` (sval_u's ILP32 size) with 4-byte alignment; sval_u is
+    // 8 bytes under LP64 (it holds real pointer members), so every node
+    // was allocated at half its real size out of this bump allocator --
+    // the very next allocation lands inside the previous node's tail,
+    // corrupting it (e.g. linked_list_end's NULL terminator gets
+    // overwritten with a self-referential pointer, hanging every list
+    // walk in the compiler forever).
+    return (sval_u *)Hunk_UserAlloc(g_allocNodeUser, sizeof(sval_u) * size, alignof(sval_u));
 }
 
 sval_u __cdecl node0(Enum_t type)
@@ -36,6 +49,16 @@ sval_u __cdecl node0(Enum_t type)
 
     result.node = Scr_AllocNode(1);
     result.node[0].type = type;
+    return result;
+}
+
+sval_u __cdecl node_value_pair(const sval_u &value, const sval_u &metadata)
+{
+    sval_u result;
+
+    result.node = Scr_AllocNode(2);
+    result.node[0] = value;
+    result.node[1] = metadata;
     return result;
 }
 
@@ -164,7 +187,7 @@ sval_u __cdecl node8(
     return result;
 }
 
-sval_u linked_list_end(sval_u val)
+sval_u linked_list_end(const sval_u &val)
 {
     sval_u *node;
     sval_u result;
@@ -178,7 +201,7 @@ sval_u linked_list_end(sval_u val)
     return result;
 }
 
-sval_u prepend_node(sval_u val1, sval_u val2)
+sval_u prepend_node(const sval_u &val1, sval_u &val2)
 {
     sval_u *node;
 
@@ -189,7 +212,7 @@ sval_u prepend_node(sval_u val1, sval_u val2)
     return val2;
 }
 
-sval_u append_node(sval_u val1, sval_u val2)
+sval_u append_node(sval_u &val1, const sval_u &val2)
 {
     sval_u *node;
 
@@ -324,7 +347,9 @@ sval_u __cdecl debugger_buffer(Enum_t type, char *buf, uint32_t size, int alignm
     sval_u *result = Scr_AllocDebugExpr(type, size + alignMask + 2 * sizeof(sval_u), "debugger_buffer");
     uint8_t *bufCopy = (uint8_t *)(((uintptr_t)&result[2] + alignMask) & ~(uintptr_t)alignMask);
     memcpy(bufCopy, buf, size);
-    result[1].intValue = (int)bufCopy;
+    // LP64: store the whole pointer (readers use node[1].debugString);
+    // intValue kept only its low 32 bits.
+    result[1].debugString = (const char *)bufCopy;
     return result[0];
 }
 
@@ -332,4 +357,3 @@ sval_u __cdecl debugger_string(Enum_t type, char *s)
 {
     return debugger_buffer(type, s, strlen(s) + 1, 1);
 }
-

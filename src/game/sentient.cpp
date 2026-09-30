@@ -381,9 +381,6 @@ void __cdecl Sentient_SetEnemy(sentient_s *self, gentity_s *enemy, int bNotify)
 
 sentient_s *__cdecl Sentient_FirstSentient(int iTeamFlags)
 {
-    int v2; // r10
-    team_t *i; // r11
-
     if (iTeamFlags > 31)
         MyAssertHandler(
             "c:\\trees\\cod3\\cod3src\\src\\game\\sentient.cpp",
@@ -391,21 +388,18 @@ sentient_s *__cdecl Sentient_FirstSentient(int iTeamFlags)
             0,
             "%s",
             "iTeamFlags <= (1 << TEAM_NUM_TEAMS) - 1");
-    v2 = 0;
-    for (i = &level.sentients->eTeam; !*((_BYTE *)i + 106) || ((1 << *i) & iTeamFlags) == 0; i += 29)
+
+    for (int i = 0; i < MAX_SENTIENTS; ++i)
     {
-        if (++v2 >= 33)
-            return 0;
+        sentient_s *sentient = &level.sentients[i];
+        if (sentient->inuse && ((1 << sentient->eTeam) & iTeamFlags) != 0)
+            return sentient;
     }
-    return &level.sentients[v2];
+    return nullptr;
 }
 
 sentient_s *__cdecl Sentient_NextSentient(sentient_s *pPrevSentient, int iTeamFlags)
 {
-    sentient_s *sentients; // r11
-    int v5; // r10
-    int i; // r9
-
     if (iTeamFlags > 31)
         MyAssertHandler(
             "c:\\trees\\cod3\\cod3src\\src\\game\\sentient.cpp",
@@ -415,8 +409,8 @@ sentient_s *__cdecl Sentient_NextSentient(sentient_s *pPrevSentient, int iTeamFl
             "iTeamFlags <= (1 << TEAM_NUM_TEAMS) - 1");
     if (!pPrevSentient)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\game\\sentient.cpp", 595, 0, "%s", "pPrevSentient");
-    sentients = level.sentients;
-    if (pPrevSentient < level.sentients || pPrevSentient >= &level.sentients[33])
+
+    if (pPrevSentient < level.sentients || pPrevSentient >= &level.sentients[MAX_SENTIENTS])
     {
         MyAssertHandler(
             "c:\\trees\\cod3\\cod3src\\src\\game\\sentient.cpp",
@@ -424,27 +418,16 @@ sentient_s *__cdecl Sentient_NextSentient(sentient_s *pPrevSentient, int iTeamFl
             0,
             "%s",
             "pPrevSentient >= level.sentients && pPrevSentient < level.sentients + MAX_SENTIENTS");
-        sentients = level.sentients;
     }
-    if (pPrevSentient != &sentients[pPrevSentient - sentients])
+
+    const int previousIndex = static_cast<int>(pPrevSentient - level.sentients);
+    for (int i = previousIndex + 1; i < MAX_SENTIENTS; ++i)
     {
-        MyAssertHandler(
-            "c:\\trees\\cod3\\cod3src\\src\\game\\sentient.cpp",
-            597,
-            0,
-            "%s",
-            "pPrevSentient == level.sentients + (pPrevSentient - level.sentients)");
-        sentients = level.sentients;
+        sentient_s *sentient = &level.sentients[i];
+        if (sentient->inuse && ((1 << sentient->eTeam) & iTeamFlags) != 0)
+            return sentient;
     }
-    v5 = pPrevSentient - sentients + 1;
-    if (v5 >= 33)
-        return 0;
-    while (!sentients[v5].inuse || ((1 << sentients[v5].eTeam) & iTeamFlags) == 0)
-    {
-        if (++v5 >= 33)
-            return 0;
-    }
-    return &sentients[v5];
+    return nullptr;
 }
 
 const char *pszTeamName[5] =
@@ -799,4 +782,3 @@ void __cdecl Sentient_Free(sentient_s *sentient)
     memset(sentient, 0xF0, sizeof(sentient_s));
     sentient->inuse = 0;
 }
-

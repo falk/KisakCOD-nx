@@ -1,7 +1,9 @@
 #pragma once
 
 #include <qcommon/qcommon.h>
-#ifndef KISAK_OPENAL
+// The Switch target excludes the Miles backend entirely (non-menu subsystem),
+// so it uses the same mss.h-free type fallback as the OpenAL path.
+#if !defined(KISAK_OPENAL) && !defined(__SWITCH__)
 #include <msslib/mss.h>
 #else
 // snd_public.h is included very widely across the codebase, and msslib/mss.h's own
@@ -12,21 +14,25 @@
 // the same type set here rather than pulling in the real <windows.h>. Guard against both the
 // real windef.h (_WINDEF_) and msslib/mss.h's own declarations (its include guard is MSS_H)
 // so files that still include mss.h directly (regardless of KISAK_OPENAL) don't conflict.
+// Type widths follow windef exactly (32-bit LONG/DWORD/ULONG, pointer-width
+// *PTR) so these declarations can coexist with the vendored d3d9-headers
+// in the Switch renderer closure.
 #if !defined(_WINDEF_) && !defined(MSS_H)
 typedef char CHAR;
 typedef short SHORT;
 typedef int BOOL;
-typedef long LONG;
-typedef CHAR *LPSTR, *PSTR;
-typedef unsigned long ULONG_PTR, *PULONG_PTR;
-typedef ULONG_PTR DWORD_PTR, *PDWORD_PTR;
-typedef unsigned long DWORD;
-typedef unsigned short WORD;
+typedef int32_t LONG;
+typedef uintptr_t ULONG_PTR, *PULONG_PTR;
+typedef uintptr_t DWORD_PTR, *PDWORD_PTR;
+typedef uint32_t DWORD;
+typedef uint16_t WORD;
 typedef unsigned int UINT;
 typedef void *LPVOID;
+#ifndef __SWITCH__
 typedef struct HWND__ *HWND;
 typedef struct HINSTANCE__ *HINSTANCE;
 typedef HINSTANCE HMODULE;
+#endif
 typedef struct HWAVE__ *HWAVE;
 typedef struct HWAVEIN__ *HWAVEIN;
 typedef struct HWAVEOUT__ *HWAVEOUT;
@@ -182,7 +188,9 @@ struct LoadedSound // sizeof=0x2C
     const char *name;
     MssSoundCOD4 sound;
 };
+#if UINTPTR_MAX == UINT32_MAX
 static_assert(sizeof(LoadedSound) == 44);
+#endif
 
 struct StreamFileNameRaw // sizeof=0x8
 {                                       // ...
@@ -221,7 +229,9 @@ struct SndCurve // sizeof=0x48
     int knotCount;                      // ...
     float knots[8][2];                  // ...
 };
+#if UINTPTR_MAX == UINT32_MAX
 static_assert(sizeof(SndCurve) == 72);
+#endif
 
 struct MSSSpeakerLevels // sizeof=0x10
 {                                       // ...
@@ -274,7 +284,9 @@ struct snd_alias_t // sizeof=0x5C
     float envelopPercentage;
     SpeakerMap *speakerMap;
 };
+#if UINTPTR_MAX == UINT32_MAX
 static_assert(sizeof(snd_alias_t) == 92);
+#endif
 
 struct snd_alias_list_t // sizeof=0xC
 {                                       // ...
@@ -282,7 +294,9 @@ struct snd_alias_list_t // sizeof=0xC
     snd_alias_t *head;                  // ...
     int count;                          // ...
 };
+#if UINTPTR_MAX == UINT32_MAX
 static_assert(sizeof(snd_alias_list_t) == 12);
+#endif
 
 struct snd_entchannel_info_t // sizeof=0x50
 {                                       // ...
@@ -513,6 +527,14 @@ int __cdecl SND_SetPlaybackIdNotPlayed(uint32_t index);
 int __cdecl SND_AcquirePlaybackId(uint32_t index, int totalMsec);
 char __cdecl SND_AddLengthNotify(int playbackId, const snd_alias_t *lengthNotifyData, SndLengthId id);
 void __cdecl DoLengthNotify(int msec, const snd_alias_t *lengthNotifyData, SndLengthId id);
+void __cdecl SND_SetKnownLength(int index, int totalMsec);
+#ifdef KISAK_OPENAL
+// Loaded-sound AL buffers (snd_driver_openal.cpp): retire on zone unload
+// (any thread), service once per sound frame, free at sound shutdown.
+void SND_ReleaseLoadedSoundBuffer(const void *data);
+void SND_ServiceLoadedSoundBuffers();
+void SND_FreeLoadedSoundBuffers();
+#endif
 char __cdecl SND_GetKnownLength(int playbackId, int *msec);
 float __cdecl SND_GetLerpedSlavePercentage(float baseSlavePercentage);
 float __cdecl SND_Attenuate(SndCurve *volumeFalloffCurve, float radius, float mindist, float maxdist);
@@ -566,6 +588,18 @@ void __cdecl SND_StopEntityChannel(SndEntHandle sndEnt, int entchannel);
 int __cdecl SND_StartAliasSample(SndStartAliasInfo *startAliasInfo, int *pChannel);
 int __cdecl SND_StartAliasStream(SndStartAliasInfo *startAliasInfo, int *pChannel);
 int __cdecl SND_FindFreeStreamChannel(SndStartAliasInfo *startAliasInfo, int entchannel);
+// Push-PCM 2D stream for the Switch FFmpeg cinematic backend, which decodes
+// BinkAudio itself and therefore has no sound alias or file-backed stream to
+// start.  Only the OpenAL driver implements these (snd_driver_openal.cpp);
+// they are unused on the Miles path.
+bool __cdecl SND_StartCinematicStream(int sampleRate, int channels);
+void __cdecl SND_SetCinematicStreamVolume(float volume);
+// Queues up to `frameCount` interleaved S16 frames and returns how many were
+// consumed; callers retry the remainder on a later update so the queue cannot
+// run far ahead of the video.
+int __cdecl SND_PushCinematicPCM(const int16_t *frames, int frameCount);
+void __cdecl SND_PauseCinematicStream(bool paused);
+void __cdecl SND_StopCinematicStream();
 void __cdecl SND_ChoosePitchAndVolume(
     const snd_alias_t *alias0,
     const snd_alias_t *alias1,
@@ -723,6 +757,13 @@ extern const dvar_t *snd_cinematicVolumeScale;
 extern const dvar_t *snd_enable3D;
 extern const dvar_t *snd_enableEq;
 extern const dvar_t *snd_debugReplace;
+extern const dvar_t *snd_debugStreams;
+extern const dvar_t *snd_debugStarts;
+// snd_debugStarts: why the next SND_Stop*Channel happens (set by the caller,
+// consumed and cleared by the stop trace).  Never read for behaviour.
+extern const char *snd_stopReason;
+bool SND_DebugStartsEnabled();
+void SND_DebugStartFail(const snd_alias_t *alias, int ent, const char *reason);
 extern const dvar_t *snd_debugAlias;
 extern const dvar_t *snd_enable2D;
 extern const dvar_t *snd_khz;

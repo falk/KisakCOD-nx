@@ -14,6 +14,12 @@
 static unsigned int g_idHistoryIndex;
 static short idHistory[16];
 
+// VariableStackBuffer's payload is native pointer-width.  The save stream is
+// still the original byte-oriented format, but the in-memory walk must use
+// the same stride as VM_ArchiveStack/VM_UnarchiveStack2 on LP64.
+static constexpr size_t kScriptStackValueSize = 1 + sizeof(uintptr_t);
+static constexpr size_t kScriptStackHeaderSize = offsetof(VariableStackBuffer, buf);
+
 void __cdecl WriteByte(
     unsigned __int8 b,
     MemoryFile *memFile)
@@ -309,7 +315,7 @@ void __cdecl WriteStack(const VariableStackBuffer *stackBuf, MemoryFile *memFile
     const char *buf; // r31
     unsigned int v7; // r3
     __int16 v8; // r30
-    VariableUnion *v9; // r4
+    uintptr_t v9; // r4
     _WORD v10[24]; // [sp+50h] [-30h] BYREF
 
     iassert(stackBuf);
@@ -329,9 +335,9 @@ void __cdecl WriteStack(const VariableStackBuffer *stackBuf, MemoryFile *memFile
         {
             v7 = (unsigned __int8)*buf;
             v8 = v5 - 1;
-            v9 = *(VariableUnion **)(buf + 1);
-            buf += 5;
-            DoSaveEntryInternal(v7, v9, memFile);
+            v9 = *reinterpret_cast<const uintptr_t *>(buf + 1);
+            buf += kScriptStackValueSize;
+            DoSaveEntryInternal(v7, reinterpret_cast<VariableUnion *>(v9), memFile);
             v5 = v8;
         } while (v8);
     }
@@ -343,7 +349,7 @@ VariableStackBuffer *__cdecl Scr_ReadStack(MemoryFile *memFile)
     int v3; // r28
     int v4; // r31
     unsigned __int16 v5; // r29
-    _WORD *v6; // r31
+    VariableStackBuffer *v6; // r31
     char *v7; // r29
     __int16 v8; // r11
     __int16 v9; // r28
@@ -353,8 +359,9 @@ VariableStackBuffer *__cdecl Scr_ReadStack(MemoryFile *memFile)
     MemFile_ReadData(memFile, 2, v11);
     v2 = *(_WORD *)v11;
     v3 = *(unsigned __int16 *)v11;
-    v4 = 5 * *(unsigned __int16 *)v11 + 11;
-    v5 = 5 * *(_WORD *)v11 + 11;
+    v4 = static_cast<int>(kScriptStackHeaderSize +
+                          kScriptStackValueSize * *(unsigned __int16 *)v11);
+    v5 = static_cast<unsigned __int16>(v4);
     if (v4 != v5)
         MyAssertHandler(
             "c:\\trees\\cod3\\cod3src\\src\\script\\scr_readwrite.cpp",
@@ -362,16 +369,16 @@ VariableStackBuffer *__cdecl Scr_ReadStack(MemoryFile *memFile)
             0,
             "%s",
             "bufLen == (unsigned short)bufLen");
-    v6 = (uint16*)MT_Alloc(v4, MT_TYPE_THREAD);
+    v6 = static_cast<VariableStackBuffer *>(MT_Alloc(v4, MT_TYPE_THREAD));
     ++scrVarPub.numScriptThreads;
-    v6[2] = v2;
-    v6[3] = v5;
-    *(unsigned int *)v6 = (unsigned int)Scr_ReadCodepos(memFile);
+    v6->size = v2;
+    v6->bufLen = v5;
+    v6->pos = Scr_ReadCodepos(memFile);
     MemFile_ReadData(memFile, 1, v11);
-    v6[4] = Scr_ReadId(memFile, v11[0]);
+    v6->localId = Scr_ReadId(memFile, v11[0]);
     MemFile_ReadData(memFile, 1, v11);
-    v7 = (char *)v6 + 11;
-    *((_BYTE *)v6 + 10) = v11[0];
+    v7 = v6->buf;
+    v6->time = v11[0];
     if (v3)
     {
         v8 = v3;
@@ -380,12 +387,12 @@ VariableStackBuffer *__cdecl Scr_ReadStack(MemoryFile *memFile)
             v9 = v8 - 1;
             Scr_DoLoadEntryInternal(&v12, memFile);
             v8 = v9;
-            *v7 = v12.type;
-            *(unsigned int *)(v7 + 1) = v12.u.intValue;
-            v7 += 5;
+            *v7 = static_cast<unsigned char>(v12.type);
+            *reinterpret_cast<uintptr_t *>(v7 + 1) = v12.u.pointerValue;
+            v7 += kScriptStackValueSize;
         } while (v9);
     }
-    return (VariableStackBuffer *)v6;
+    return v6;
 }
 
 void __cdecl Scr_DoLoadEntryInternal(VariableValue *value, MemoryFile *memFile)
@@ -417,7 +424,7 @@ void __cdecl Scr_DoLoadEntryInternal(VariableValue *value, MemoryFile *memFile)
             value->u.intValue = (unsigned __int16)Scr_ReadString(memFile);
             break;
         case VAR_VECTOR:
-            value->u.intValue = (int)Scr_ReadVec3(memFile);
+            value->u.pointerValue = reinterpret_cast<uintptr_t>(Scr_ReadVec3(memFile));
             break;
         case VAR_FLOAT:
             value->u.floatValue = MemFile_ReadFloat(memFile);
@@ -429,10 +436,10 @@ void __cdecl Scr_DoLoadEntryInternal(VariableValue *value, MemoryFile *memFile)
             break;
         case VAR_CODEPOS:
         case VAR_FUNCTION:
-            value->u.intValue = (int)Scr_ReadCodepos(memFile);
+            value->u.pointerValue = reinterpret_cast<uintptr_t>(Scr_ReadCodepos(memFile));
             break;
         case VAR_STACK:
-            value->u.intValue = (int)Scr_ReadStack(memFile);
+            value->u.pointerValue = reinterpret_cast<uintptr_t>(Scr_ReadStack(memFile));
             break;
         default:
             if (!alwaysfails)
@@ -663,7 +670,9 @@ void __cdecl Scr_DoLoadObjectInfo(unsigned __int16 parentId, MemoryFile *memFile
             iassert(!(entryValue->w.type & VAR_MASK));
             --v13;
             v20 = type | entryValue->w.type;
-            entryValue->u.u.intValue = value.u.intValue;
+            // Preserve native pointers (vector/codepos/stack) on LP64; the
+            // old int-only copy truncated the loaded union before use.
+            entryValue->u.u = value.u;
             entryValue->w.type = v20;
         } while (v13);
     }
@@ -784,24 +793,23 @@ static void Scr_RemoveDebuggerRefs()
 void __cdecl Scr_SaveShutdown(bool savegame)
 {
     char v2; // r20
-    unsigned __int16 *v3; // r25
     int v4; // r30
-    VariableValueInternal_w *p_w; // r27
-    int v6; // r26
     const char *v7; // r31
 
     v2 = 0;
     if (scrVarDebugPub)
     {
-        v3 = &scrVarPub.saveIdMap[1];
+        // variableList records are native-sized on LP64; walking them with the
+        // old 16-byte p_w stride landed inside records and produced false
+        // cyclic-leak diagnostics.  saveIdMap[v4] and varUsage[v4 + 1] name
+        // the same variableList[v4 + 1] entry as the retail walk did.
         v4 = 1;
-        p_w = &scrVarGlob.variableList[2].w;
-        v6 = 0x7FFF;
         do
         {
-            if ((p_w->type & 0x60) != 0)
+            VariableValueInternal *entryValue = &scrVarGlob.variableList[v4 + 1];
+            if ((entryValue->w.type & 0x60) != 0)
             {
-                if (!IsObject((VariableValueInternal *)&p_w[-2]))
+                if (!IsObject(entryValue))
                     MyAssertHandler(
                         "c:\\trees\\cod3\\cod3src\\src\\script\\scr_readwrite.cpp",
                         968,
@@ -811,21 +819,26 @@ void __cdecl Scr_SaveShutdown(bool savegame)
                 v7 = scrVarDebugPub->varUsage[v4 + 1];
                 if (!v7)
                     MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\script\\scr_readwrite.cpp", 970, 0, "%s", "pos");
-                if (!*v3 && (p_w->type & VAR_MASK) != VAR_ARRAY)
+                if (!scrVarPub.saveIdMap[v4] && (entryValue->w.type & VAR_MASK) != VAR_ARRAY)
                 {
                     if (!v2)
                     {
                         v2 = 1;
                         Com_Printf(CON_CHANNEL_PARSERSCRIPT, "\n****script variable cyclic leak*****\n");
                     }
+                    {
+                        static int s_scrLeakDiag;
+                        if (s_scrLeakDiag < 8)
+                        {
+                            ++s_scrLeakDiag;
+                            
+                        }
+                    }
                     Scr_PrintPrevCodePos(CON_CHANNEL_PARSERSCRIPT, (char*)v7, 0);
                 }
             }
-            --v6;
-            p_w += 4;
             ++v4;
-            ++v3;
-        } while (v6);
+        } while (v4 <= 0x7FFF);
     }
     Scr_AddDebuggerRefs();
     if (v2)
@@ -948,9 +961,14 @@ void __cdecl Scr_LoadPre(int sys, MemoryFile *memFile)
         ++scrVarDebugPub->extRefCount[v18];
     v19 = 4;
     p_entArrayId = &g_classMap[0].entArrayId;
-    do
+    for (v19 = 0; v19 < 4; ++v19)
     {
-        if (GetArraySize(*p_entArrayId))
+        // scr_classStruct_t widened on LP64 (its name pointer grew), so the
+        // ILP32 +6 uint16 stride walked into the following entries' name
+        // pointer and loaded class 1..3 roots out of unrelated memory.  Walk
+        // the array natively so every class entity array is read back.
+        const uint16_t entArrayId = g_classMap[v19].entArrayId;
+        if (GetArraySize(entArrayId))
             MyAssertHandler(
                 "c:\\trees\\cod3\\cod3src\\src\\script\\scr_readwrite.cpp",
                 1083,
@@ -958,17 +976,15 @@ void __cdecl Scr_LoadPre(int sys, MemoryFile *memFile)
                 "%s",
                 "!GetArraySize( g_classMap[classnum].entArrayId )");
         if (scrVarDebugPub)
-            --scrVarDebugPub->extRefCount[*p_entArrayId];
-        RemoveRefToObject(*p_entArrayId);
+            --scrVarDebugPub->extRefCount[entArrayId];
+        RemoveRefToObject(entArrayId);
         MemFile_ReadData(memFile, 1, v23);
         v21 = Scr_ReadId(memFile, v23[0]);
         v22 = scrVarDebugPub;
-        *p_entArrayId = v21;
+        g_classMap[v19].entArrayId = v21;
         if (v22)
             ++v22->extRefCount[v21];
-        --v19;
-        p_entArrayId += 6;
-    } while (v19);
+    }
 }
 
 static void Scr_AddDebugExprValueRefCount(unsigned __int16 *refCount, sval_u *val)
@@ -1029,6 +1045,52 @@ static bool Scr_IsVariableBreakpoint(unsigned int id)
     return variableBreakpoints[id] != 0;
 }
 
+// The leak check is the only walker of the whole variable list, and it is the
+// only thing CheckReferences (called from Scr_LoadShutdown, i.e. the savegame
+// load path alone) does.  Every index it feeds to refCount[] must be a real
+// variable id: anything else is a write far outside scrVarDebugPub_t, which is
+// how a load-time death in here corrupts something else instead of failing.
+// The counters are gated on the same diag flag the save/load stage markers use
+// (G_LoadMainState copies com_diagMarkers into it), which keeps this TU free of
+// a dvar dependency the host proofs would have to satisfy.
+bool scrLoadDiagEnabled;
+
+static bool ScrLoadDiagOn()
+{
+    return scrLoadDiagEnabled;
+}
+
+struct ScrRefCountDiag
+{
+    unsigned int outOfRange;
+    unsigned int maxIndex;
+    unsigned int byCase[0x20];
+    unsigned int arrayWalkSteps;
+    unsigned int arrayWalkBailed;
+};
+
+static ScrRefCountDiag g_scrRefCountDiag;
+
+static void ScrRefCountAdd(unsigned int index, unsigned int refCase)
+{
+    ++g_scrRefCountDiag.byCase[refCase & 0x1F];
+    if (index >= 0x8000u)
+    {
+        if (++g_scrRefCountDiag.outOfRange <= 8)
+        {
+            Com_Printf(
+                0,
+                "KISAK_SAVE_REFCOUNT out_of_range index=%u case=0x%x\n",
+                index,
+                refCase);
+        }
+        return;
+    }
+    if (index > g_scrRefCountDiag.maxIndex)
+        g_scrRefCountDiag.maxIndex = index;
+    ++scrVarDebugPub->refCount[index];
+}
+
 static void CheckReferenceRange(unsigned int begin, unsigned int end)
 {
     if ((int)(end - begin) <= 1)
@@ -1044,7 +1106,7 @@ static void CheckReferenceRange(unsigned int begin, unsigned int end)
         switch (status & VAR_MASK)
         {
         case VAR_POINTER:
-            ++scrVarDebugPub->refCount[entry->u.u.intValue];
+            ScrRefCountAdd(entry->u.u.intValue, 1);
             break;
 
         case VAR_STACK:
@@ -1057,17 +1119,17 @@ static void CheckReferenceRange(unsigned int begin, unsigned int end)
                     0,
                     "%s",
                     "entryValue->u.u.stackValue->localId");
-            ++scrVarDebugPub->refCount[sb->localId];
+            ScrRefCountAdd(sb->localId, 0xA);
             unsigned __int8 *p = (unsigned __int8 *)&sb->buf[0];
             unsigned int count = sb->size;
             while (count)
             {
                 unsigned int entryType = *p;
-                unsigned int entryVal = *(unsigned int *)(p + 1);
-                p += 5;
+                uintptr_t entryVal = *reinterpret_cast<const uintptr_t *>(p + 1);
+                p += kScriptStackValueSize;
                 --count;
                 if (entryType == VAR_POINTER)
-                    ++scrVarDebugPub->refCount[entryVal];
+                    ScrRefCountAdd(static_cast<unsigned int>(entryVal), 1);
             }
             break;
         }
@@ -1076,17 +1138,31 @@ static void CheckReferenceRange(unsigned int begin, unsigned int end)
         case VAR_NOTIFY_THREAD:
         case VAR_TIME_THREAD:
         case VAR_DEAD_ENTITY:
-            ++scrVarDebugPub->refCount[entry->u.o.u.size];
+            ScrRefCountAdd(entry->u.o.u.size, status & 0x1F);
             break;
 
         case VAR_CHILD_THREAD:
-            ++scrVarDebugPub->refCount[GetParentLocalId(parentType)];
-            ++scrVarDebugPub->refCount[entry->u.o.u.size];
+            ScrRefCountAdd(GetParentLocalId(parentType), 0x11);
+            ScrRefCountAdd(entry->u.o.u.size, 0x11);
             break;
 
         case VAR_ARRAY:
+            // A sibling chain that points back into itself would spin here
+            // forever; a chain that points outside the child list would read
+            // unrelated records.  Both are bounded and reported.
             for (unsigned int i = FindFirstSibling(parentType); i; i = FindNextSibling(i))
             {
+                if (++g_scrRefCountDiag.arrayWalkSteps > 0x20000u)
+                {
+                    ++g_scrRefCountDiag.arrayWalkBailed;
+                    if (g_scrRefCountDiag.arrayWalkBailed <= 8)
+                        Com_Printf(
+                            0,
+                            "KISAK_SAVE_REFCOUNT array_walk_bailed id=%u sibling=%u\n",
+                            parentType,
+                            i);
+                    break;
+                }
                 VariableValueInternal *child = &scrVarGlob.variableList[i + VARIABLELIST_CHILD_BEGIN];
                 if (IsObject(child))
                     MyAssertHandler(
@@ -1098,7 +1174,7 @@ static void CheckReferenceRange(unsigned int begin, unsigned int end)
 
                 VariableValue val = Scr_GetArrayIndexValue(child->w.status >> 8);
                 if (val.type == VAR_POINTER)
-                    ++scrVarDebugPub->refCount[val.u.intValue];
+                    ScrRefCountAdd(val.u.intValue, 0x16); // array index that is an object id
             }
             break;
 
@@ -1110,67 +1186,224 @@ static void CheckReferenceRange(unsigned int begin, unsigned int end)
 
 static int CheckReferences()
 {
-    int v0; // r11
-    unsigned int i; // r31
-    int v2; // r30
-    int v3; // r9
-    unsigned int v4; // r7
-    VariableValueInternal_w *j; // r11
-
     if (!scrVarDebugPub || scrStringDebugGlob && scrStringDebugGlob->ignoreLeaks)
         return 1;
+    const bool diagOn = ScrLoadDiagOn();
+    if (diagOn)
+        Com_Printf(0, "KISAK_SAVE_STAGE checkrefs=begin\n");
+    memset(&g_scrRefCountDiag, 0, sizeof(g_scrRefCountDiag));
     memcpy(scrVarDebugPub->refCount, scrVarDebugPub->extRefCount, sizeof(scrVarDebugPub->refCount));
+    if (diagOn)
+        Com_Printf(0, "KISAK_SAVE_STAGE checkrefs=copy_done\n");
     Scr_AddDebugRefCount(scrVarDebugPub->refCount);
+    if (diagOn)
+        Com_Printf(0, "KISAK_SAVE_STAGE checkrefs=debugrefs_done\n");
     CheckReferenceRange(1u, 0x8001u);
+    if (diagOn)
+        Com_Printf(0, "KISAK_SAVE_STAGE checkrefs=range_parents_done\n");
     CheckReferenceRange(0x8002u, 0x18000u);
-    if (scrVarPub.developer)
+    if (diagOn)
+        Com_Printf(0, "KISAK_SAVE_STAGE checkrefs=range_children_done\n");
+    if (scrVarPub.developer && scrDebuggerGlob.variableBreakpoints)
     {
-        v0 = 1;
-        for (i = 458754; i < 0x80000; i += 2)
+        // The retail loop wrote the refCount[id] bias through the
+        // varUsage + 0x70002 byte alias, which lands inside varUsage on
+        // LP64; address refCount by its real id index instead.
+        //
+        // Scr_ShutdownDebuggerMain (called by this load's Scr_ShutdownSystem)
+        // frees the breakpoint table and zeroes the pointer, so the bias only
+        // exists when the debugger actually kept one: it is the same table the
+        // -1 bias is derived from, and with no table there are no variable
+        // breakpoints to account for.
+        for (unsigned int index = 1; index <= 0x7FFF; ++index)
         {
-            v2 = v0 + 1;
-            if (Scr_IsVariableBreakpoint(v0 + 1))
-                ++*(_WORD *)((char *)scrVarDebugPub->varUsage + i);
-            v0 = v2;
+            if (Scr_IsVariableBreakpoint(index + 1))
+                ++scrVarDebugPub->refCount[index];
         }
     }
-    v3 = 458754;
-    v4 = 16;
-    for (j = &scrVarGlob.variableList[2].w;
-        (j->status & 0x60) == 0
-        || (j->type & VAR_MASK) < VAR_THREAD
-        || *(_WORD *)((char *)scrVarDebugPub->varUsage + v3)
-        && *(unsigned __int16 *)((char *)scrVarDebugPub->varUsage + v3) == (unsigned __int16)j[-1].status + 1;
-        j += 4)
+    for (unsigned int entryIndex = 2; entryIndex <= 0x8000; ++entryIndex)
     {
-        v4 += 16;
-        v3 += 2;
-        if (v4 >= 0x80000)
-            return 1;
+        // The retail walk stepped 16 bytes through an ILP32 record.  On LP64
+        // the records are native-sized, and refCount[entryIndex - 1] is the
+        // same slot the old varUsage + 0x70002 byte alias addressed
+        // (refCount[id], with parent id = entryIndex - 1).
+        VariableValueInternal *entry = &scrVarGlob.variableList[entryIndex];
+        if ((entry->w.status & 0x60) == 0
+            || (entry->w.type & 0x1Fu) < 0xE
+            || (scrVarDebugPub->refCount[entryIndex - 1]
+                && scrVarDebugPub->refCount[entryIndex - 1]
+                    == (unsigned __int16)(entry->u.next + 1)))
+            continue;
+        if (diagOn)
+            Com_Printf(
+                0,
+                "KISAK_SAVE_STAGE checkrefs=mismatch id=%u refcount=%u ref=%u type=0x%x\n",
+                entryIndex - 1,
+                scrVarDebugPub->refCount[entryIndex - 1],
+                entry->u.next,
+                entry->w.type);
+        return 0;
     }
-    return 0;
+    if (diagOn)
+    {
+        Com_Printf(
+            0,
+            "KISAK_SAVE_STAGE checkrefs=done case1=%u caseA=%u caseThr=%u caseChld=%u caseArr=%u caseArrVals=%u maxIndex=%u outOfRange=%u arraySteps=%u arrayBailed=%u\n",
+            g_scrRefCountDiag.byCase[1],
+            g_scrRefCountDiag.byCase[0xA],
+            g_scrRefCountDiag.byCase[0xE] + g_scrRefCountDiag.byCase[0xF]
+                + g_scrRefCountDiag.byCase[0x10] + g_scrRefCountDiag.byCase[0x13],
+            g_scrRefCountDiag.byCase[0x11],
+            g_scrRefCountDiag.byCase[0x15],
+            g_scrRefCountDiag.byCase[0x16],
+            g_scrRefCountDiag.maxIndex,
+            g_scrRefCountDiag.outOfRange,
+            g_scrRefCountDiag.arrayWalkSteps,
+            g_scrRefCountDiag.arrayWalkBailed);
+    }
+    return 1;
+}
+
+// The removal walk frees every object the savegame load created, one call per
+// saved id.  G_LoadMainState names its own stages, but a death inside this walk
+// still prints nothing, so the walk reports its shape instead of every object:
+// a type census, the first entries, and any entry whose saved id or status is
+// not one this VM can hold.
+struct ScrLoadWalkDiag
+{
+    unsigned int objects;
+    unsigned int byType[0x20];
+    unsigned int refZero;
+    unsigned int anomalies;
+};
+
+static ScrLoadWalkDiag g_scrLoadWalkDiag;
+
+static void ScrLoadShutdownDiag(bool enabled, const char *stage, unsigned int index)
+{
+    if (!enabled)
+        return;
+    if (index)
+    {
+        const unsigned int id = scrVarPub.saveIdMapRev[index];
+        VariableValueInternal *entry =
+            (id >= 1 && id < VARIABLELIST_PARENT_SIZE) ? &scrVarGlob.variableList[id + 1] : 0;
+        const unsigned int type = entry ? (entry->w.type & 0x1F) : 0xFFFFFFFFu;
+        const unsigned int status = entry ? (entry->w.status & VAR_STAT_MASK) : 0;
+        const unsigned int ref = entry ? entry->u.next : 0;
+
+        ++g_scrLoadWalkDiag.objects;
+        if (type < 0x20)
+            ++g_scrLoadWalkDiag.byType[type];
+        if (entry && !ref)
+            ++g_scrLoadWalkDiag.refZero;
+
+        const bool anomaly = !entry || status != VAR_STAT_EXTERNAL
+                             || type < VAR_THREAD || type > VAR_ARRAY || id >= VARIABLELIST_PARENT_SIZE;
+        const bool named = index <= 8 || (index % 512) == 0;
+        if ((anomaly || named) && g_scrLoadWalkDiag.anomalies < 16)
+        {
+            if (anomaly)
+                ++g_scrLoadWalkDiag.anomalies;
+            Com_Printf(
+                0,
+                "KISAK_SAVE_OBJ i=%u id=%u status=0x%x type=0x%x ref=%u sibling=%u%s\n",
+                index,
+                id,
+                entry ? entry->w.status : 0,
+                entry ? entry->w.type : 0,
+                ref,
+                entry ? entry->nextSibling : 0,
+                anomaly ? " anomaly=1" : "");
+        }
+        return;
+    }
+    if (!stage[0])
+        return;
+    Com_Printf(0, "KISAK_SAVE_STAGE %s\n", stage);
+}
+
+static void ScrLoadWalkDiagCensus(bool enabled)
+{
+    if (!enabled)
+        return;
+    Com_Printf(
+        0,
+        "KISAK_SAVE_STAGE scrshutdown=census objects=%u refZero=%u anomalies=%u "
+        "t14=%u t15=%u t16=%u t17=%u t18=%u t19=%u t20=%u t21=%u other=%u\n",
+        g_scrLoadWalkDiag.objects,
+        g_scrLoadWalkDiag.refZero,
+        g_scrLoadWalkDiag.anomalies,
+        g_scrLoadWalkDiag.byType[14],
+        g_scrLoadWalkDiag.byType[15],
+        g_scrLoadWalkDiag.byType[16],
+        g_scrLoadWalkDiag.byType[17],
+        g_scrLoadWalkDiag.byType[18],
+        g_scrLoadWalkDiag.byType[19],
+        g_scrLoadWalkDiag.byType[20],
+        g_scrLoadWalkDiag.byType[21],
+        g_scrLoadWalkDiag.objects
+            - (g_scrLoadWalkDiag.byType[14] + g_scrLoadWalkDiag.byType[15]
+               + g_scrLoadWalkDiag.byType[16] + g_scrLoadWalkDiag.byType[17]
+               + g_scrLoadWalkDiag.byType[18] + g_scrLoadWalkDiag.byType[19]
+               + g_scrLoadWalkDiag.byType[20] + g_scrLoadWalkDiag.byType[21]));
 }
 
 void __cdecl Scr_LoadShutdown()
 {
     unsigned int v0; // r30
     unsigned __int16 *v1; // r31
+    const bool diagOn = ScrLoadDiagOn();
 
+    ScrLoadShutdownDiag(diagOn, "scrshutdown=begin", 0);
+    if (diagOn)
+    {
+        Com_Printf(0, "KISAK_SAVE_STAGE scrshutdown=savecount savecount=%u\n", scrVarPub.savecount);
+        // Which of the shutdown's branches are live: Scr_InitDebuggerSystem()
+        // and the leak check below both key off these, and the port runs with
+        // scrVarPub.developer set whenever com_logfile defaults to 1.
+        Com_Printf(
+            0,
+            "KISAK_SAVE_STAGE scrshutdown=state developer=%d debugPub=%d ignoreLeaks=%d initedSystem=%d\n",
+            scrVarPub.developer ? 1 : 0,
+            scrVarDebugPub ? 1 : 0,
+            (scrStringDebugGlob && scrStringDebugGlob->ignoreLeaks) ? 1 : 0,
+            scrDebuggerGlob.debugger_inited_system ? 1 : 0);
+    }
     v0 = 1;
     if (scrVarPub.savecount)
     {
+        ScrLoadWalkProbeStart();
         v1 = &scrVarPub.saveIdMapRev[1];
         do
         {
+            ScrLoadShutdownDiag(diagOn, 0, v0);
             RemoveRefToObject(*v1);
             ++v0;
             ++v1;
         } while (v0 <= scrVarPub.savecount);
     }
+    ScrLoadShutdownDiag(diagOn, "scrshutdown=objects=done", 0);
+    ScrLoadWalkDiagCensus(diagOn);
+    if (diagOn)
+        ScrLoadWalkProbeReport();
+#if defined(__SWITCH__)
+    // Same divergence Scr_InitGameVariable takes (scr_vm.cpp): the Switch SP
+    // runtime has no remote script-debugger client, so this tail only needs the
+    // debugger state the VM itself reads.  Running the full system init here
+    // was wrong twice over: it re-initializes debugger UI state that the map
+    // path deliberately leaves to Scr_InitDebuggerBootState, and its
+    // ScriptList::LoadScriptPos walks the script-window array that this load's
+    // own Scr_ShutdownSystem had just freed.
+    Scr_InitDebuggerBootState();
+#else
     Scr_InitDebuggerSystem();
+#endif
+    ScrLoadShutdownDiag(diagOn, "scrshutdown=debugger=done", 0);
     scrVarPub.varUsagePos = 0;
     if (!CheckReferences())
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\script\\scr_readwrite.cpp", 1115, 0, "%s", "CheckReferences()");
+    ScrLoadShutdownDiag(diagOn, "scrshutdown=done", 0);
 }
 
 void __cdecl DoSaveEntryInternal(unsigned int type, VariableUnion *u, MemoryFile *memFile)
@@ -1213,7 +1446,7 @@ void __cdecl DoSaveEntryInternal(unsigned int type, VariableUnion *u, MemoryFile
     {
         UsedSize = MemFile_GetUsedSize(memFile);
         //ProfMem_Begin("pointer", UsedSize);
-        WriteId((unsigned int)u, 1u, memFile);
+        WriteId((unsigned int)(intptr_t)u, 1u, memFile);
         v7 = MemFile_GetUsedSize(memFile);
         //ProfMem_End(v7);
     }
@@ -1234,7 +1467,7 @@ void __cdecl DoSaveEntryInternal(unsigned int type, VariableUnion *u, MemoryFile
         case VAR_ISTRING:
             v19 = MemFile_GetUsedSize(memFile);
             //ProfMem_Begin("string", v19);
-            v20 = SL_ConvertToString((unsigned __int16)u);
+            v20 = SL_ConvertToString((unsigned __int16)(intptr_t)u);
             MemFile_WriteCString(memFile, v20);
             v21 = MemFile_GetUsedSize(memFile);
             //ProfMem_End(v21);
@@ -1298,16 +1531,13 @@ void __cdecl Scr_SaveSourceImmediate(SaveImmediate *save)
     int archivedCount = 0;
     int countOut = 0;
     unsigned int sourceBufferLookupLen = scrParserPub.sourceBufferLookupLen;
-    if (sourceBufferLookupLen)
+    // LP64: index the records; the IDA form stepped a bool * by 44 (ILP32
+    // sizeof(SourceBufferInfo)), but LP64 sizeof is 56, so it counted stray
+    // bytes and the saved count disagreed with the entries written below.
+    for (unsigned int k = 0; k < sourceBufferLookupLen; ++k)
     {
-        bool *p_archive = &scrParserPub.sourceBufferLookup->archive;
-        do
-        {
-            if (*p_archive)
-                countOut = ++archivedCount;
-            --sourceBufferLookupLen;
-            p_archive += 44;  // sizeof(SourceBufferInfo) per IDA stride
-        } while (sourceBufferLookupLen);
+        if (scrParserPub.sourceBufferLookup[k].archive)
+            countOut = ++archivedCount;
     }
     SaveMemory_SaveWriteImmediate(&countOut, 4u, save);
 
@@ -1362,8 +1592,9 @@ void __cdecl Scr_LoadSource(MemoryFile *memFile, void *fileHandle)
             scrParserGlob.saveSourceBufferLookup = 0;
             return;
         }
+        // LP64: SaveSourceBufferInfo holds a pointer (16 bytes, not 8).
         saveSourceBufferLookup = (SaveSourceBufferInfo *)Hunk_AllocDebugMem(
-            8 * scrParserGlob.saveSourceBufferLookupLen,
+            sizeof(SaveSourceBufferInfo) * scrParserGlob.saveSourceBufferLookupLen,
             "Scr_LoadSource");
         scrParserGlob.saveSourceBufferLookup = saveSourceBufferLookup;
         v5 = scrParserGlob.saveSourceBufferLookupLen - 1;
@@ -1431,7 +1662,7 @@ void __cdecl AddSaveStackInternal(const VariableStackBuffer *stackBuf)
     const char *buf; // r31
     unsigned int v4; // r3
     unsigned __int16 v5; // r30
-    VariableUnion *v6; // r4
+    uintptr_t v6; // r4
 
     localId = stackBuf->localId;
     if (stackBuf->localId && !scrVarPub.saveIdMap[localId])
@@ -1447,9 +1678,9 @@ void __cdecl AddSaveStackInternal(const VariableStackBuffer *stackBuf)
         {
             v4 = (unsigned __int8)*buf;
             v5 = size - 1;
-            v6 = *(VariableUnion **)(buf + 1);
-            buf += 5;
-            AddSaveEntryInternal(v4, (const VariableStackBuffer*)v6);
+            v6 = *reinterpret_cast<const uintptr_t *>(buf + 1);
+            buf += kScriptStackValueSize;
+            AddSaveEntryInternal(v4, reinterpret_cast<const VariableStackBuffer *>(v6));
             size = v5;
         } while (v5);
     }
@@ -1459,10 +1690,10 @@ void __cdecl AddSaveEntryInternal(unsigned int type, const VariableStackBuffer *
 {
     if (type == VAR_POINTER)
     {
-        if (u && !scrVarPub.saveIdMap[(unsigned int)u])
+        if (u && !scrVarPub.saveIdMap[(unsigned int)(intptr_t)u])
         {
-            scrVarPub.saveIdMap[(unsigned int)u] = ++scrVarPub.savecount;
-            *(unsigned __int16 *)((char *)scrVarPub.saveIdMapRev + __ROL4__(scrVarPub.savecount, 1)) = (unsigned __int16)u;
+            scrVarPub.saveIdMap[(unsigned int)(intptr_t)u] = ++scrVarPub.savecount;
+            *(unsigned __int16 *)((char *)scrVarPub.saveIdMapRev + __ROL4__(scrVarPub.savecount, 1)) = (unsigned __int16)(intptr_t)u;
         }
     }
     else if (type == VAR_STACK)
@@ -1502,14 +1733,15 @@ void __cdecl DoSaveEntry(VariableValue *value, VariableValue *name, bool isArray
     //ProfMem_Begin("DoSaveEntry", UsedSize);
     v9 = MemFile_GetUsedSize(memFile);
     //ProfMem_Begin("DoSaveEntryInternal", v9);
-    DoSaveEntryInternal(value->type, (VariableUnion *)value->u.intValue, memFile);
+    DoSaveEntryInternal(value->type,
+                        reinterpret_cast<VariableUnion *>(value->u.pointerValue), memFile);
     v10 = MemFile_GetUsedSize(memFile);
     //ProfMem_End(v10);
     if (!isArray)
     {
         v12 = MemFile_GetUsedSize(memFile);
         //ProfMem_Begin("non-array", v12);
-        if (((unsigned int)name & 0xFF000000) != 0)
+        if (((unsigned int)(intptr_t)name & 0xFF000000) != 0)
             MyAssertHandler(
                 "c:\\trees\\cod3\\cod3src\\src\\script\\scr_readwrite.cpp",
                 402,
@@ -1517,11 +1749,11 @@ void __cdecl DoSaveEntry(VariableValue *value, VariableValue *name, bool isArray
                 "%s\n\t(name) = %i",
                 "(!(name & 0xFF000000))",
                 name);
-        v27[0] = (v27[0] & 0xFFFFFF00) | ((uint8_t)name);
+        v27[0] = (v27[0] & 0xFFFFFF00) | ((uint8_t)(intptr_t)name);
         MemFile_WriteData(memFile, 1, v27);
-        v27[0] = (v27[0] & 0xFFFFFF00) | (((uint32_t)name >> 8) & 0xFF);
+        v27[0] = (v27[0] & 0xFFFFFF00) | (((uint32_t)(intptr_t)name >> 8) & 0xFF);
         MemFile_WriteData(memFile, 1, v27);
-        v27[0] = (v27[0] & 0xFFFFFF00) | (((uint32_t)name >> 16) & 0xFF);
+        v27[0] = (v27[0] & 0xFFFFFF00) | (((uint32_t)(intptr_t)name >> 16) & 0xFF);
         MemFile_WriteData(memFile, 1, v27);
         v13 = MemFile_GetUsedSize(memFile);
         //ProfMem_End(v13);
@@ -1529,7 +1761,7 @@ void __cdecl DoSaveEntry(VariableValue *value, VariableValue *name, bool isArray
         //ProfMem_End(v14);
         return;
     }
-    VariableValue arrVal = Scr_GetArrayIndexValue((unsigned int)name);
+    VariableValue arrVal = Scr_GetArrayIndexValue((unsigned int)(intptr_t)name);
     if (arrVal.type == VAR_POINTER)
     {
         WriteId(arrVal.u.intValue, 5u, memFile);
@@ -1605,8 +1837,13 @@ void __cdecl AddSaveObjectChildren(unsigned int parentId)
     parentType = parentValue->w.type & 0x1F;
     for (i = FindLastSibling(parentId); i; i = FindPrevSibling(i))
     {
-        entryValue = (VariableValueInternal *)((char *)&scrVarGlob.variableList[VARIABLELIST_CHILD_BEGIN]
-            + __ROL4__(scrVarGlob.variableList[i + VARIABLELIST_CHILD_BEGIN].hash.id, 4));
+        // hash.id names the backing child slot.  The old expression was a
+        // byte offset (id * 16) from the ILP32 layout; on LP64 each
+        // VariableValueInternal is wider and that lands in the middle of an
+        // unrelated record.
+        entryValue = &scrVarGlob.variableList[
+            scrVarGlob.variableList[i + VARIABLELIST_CHILD_BEGIN].hash.id +
+            VARIABLELIST_CHILD_BEGIN];
         iassert(!IsObject(entryValue));
         if (parentType == VAR_ARRAY)
         {
@@ -1770,8 +2007,9 @@ void __cdecl DoSaveObjectInfo(unsigned int parentId, MemoryFile *memFile)
         MemFile_WriteData(memFile, 2, v18);
         for (j = FindLastSibling(parentId); j; j = FindPrevSibling(j))
         {
-            v14 = (VariableValueInternal *)((char *)&scrVarGlob.variableList[VARIABLELIST_CHILD_BEGIN]
-                + __ROL4__(scrVarGlob.variableList[j + VARIABLELIST_CHILD_BEGIN].hash.id, 4));
+            v14 = &scrVarGlob.variableList[
+                scrVarGlob.variableList[j + VARIABLELIST_CHILD_BEGIN].hash.id +
+                VARIABLELIST_CHILD_BEGIN];
             v15 = v14->w.status & 0x60;
             if (!v15 || v15 == 96)
                 MyAssertHandler(
@@ -1788,7 +2026,7 @@ void __cdecl DoSaveObjectInfo(unsigned int parentId, MemoryFile *memFile)
                     "%s",
                     "!IsObject( entryValue )");
             w = v14->w;
-            v18[0].u.intValue = v14->u.u.intValue;
+            v18[0].u = v14->u.u;
             v18[0].type = (Vartype_t)(w.type & 0x1F);
             DoSaveEntry(v18, (VariableValue *)((unsigned int)w.status >> 8), v9, memFile);
         }
@@ -1822,7 +2060,8 @@ void __cdecl WriteGameEntry(MemoryFile *memFile)
 {
     DoSaveEntryInternal(
         scrVarGlob.variableList[scrVarPub.gameId + VARIABLELIST_CHILD_BEGIN].w.type & 0x1F,
-        (VariableUnion *)scrVarGlob.variableList[scrVarPub.gameId + VARIABLELIST_CHILD_BEGIN].u.u.intValue,
+        reinterpret_cast<VariableUnion *>(scrVarGlob.variableList[
+            scrVarPub.gameId + VARIABLELIST_CHILD_BEGIN].u.u.pointerValue),
         memFile);
 }
 
@@ -1859,7 +2098,8 @@ void __cdecl Scr_SavePost(MemoryFile *memFile)
     //ProfMem_End(v5);
     DoSaveEntryInternal(
         scrVarGlob.variableList[scrVarPub.gameId + VARIABLELIST_CHILD_BEGIN].w.type & VAR_MASK,
-        (VariableUnion *)scrVarGlob.variableList[scrVarPub.gameId + VARIABLELIST_CHILD_BEGIN].u.u.intValue,
+        reinterpret_cast<VariableUnion *>(scrVarGlob.variableList[
+            scrVarPub.gameId + VARIABLELIST_CHILD_BEGIN].u.u.pointerValue),
         memFile);
     WriteId(scrVarPub.levelId, 0, memFile);
     WriteId(scrVarPub.animId, 0, memFile);
@@ -1868,12 +2108,9 @@ void __cdecl Scr_SavePost(MemoryFile *memFile)
     WriteId(scrVarPub.freeEntList, 0, memFile);
     v6 = 4;
     p_entArrayId = &g_classMap[0].entArrayId;
-    do
-    {
-        WriteId(*p_entArrayId, 0, memFile);
-        --v6;
-        p_entArrayId += 6;
-    } while (v6);
+    // Native class stride: the LP64 scr_classStruct_t is not 6 uint16 wide.
+    for (v6 = 0; v6 < 4; ++v6)
+        WriteId(g_classMap[v6].entArrayId, 0, memFile);
 }
 
 void __cdecl AddSaveStack(const VariableStackBuffer *stackBuf)
@@ -1882,7 +2119,7 @@ void __cdecl AddSaveStack(const VariableStackBuffer *stackBuf)
     CONST char *buf; // r31
     int v4; // r10
     __int16 v5; // r29
-    const VariableStackBuffer *v6; // r3
+    uintptr_t v6; // r3
 
     AddSaveObject(stackBuf->localId);
     size = stackBuf->size;
@@ -1893,15 +2130,15 @@ void __cdecl AddSaveStack(const VariableStackBuffer *stackBuf)
         {
             v4 = (unsigned __int8)*buf;
             v5 = size - 1;
-            v6 = *(const VariableStackBuffer **)(buf + 1);
-            buf += 5;
+            v6 = *reinterpret_cast<const uintptr_t *>(buf + 1);
+            buf += kScriptStackValueSize;
             if (v4 == VAR_POINTER)
             {
-                AddSaveObject((unsigned int)v6);
+                AddSaveObject(static_cast<unsigned int>(v6));
             }
             else if (v4 == VAR_STACK)
             {
-                AddSaveStack(v6);
+                AddSaveStack(reinterpret_cast<const VariableStackBuffer *>(v6));
             }
             //LOWORD(size) = v5;
             size = (size & 0xFFFF0000) | ((uint32_t)v5 & 0xFFFF);
@@ -1914,7 +2151,7 @@ void __cdecl AddSaveEntry(unsigned int type, const VariableStackBuffer *u)
 {
     if (type == VAR_POINTER)
     {
-        AddSaveObject((unsigned int)u);
+        AddSaveObject((unsigned int)(intptr_t)u);
     }
     else if (type == VAR_STACK)
     {
@@ -1947,22 +2184,20 @@ void __cdecl Scr_SavePre(int sys)
     AddSaveObject(scrVarPub.freeEntList);
     v2 = 4;
     p_entArrayId = &g_classMap[0].entArrayId;
-    do
-    {
-        AddSaveObject(*p_entArrayId);
-        --v2;
-        p_entArrayId += 6;
-    } while (v2);
+    // Native class stride: rooting only class 0 leaves the pathnode/hudelem/
+    // vehiclenode entity objects unreachable, so the save's cyclic-leak check
+    // treats every one of their entities as leaked.
+    for (v2 = 0; v2 < 4; ++v2)
+        AddSaveObject(g_classMap[v2].entArrayId);
     v4 = &scrVarGlob.variableList[scrVarPub.gameId + VARIABLELIST_CHILD_BEGIN];
     stackValue = v4->u.u.stackValue;
     v6 = v4->w.type & VAR_MASK;
     if (v6 == VAR_POINTER)
     {
-        AddSaveObject((unsigned int)stackValue);
+        AddSaveObject((unsigned int)(intptr_t)stackValue);
     }
     else if (v6 == VAR_STACK)
     {
         AddSaveStack(stackValue);
     }
 }
-

@@ -78,7 +78,7 @@ devguiGlob_t *__cdecl DevGui_GetMenu(uint16_t handle)
             handle,
             1,
             600);
-    return (devguiGlob_t *)((char *)&devguiGlob + 40 * handle - 40);
+    return (devguiGlob_t *)&devguiGlob.menus[handle - 1];
 }
 
 uint16_t __cdecl DevGui_ConstructPath_r(uint16_t parent, const char *path)
@@ -134,7 +134,7 @@ uint16_t __cdecl DevGui_CreateMenu(uint16_t parentHandle, const char *label, __i
     menu->childMenuMemory = 0;
     menu->sortKey = sortKey;
     menu->parent = parentHandle;
-    menu->child.menu = 0;
+    memset(&menu->child, 0, sizeof(menu->child));
     if (parentHandle)
         parentMenu = DevGui_GetMenu(parentHandle);
     else
@@ -159,19 +159,16 @@ uint16_t __cdecl DevGui_CreateMenu(uint16_t parentHandle, const char *label, __i
 
 uint16_t __cdecl DevGui_GetMenuHandle(DevMenuItem *menu)
 {
-    uint16_t handle; // [esp+0h] [ebp-4h]
-
-    handle = ((char *)menu - (char *)&devguiGlob) / 40 + 1;
-    if ((uint16_t)(((char *)menu - (char *)&devguiGlob) / 40) == 0xFFFF || handle > 0x258u)
+    if (menu < devguiGlob.menus || menu >= &devguiGlob.menus[600])
         MyAssertHandler(
             ".\\devgui\\devgui.cpp",
             137,
             0,
             "handle not in [1, ARRAY_COUNT( devguiGlob.menus )]\n\t%i not in [%i, %i]",
-            handle,
+            (int)(menu - devguiGlob.menus + 1),
             1,
             600);
-    return ((char *)menu - (char *)&devguiGlob) / 40 + 1;
+    return (uint16_t)(menu - devguiGlob.menus + 1);
 }
 
 int32_t __cdecl DevGui_CompareMenus(const DevMenuItem *menu0, const DevMenuItem *menu1)
@@ -480,7 +477,7 @@ void __cdecl DevGui_FreeMenu_r(uint16_t handle)
             DevGui_FreeMenu_r(menu->menus[0].child.menu);
         }
         DevGui_FreeMenu_r(menu->menus[0].nextSibling);
-        *(uint32_t*)menu->menus[0].label = (uint32_t)devguiGlob.nextFreeMenu;
+        *(DevMenuItem **)menu->menus[0].label = devguiGlob.nextFreeMenu;
         devguiGlob.nextFreeMenu = (DevMenuItem *)menu;
     }
 }
@@ -1185,12 +1182,12 @@ void __cdecl DevGui_Init()
     screen_xPad = RETURN_ZERO32();
     screen_yPad = RETURN_ZERO32();
     for (menuIndex = 0; menuIndex < 0x257; ++menuIndex)
-        *(uint32_t *)devguiGlob.menus[menuIndex].label = (uint32_t)&devguiGlob.menus[menuIndex + 1];
-    *(uint32_t *)devguiGlob.menus[menuIndex].label = 0;
-    devguiGlob.nextFreeMenu = (DevMenuItem *)&devguiGlob;
+        *(DevMenuItem **)devguiGlob.menus[menuIndex].label = &devguiGlob.menus[menuIndex + 1];
+    *(DevMenuItem **)devguiGlob.menus[menuIndex].label = nullptr;
+    devguiGlob.nextFreeMenu = &devguiGlob.menus[0];
     devguiGlob.topmostMenu.childType = 0;
     devguiGlob.topmostMenu.childMenuMemory = 0;
-    devguiGlob.topmostMenu.child.menu = 0;
+    memset(&devguiGlob.topmostMenu.child, 0, sizeof(devguiGlob.topmostMenu.child));
     devguiGlob.topmostMenu.nextSibling = 0;
     devguiGlob.topmostMenu.prevSibling = 0;
     devguiGlob.topmostMenu.parent = 0;

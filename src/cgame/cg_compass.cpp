@@ -2417,8 +2417,8 @@ void CG_CompassDrawGoalDistance(
     int textStyle)
 {
     int compassFadeTime; // r27
-    long double v12; // fp2
-    long double v13; // fp2
+    double v12; // fp2
+    double v13; // fp2
     double v14; // fp1
     double centerX; // fp0
     bool centerY; // mr_fpscr48

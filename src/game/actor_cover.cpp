@@ -897,11 +897,15 @@ int __cdecl Actor_Cover_FindBestCoverListInList(actor_s *self, pathsort_t *nodes
     return count;
 }
 
-int __cdecl compare_node_sort(const void *a, const void *b)
+int __cdecl compare_node_sort(const void *pe1, const void *pe2)
 {
-    const pathsort_t *left = (const pathsort_t *)a;
-    const pathsort_t *right = (const pathsort_t *)b;
-    return (left->metric > right->metric) - (left->metric < right->metric);
+    const pathsort_t *node1 = static_cast<const pathsort_t *>(pe1);
+    const pathsort_t *node2 = static_cast<const pathsort_t *>(pe2);
+    if (node1->metric < node2->metric)
+        return -1;
+    if (node1->metric > node2->metric)
+        return 1;
+    return 0;
 }
 
 int __cdecl Actor_Cover_FindBestCoverList(actor_s *self, pathnode_t **bestNodes, int bestNodesInList)
@@ -912,13 +916,6 @@ int __cdecl Actor_Cover_FindBestCoverList(actor_s *self, pathnode_t **bestNodes,
     int BestCoverListInList; // r3
     signed int v10; // r31
     int v11; // r10
-    float *p_metric; // r11
-    unsigned int v13; // r9
-    double v14; // fp13
-    double v15; // fp12
-    double v16; // fp11
-    int v17; // r9
-    float *v18; // r11
     signed int v19; // r29
     pathsort_t *v20; // r30
     signed int v21; // r11
@@ -940,11 +937,9 @@ int __cdecl Actor_Cover_FindBestCoverList(actor_s *self, pathnode_t **bestNodes,
     v10 = BestCoverListInList;
     v11 = 0;
     self->numCoverNodesInGoal = BestCoverListInList;
-
-    for (int i = 0; i < BestCoverListInList; ++i)
-        v29[i].metric -= v29[i].distMetric;
-    qsort(v29, BestCoverListInList, sizeof(pathsort_t), compare_node_sort);
-
+    for (v11 = 0; v11 < BestCoverListInList; ++v11)
+        v29[v11].metric -= v29[v11].distMetric;
+    qsort(v29, BestCoverListInList, sizeof(*v29), compare_node_sort);
     v19 = 0;
     if (v10 > 0)
     {
@@ -959,7 +954,7 @@ int __cdecl Actor_Cover_FindBestCoverList(actor_s *self, pathnode_t **bestNodes,
             ++v20;
         } while (v19 < v10);
     }
-    qsort(v29, v10, sizeof(pathsort_t), compare_node_sort);
+    qsort(v29, v10, sizeof(*v29), compare_node_sort);
     v21 = 0;
     if (v10 > bestNodesInList)
         v21 = v10 - bestNodesInList;
@@ -1096,4 +1091,3 @@ pathnode_t *__cdecl Actor_Cover_FindBestCover(actor_s *self)
         return 0;
     return result;
 }
-

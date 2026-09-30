@@ -7,6 +7,11 @@
 #include "rb_tess.h"
 #include "r_draw_staticmodel.h"
 #include <universal/profile.h>
+#include "r_bsp.h"
+#include "r_dvars.h"
+#include "r_init.h"
+#include <port/switch_perf.h>
+#include <deko9/deko9_native.h>
 
 
 void __cdecl R_InitDrawSurfListInfo(GfxDrawSurfListInfo *info)
@@ -156,9 +161,20 @@ uint16_t *__cdecl R_AllocPreTessIndices(int count)
     iassert( gfxBuf.preTessIndexBuffer->indices != NULL );
     iassert( count );
     if (count + gfxBuf.preTessIndexBuffer->used > gfxBuf.preTessIndexBuffer->total)
+    {
+#ifdef __SWITCH__
+        // A full buffer silently sends the caller to one draw per surface.
+        if (SwitchPerf_g_enabled)
+            SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_ALLOC_FAIL, 1);
+#endif
         return 0;
+    }
     indices = &gfxBuf.preTessIndexBuffer->indices[gfxBuf.preTessIndexBuffer->used];
     gfxBuf.preTessIndexBuffer->used += count;
+#ifdef __SWITCH__
+    if (SwitchPerf_g_enabled)
+        SwitchPerf_NotePreTessUsed(gfxBuf.preTessIndexBuffer->used, gfxBuf.preTessIndexBuffer->total);
+#endif
     return indices;
 }
 
@@ -192,4 +208,74 @@ int __cdecl R_ReadBspPreTessDrawSurfs(
     *baseIndex = R_ReadPrimDrawSurfInt(cmdBuf);
     *list = (const GfxBspPreTessDrawSurf *)R_ReadPrimDrawSurfData(cmdBuf, *count);
     return 1;
+}
+
+// ---- Static world index buffer (r_deko9StaticPretess, see r_pretess.h) -----
+
+namespace
+{
+struct StaticPretessWorld
+{
+    IDirect3DIndexBuffer9 *ib;
+    const GfxWorld *world;
+    const uint16_t *indices;
+    int indexCount;
+};
+StaticPretessWorld s_staticPretess;
+} // namespace
+
+void R_StaticPretessRelease()
+{
+    if (s_staticPretess.ib)
+        R_FreeStaticIndexBuffer(s_staticPretess.ib);
+    s_staticPretess = {};
+}
+
+void R_StaticPretessSetWorld(const GfxWorld *world)
+{
+    if (world && s_staticPretess.ib && s_staticPretess.world == world && s_staticPretess.indices == world->indices
+        && s_staticPretess.indexCount == world->indexCount)
+        return;
+    R_StaticPretessRelease();
+    if (!world || !world->indices || world->indexCount <= 0 || !r_loadForRenderer->current.enabled)
+        return;
+    const int bytes = world->indexCount * (int)sizeof(uint16_t);
+    IDirect3DIndexBuffer9 *ib = nullptr;
+    void *dst = R_AllocStaticIndexBuffer(&ib, bytes);
+    if (!dst || !ib)
+    {
+        // Loud, not fatal: the per-frame pretess copy keeps drawing the world.
+        Com_Printf(CON_CHANNEL_SYSTEM, "FAIL:STATIC_PRETESS_IB world=%s indices=%d (per-frame pretess stays on)\n",
+                   world->name, world->indexCount);
+        return;
+    }
+    Com_Memcpy(dst, world->indices, bytes);
+    R_FinishStaticIndexBuffer(ib);
+    Deko9_SetBufferRole(ib, "worldStaticIB");
+    s_staticPretess.ib = ib;
+    s_staticPretess.world = world;
+    s_staticPretess.indices = world->indices;
+    s_staticPretess.indexCount = world->indexCount;
+    Com_Printf(CON_CHANNEL_SYSTEM, "STATIC_PRETESS world=%s indices=%d bytes=%d\n", world->name, world->indexCount,
+               bytes);
+}
+
+IDirect3DIndexBuffer9 *R_StaticPretessWorldIbAny()
+{
+    const StaticPretessWorld &s = s_staticPretess;
+    if (!s.ib || !rgp.world || s.world != rgp.world || s.indices != rgp.world->indices)
+        return nullptr;
+    return s.ib;
+}
+
+IDirect3DIndexBuffer9 *R_StaticPretessWorldIb()
+{
+    if (!r_deko9StaticPretess || !r_deko9StaticPretess->current.enabled)
+        return nullptr;
+    return R_StaticPretessWorldIbAny();
+}
+
+bool R_StaticPretessModels()
+{
+    return r_deko9StaticPretessModels && r_deko9StaticPretessModels->current.enabled;
 }

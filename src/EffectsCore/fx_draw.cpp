@@ -1,4 +1,6 @@
 #include <universal/q_shared.h>
+#include <algorithm>
+#include <cstring>
 #include "fx_system.h"
 
 #include <gfx_d3d/r_drawsurf.h>
@@ -8,8 +10,14 @@
 #include <aim_assist/aim_assist.h>
 
 #include <physics/phys_local.h>
+#include <universal/critical_section.h>
 
+#ifndef __SWITCH__
+// FX drawing only needs the shared engine declarations above.  win_local.h
+// imports DirectInput and WinSock for the desktop shell, neither of which is
+// part of the Horizon renderer path.
 #include <win32/win_local.h>
+#endif
 #include <universal/profile.h>
 
 #ifdef KISAK_MP
@@ -227,6 +235,196 @@ void __cdecl FX_UnpackColor565(
     *outG |= (int)*outG >> 5;
     *outB = HIBYTE(packed) & 0xF8;
     *outB |= (int)*outB >> 5;
+}
+
+// fx_drawStats: the screen area of
+// every generated sprite quad, per material, to size the emissive fill
+// (the GPU draw census counts samples that pass; this is what is
+// rasterized before depth and alpha tests). Area is the quad clipped to the
+// near plane (1 unit) and the view rectangle, in screens (1.0 = the whole
+// render target). Races between FX worker threads only blur the numbers.
+namespace
+{
+struct FxDrawStatRow
+{
+    const Material *material;
+    double sprites, zeroAlpha, lowAlpha, area, areaZeroAlpha, areaLowAlpha, areaAlphaWeighted, big, nearClipped;
+    float maxArea;
+};
+constexpr int kFxDrawStatRows = 96;
+FxDrawStatRow s_fxDrawStat[kFxDrawStatRows];
+int s_fxDrawStatCount;
+uint32_t s_fxDrawStatFrames;
+uint32_t s_fxDrawStatLastMs;
+
+float FX_DrawStatQuadArea(const FxCamera *camera, const float (*corner)[3], bool *nearClipped)
+{
+    // tan(half fov) from the side planes FX_SetNextUpdateCamera built.
+    const float tanX = Vec3Dot(camera->frustum[1], camera->axis[0]) / Vec3Dot(camera->frustum[1], camera->axis[1]);
+    const float tanY = Vec3Dot(camera->frustum[3], camera->axis[0]) / Vec3Dot(camera->frustum[3], camera->axis[2]);
+    *nearClipped = false;
+    if (!(tanX > 0.0f) || !(tanY > 0.0f))
+        return 0.0f;
+    float view[4][3];
+    for (int i = 0; i < 4; ++i)
+    {
+        float d[3];
+        Vec3Sub(corner[i], camera->origin, d);
+        view[i][0] = Vec3Dot(d, camera->axis[0]);
+        view[i][1] = Vec3Dot(d, camera->axis[1]) / tanX;
+        view[i][2] = Vec3Dot(d, camera->axis[2]) / tanY;
+    }
+    // Clip against the near plane (forward >= 1), then project.
+    const float kNear = 1.0f;
+    float poly[16][2], next[16][2];
+    int n = 0;
+    for (int i = 0; i < 4; ++i)
+    {
+        const float *a = view[i], *b = view[(i + 1) & 3];
+        const bool ina = a[0] >= kNear, inb = b[0] >= kNear;
+        if (ina)
+        {
+            poly[n][0] = a[1] / a[0];
+            poly[n][1] = a[2] / a[0];
+            ++n;
+        }
+        else
+        {
+            *nearClipped = true;
+        }
+        if (ina != inb)
+        {
+            const float t = (kNear - a[0]) / (b[0] - a[0]);
+            poly[n][0] = (a[1] + t * (b[1] - a[1])) / kNear;
+            poly[n][1] = (a[2] + t * (b[2] - a[2])) / kNear;
+            ++n;
+        }
+    }
+    // Clip to the view rectangle [-1,1]^2 (Sutherland-Hodgman, 4 edges).
+    for (int edge = 0; edge < 4 && n >= 3; ++edge)
+    {
+        const int axis = edge >> 1;
+        const float sign = (edge & 1) ? -1.0f : 1.0f; // inside: sign * p[axis] <= 1
+        int m = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            const float *a = poly[i], *b = poly[(i + 1) % n];
+            const float da = 1.0f - sign * a[axis], db = 1.0f - sign * b[axis];
+            if (da >= 0.0f && m < 16)
+            {
+                next[m][0] = a[0];
+                next[m][1] = a[1];
+                ++m;
+            }
+            if ((da >= 0.0f) != (db >= 0.0f) && m < 16)
+            {
+                const float t = da / (da - db);
+                next[m][0] = a[0] + t * (b[0] - a[0]);
+                next[m][1] = a[1] + t * (b[1] - a[1]);
+                ++m;
+            }
+        }
+        n = m;
+        memcpy(poly, next, sizeof(float) * 2 * m);
+    }
+    if (n < 3)
+        return 0.0f;
+    float twice = 0.0f;
+    for (int i = 0; i < n; ++i)
+        twice += poly[i][0] * poly[(i + 1) % n][1] - poly[(i + 1) % n][0] * poly[i][1];
+    return fabsf(twice) * 0.5f * 0.25f; // NDC area 4 = one screen
+}
+
+void FX_DrawStatSprite(const FxDrawState *draw, const Material *material, const GfxPackedVertex *verts)
+{
+    const float corner[4][3] = {{verts[0].xyz[0], verts[0].xyz[1], verts[0].xyz[2]},
+                                {verts[1].xyz[0], verts[1].xyz[1], verts[1].xyz[2]},
+                                {verts[2].xyz[0], verts[2].xyz[1], verts[2].xyz[2]},
+                                {verts[3].xyz[0], verts[3].xyz[1], verts[3].xyz[2]}};
+    bool nearClipped = false;
+    const float area = FX_DrawStatQuadArea(draw->camera, corner, &nearClipped);
+    FxDrawStatRow *row = nullptr;
+    for (int i = 0; i < s_fxDrawStatCount && !row; ++i)
+        if (s_fxDrawStat[i].material == material)
+            row = &s_fxDrawStat[i];
+    if (!row)
+    {
+        if (s_fxDrawStatCount >= kFxDrawStatRows)
+            return;
+        row = &s_fxDrawStat[s_fxDrawStatCount++];
+        memset(row, 0, sizeof(*row));
+        row->material = material;
+    }
+    const uint8_t alpha = draw->visState.color[3];
+    row->sprites += 1.0;
+    row->area += area;
+    row->areaAlphaWeighted += area * alpha / 255.0;
+    if (alpha == 0)
+    {
+        row->zeroAlpha += 1.0;
+        row->areaZeroAlpha += area;
+    }
+    if (alpha <= 8)
+    {
+        row->lowAlpha += 1.0;
+        row->areaLowAlpha += area;
+    }
+    if (area > 0.25f)
+        row->big += 1.0;
+    if (nearClipped)
+        row->nearClipped += 1.0;
+    if (area > row->maxArea)
+        row->maxArea = area;
+}
+
+bool FX_DrawStatTourActive()
+{
+    static const dvar_t *tour;
+    if (!tour)
+        tour = Dvar_FindVar("r_deko9EmissiveTour");
+    return tour && tour->current.enabled;
+}
+} // namespace
+
+void FX_DrawStatsReset()
+{
+    s_fxDrawStatCount = 0;
+    s_fxDrawStatFrames = 0;
+}
+
+void FX_DrawStatsReport(const char *label)
+{
+    if (!s_fxDrawStatFrames)
+        return;
+    const double f = s_fxDrawStatFrames;
+    static FxDrawStatRow rows[kFxDrawStatRows];
+    const int count = s_fxDrawStatCount;
+    memcpy(rows, s_fxDrawStat, sizeof(FxDrawStatRow) * count);
+    std::sort(rows, rows + count, [](const FxDrawStatRow &a, const FxDrawStatRow &b) { return a.area > b.area; });
+    double sprites = 0, area = 0, areaZero = 0, areaLow = 0, areaW = 0;
+    for (int i = 0; i < count; ++i)
+    {
+        sprites += rows[i].sprites;
+        area += rows[i].area;
+        areaZero += rows[i].areaZeroAlpha;
+        areaLow += rows[i].areaLowAlpha;
+        areaW += rows[i].areaAlphaWeighted;
+    }
+    Com_Printf(CON_CHANNEL_SYSTEM,
+               "FX_DRAWSTAT label=%s frames=%u materials=%d sprites=%.1f area=%.3f area_a0=%.3f area_a8=%.3f "
+               "area_aw=%.3f (per frame; area in screens)\n",
+               label, s_fxDrawStatFrames, count, sprites / f, area / f, areaZero / f, areaLow / f, areaW / f);
+    for (int i = 0; i < count && i < 16; ++i)
+    {
+        const FxDrawStatRow &r = rows[i];
+        Com_Printf(CON_CHANNEL_SYSTEM,
+                   "FX_DRAWSTAT label=%s mat=%s sprites=%.1f a0=%.1f a8=%.1f area=%.3f area_a0=%.3f area_a8=%.3f "
+                   "area_aw=%.3f big=%.1f near=%.1f max=%.3f\n",
+                   label, r.material && r.material->info.name ? r.material->info.name : "?", r.sprites / f,
+                   r.zeroAlpha / f, r.lowAlpha / f, r.area / f, r.areaZeroAlpha / f, r.areaLowAlpha / f,
+                   r.areaAlphaWeighted / f, r.big / f, r.nearClipped / f, r.maxArea);
+    }
+    FX_DrawStatsReset();
 }
 
 void __cdecl FX_DrawElem_BillboardSprite(FxDrawState *draw)
@@ -471,6 +669,8 @@ void __cdecl FX_GenSpriteVerts(FxDrawState *draw, const float *tangent, const fl
         verts->texCoord.packed = (v5 & 0x3FFF | ((int)LODWORD(v13) >> 16) & 0xC000)
             + ((v6 & 0x3FFF | ((int)LODWORD(v15) >> 16) & 0xC000) << 16);
         verts->tangent = packedTangent;
+        if (fx_drawStats && fx_drawStats->current.integer)
+            FX_DrawStatSprite(draw, visuals.material, baseVerts);
     }
 }
 
@@ -1138,6 +1338,20 @@ void __cdecl FX_DrawSpriteElems(FxSystem *system, int32_t drawTime)
     if (!system->camera.isValid)
         MyAssertHandler(".\\EffectsCore\\fx_draw.cpp", 1511, 0, "%s", "system->camera.isValid");
     system->gfxCloudCount = 0;
+    if (fx_drawStats && fx_drawStats->current.integer)
+    {
+        // Outside the tour (which reports per census phase) print every
+        // fx_drawStats msec.
+        ++s_fxDrawStatFrames;
+        const uint32_t now = Sys_Milliseconds();
+        if (!s_fxDrawStatLastMs)
+            s_fxDrawStatLastMs = now;
+        if (!FX_DrawStatTourActive() && now - s_fxDrawStatLastMs >= (uint32_t)fx_drawStats->current.integer)
+        {
+            s_fxDrawStatLastMs = now;
+            FX_DrawStatsReport("auto");
+        }
+    }
     sprite = &system->sprite;
     system->sprite.indices = 0;
     system->sprite.indexCount = 0;
@@ -1678,7 +1892,7 @@ double __cdecl FX_ClampRangeLerp(float dist, const FxFloatRange *range)
     value = 0.0;
     if (baseDist >= 0.0)
     {
-        if (range->amplitude > (double)baseDist)
+        if (range->amplitude > baseDist)
             return (float)(1.0 - baseDist / range->amplitude);
     }
     else
@@ -1687,4 +1901,3 @@ double __cdecl FX_ClampRangeLerp(float dist, const FxFloatRange *range)
     }
     return value;
 }
-

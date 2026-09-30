@@ -4,6 +4,7 @@
 #include "r_draw_shadowable_light.h"
 #include "rb_pixelcost.h"
 #include "r_drawsurf.h"
+#include "r_dvars.h"
 
 
 int __cdecl R_SetupMaterial(
@@ -18,6 +19,15 @@ int __cdecl R_SetupMaterial(
 
     surfType = drawSurf.fields.surfType;
     baseTechType = info->baseTechType;
+    if (baseTechType == TECHNIQUE_LIT_BEGIN)
+    {
+        static unsigned s_litDbg = 0;
+        if (s_litDbg < 24u)
+        {
+            ++s_litDbg;
+            
+        }
+    }
     if (baseTechType > TECHNIQUE_BUILD_FLOAT_Z)
     {
         if (baseTechType == TECHNIQUE_LIT_BEGIN)
@@ -107,6 +117,16 @@ int __cdecl R_SetMaterial(GfxCmdBufContext context, GfxDrawSurf drawSurf, Materi
 
     if ((technique->flags & MTL_TECHFLAG_NEEDS_RESOLVED_POST_SUN) != 0 && !rg.distortion)
         return 0;
+    if ((technique->flags & MTL_TECHFLAG_NEEDS_RESOLVED_POST_SUN) != 0 && !rb_resolvedPostSunValid)
+    {
+        // r_distortionResolveOnDemand skipped the copy this technique samples:
+        // the emissive-list scan (r_scene.cpp) missed it. Loud, once.
+        static bool s_reported;
+        if (!s_reported)
+            Com_Printf(CON_CHANNEL_SYSTEM, "FAIL:RESOLVE_POST_SUN_SKIPPED material=%s technique=%s\n",
+                       material->info.name, technique->name);
+        s_reported = true;
+    }
 
     if ((techType == TECHNIQUE_EMISSIVE || techType == TECHNIQUE_UNLIT)
         && (technique->flags & 0x10) != 0

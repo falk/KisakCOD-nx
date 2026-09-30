@@ -229,8 +229,6 @@ void __cdecl Actor_Grenade_GetTossPositions(
     WeaponDef *weapDef; // r28
     double v8; // fp12
     int v9; // r11
-    int v10; // r10
-    int v11; // r11
     double v12; // fp11
     double v13; // fp0
     // KISAKFIX: v14/v15/v16 vec3 passed as &v14 to G_MissileTrace. Pack into array.
@@ -255,27 +253,16 @@ void __cdecl Actor_Grenade_GetTossPositions(
     else
         v9 = SURF_TYPEINDEX(v18.surfaceFlags);
 
-    v10 = 4 * ((unsigned __int8)v9 + 368);
-    v11 = 4 * ((unsigned __int8)v9 + 397);
-    v12 = (float)((float)(vTargetPos[1] - vFrom[1])
-        * (float)((float)1.0
-            - (float)((float)((float)(*(float *)((char *)&weapDef->szInternalName + v11)
-                - *(float *)((char *)&weapDef->szInternalName + v10))
-                * (float)0.93970001)
-                + *(float *)((char *)&weapDef->szInternalName + v10))));
-    v13 = (float)((float)(vTargetPos[2] - vFrom[2])
-        * (float)((float)1.0
-            - (float)((float)((float)(*(float *)((char *)&weapDef->szInternalName + v11)
-                - *(float *)((char *)&weapDef->szInternalName + v10))
-                * (float)0.93970001)
-                + *(float *)((char *)&weapDef->szInternalName + v10))));
-    *vLand = *vFrom
-        + (float)((float)(*vTargetPos - *vFrom)
-            * (float)((float)1.0
-                - (float)((float)((float)(*(float *)((char *)&weapDef->szInternalName + v11)
-                    - *(float *)((char *)&weapDef->szInternalName + v10))
-                    * (float)0.93970001)
-                    + *(float *)((char *)&weapDef->szInternalName + v10))));
+    // LP64: the decompiled code read these through ILP32 byte offsets from
+    // &weapDef->szInternalName (4 * (surf + 368) / 4 * (surf + 397) are the
+    // 32-bit offsets of parallelBounce[] / perpendicularBounce[]). WeaponDef
+    // holds pointers, so on LP64 those offsets land in unrelated fields.
+    const float parallel = weapDef->parallelBounce[(unsigned __int8)v9];
+    const float perpendicular = weapDef->perpendicularBounce[(unsigned __int8)v9];
+    const float scale = 1.0f - ((perpendicular - parallel) * 0.93970001f + parallel);
+    v12 = (vTargetPos[1] - vFrom[1]) * scale;
+    v13 = (vTargetPos[2] - vFrom[2]) * scale;
+    *vLand = *vFrom + (*vTargetPos - *vFrom) * scale;
     vLand[1] = vFrom[1] + (float)v12;
     vLand[2] = vFrom[2] + (float)v13;
 }
@@ -286,8 +273,8 @@ int __cdecl Actor_Grenade_GetTossPositionsFromHints(
     const unsigned int method,
     float *vLand)
 {
-    long double v7; // fp2
-    long double v8; // fp2
+    double v7; // fp2
+    double v8; // fp2
     double v9; // fp29
     int v10; // r26
     unsigned int v11; // r30

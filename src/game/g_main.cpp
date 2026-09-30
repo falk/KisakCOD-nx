@@ -27,10 +27,27 @@
 #include "actor_grenade.h"
 #include "actor_corpse.h"
 #include <universal/profile.h>
+#include <port/switch_perf.h>
+#include <qcommon/threads.h>
+// The server can run on its own thread with sv_smp 1.  The flat profiler is
+// main-thread-only; ignore that path instead of racing its frame accumulators.
 #include <qcommon/cmd.h>
 #include <client/client.h>
 #include <qcommon/qcommon.h>
 #include <server/sv_world.h>
+
+// KILLHOUSE/SMC diagnostic markers: high-volume per-frame tracing kept for the
+// verifiers, gated off by default so a hardware run does not pay a syscall per
+// line. See com_diagMarkers in switch_diag_dvars.cpp.
+static inline bool Killhouse_DiagMarkers()
+{
+    extern const dvar_t *com_diagMarkers;
+    return com_diagMarkers && com_diagMarkers->current.enabled;
+}
+
+// Frame number the last savegame load ended on, for G_RunFrame's one-shot
+// "the level is running again" marker; -1 when no load is pending.
+static int g_postLoadFrame = -1;
 
 const char *g_helicopterYawAltitudeControlsNames[4] =
 {
@@ -875,13 +892,15 @@ void *__cdecl Hunk_AllocActorXAnimServer(int size)
     return Hunk_AllocLow(size, "Hunk_AllocActorXAnimServer", 5);
 }
 
+// Same com_diagMarkers gate as Killhouse_DiagMarkers() above; reuse the
+// cached pointer instead of a second Dvar_FindVar lookup.
+
 void G_LoadAnimTreeInstances()
 {
     int v0; // r31
     XAnimTree_s **actorXAnimTrees; // r30
     XAnim_s *anims; // r29
     int v3; // r30
-    int *p_entnum; // r31
     int v5; // r31
     XAnimTree_s **actorXAnimClientTrees; // r30
     void *result; // r3
@@ -889,6 +908,8 @@ void G_LoadAnimTreeInstances()
     v0 = 32;
     actorXAnimTrees = g_scr_data.actorXAnimTrees;
     anims = g_scr_data.generic_human.tree.anims;
+    if (Killhouse_DiagMarkers())
+        Com_Printf(0, "KISAK_SAVE_STAGE animinstances anims=%p\n", (void *)anims);
     do
     {
         --v0;
@@ -966,6 +987,9 @@ void G_FreeAnimTreeInstances()
 
 void __cdecl G_ClearLowHunk()
 {
+    if (Killhouse_DiagMarkers())
+        Com_Printf(0, "KISAK_SAVE_STAGE clearlowhunk loading=%i program=%p\n",
+                   level.loading, (void *)scrVarPub.programBuffer);
     if (level.loading == LOADING_SAVEGAME)
         XAnimDisableLeakCheck();
     else
@@ -976,6 +1000,9 @@ void __cdecl G_ClearLowHunk()
     Com_FreeWeaponInfoMemory(1);
     Hunk_ClearToMarkLow(0);
     Hunk_ResetDebugMem();
+    if (Killhouse_DiagMarkers())
+        Com_Printf(0, "KISAK_SAVE_STAGE clearlowhunk=done program=%p\n",
+                   (void *)scrVarPub.programBuffer);
 }
 
 bool __cdecl G_DemoPlaying()
@@ -1006,12 +1033,18 @@ void GScr_LoadScriptsAndAnims()
     GScr_LoadScripts(mapname, &functions);
     functions.maxSize = functions.count;
     functions.count = 0;
+    // Diagnostic markers scoping which script phase runs.
+    Com_Printf(0, "SCRIPT_PROBE setscripts begin\n");
     GScr_SetScripts(&functions);
+    Com_Printf(0, "SCRIPT_PROBE setscripts end\n");
 
     if (functions.maxSize != functions.count)
         Com_Error(ERR_DROP, "Script function count mismatch");
 
+    // Diagnostic markers scoping which script phase runs.
+    Com_Printf(0, "SCRIPT_PROBE animtrees begin\n");
     G_LoadAnimTreeInstances();
+    Com_Printf(0, "SCRIPT_PROBE animtrees end\n");
 }
 
 void ScriptIOFilesInit()
@@ -1045,7 +1078,7 @@ void __cdecl G_PrintFastFileErrors(const char *fastfile)
     if (rawfile->len)
     {
         Com_PrintError(CON_CHANNEL_ERROR, "There were errors when building fast file '%s'\n", fastfile);
-        Com_PrintError(CON_CHANNEL_ERROR, rawfile->buffer);
+        Com_PrintError(CON_CHANNEL_ERROR, "%s", rawfile->buffer); // the build log is data, not a format string
     }
 }
 
@@ -1158,7 +1191,10 @@ void __cdecl G_InitGame(
     else
     {
         memset(&g_scr_data, 0, sizeof(g_scr_data));
-        actorBackup = (actorBackup_s *)Hunk_AllocLow(380, "actorBackup", 5);
+        // LP64: the 380-byte literal was the ILP32 sizeof(actorBackup_s); its
+        // actor_physics_t/ai_orient_t members widen here, so the following
+        // memset(actorBackup, 0, sizeof(actorBackup_s)) overran the hunk.
+        actorBackup = (actorBackup_s *)Hunk_AllocLow(sizeof(actorBackup_s), "actorBackup", 5);
         g_scr_data.actorBackup = actorBackup;
     }
     memset(actorBackup, 0, sizeof(actorBackup_s));
@@ -1203,13 +1239,10 @@ void __cdecl G_InitGame(
     if (level.maxclients > 0)
     {
         v22 = level.clients;
-        p_client = &g_entities[0].client;
-        do
+        for (int clientIndex = 0; clientIndex < level.maxclients; ++clientIndex)
         {
-            --maxclients;
-            *p_client = v22++;
-            p_client += 157;
-        } while (maxclients);
+            g_entities[clientIndex].client = v22++;
+        }
     }
     level.num_entities = 1;
     level.firstFreeEnt = 0;
@@ -1611,6 +1644,8 @@ LABEL_5:
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\game\\g_main.cpp", 2202, 0, "%s", "save");
     SV_ClearPendingSaves();
     G_LoadGame(checksum, save);
+    if (Killhouse_DiagMarkers())
+        Com_Printf(0, "KISAK_SAVE_STAGE checkloadgame=loadgame=done\n");
 LABEL_8:
     SV_GameSendServerCommand(-1, "snd_fade 1 0");
     SV_GameSendServerCommand(-1, "scr_fade 0 0 0");
@@ -1620,6 +1655,9 @@ LABEL_8:
     level.absoluteReloadDelayTime = 0;
     Dvar_SetInt(g_reloading, 0);
     level.loading = LOADING_DONE;
+    g_postLoadFrame = level.framenum;
+    if (Killhouse_DiagMarkers())
+        Com_Printf(0, "KISAK_SAVE_STAGE checkloadgame=done frame=%d\n", level.framenum);
 }
 
 void __cdecl G_XAnimUpdateEnt(gentity_s *ent)
@@ -1832,6 +1870,9 @@ void __cdecl G_RunPreFrame()
     level.previousTime = level.time;
     ++level.framenum;
     level.time += 50;
+    // Retail PC SV_PreFrame (0x5c7e30, G_RunPreFrame inlined) restarts
+    // G_RunFrame's stage machine for the new server frame.
+    level.runFrameStage = 0;
 }
 
 int __cdecl G_GetFramePos()
@@ -1929,6 +1970,7 @@ void __cdecl G_SendClientMessages()
     int v33; // r11
     int v34; // r11
 
+    
     level.snapTime = level.time;
     memset(level.specialIndex, 255, sizeof(level.specialIndex));
     AimTarget_UpdateClientTargets();
@@ -1976,73 +2018,24 @@ void __cdecl G_SendClientMessages()
         ++cgData_actorProneInfo;
         ++v0;
         ++v1;
-    } while ((int)cgData_actorProneInfo < (int)&level.cgData_actorProneInfo[32]);
-    v10 = 33;
-    v11 = &level.cgData_actorProneInfo[33];
-    p_entnum = &g_scr_data.actorCorpseInfo[0].entnum;
-    v13 = 4;
-    do
+    } while ((uintptr_t)cgData_actorProneInfo < (uintptr_t)&level.cgData_actorProneInfo[32]); // LP64: full-width compare
+    
+    // KISAKFIX (LP64): the reference loop walked actorCorpseInfo with raw
+    // `int *` arithmetic (`p_entnum[8]`, `p_entnum += 32`) that encodes only
+    // the ILP32 32-byte corpseInfo_t stride. On LP64 the stride is
+    // sizeof(corpseInfo_t) (40 bytes), so those offsets read the tree/prone
+    // fields of the wrong corpse and fed garbage entity numbers into
+    // level.specialIndex[], writing far outside the array. Index the array
+    // directly so the stride is the real struct size on every ABI.
+    for (v13 = 0; v13 < 16; ++v13)
     {
-        if (*p_entnum >= 0)
+        if (g_scr_data.actorCorpseInfo[v13].entnum >= 0)
         {
-            v14 = p_entnum + 1;
-            v15 = v11 - 1;
-            level.specialIndex[*p_entnum] = v10 - 1;
-            v16 = 6;
-            do
-            {
-                *(unsigned int *)&v15->bCorpseOrientation = *v14++;
-                v15 = (actor_prone_info_s *)((char *)v15 + 4);
-                --v16;
-            } while (v16);
+            level.specialIndex[g_scr_data.actorCorpseInfo[v13].entnum] = (unsigned __int8)(32 + v13);
+            level.cgData_actorProneInfo[32 + v13] = g_scr_data.actorCorpseInfo[v13].proneInfo;
         }
-        v17 = p_entnum[8];
-        if (v17 >= 0)
-        {
-            v18 = p_entnum + 9;
-            v19 = v11;
-            level.specialIndex[v17] = v10;
-            v20 = 6;
-            do
-            {
-                *(unsigned int *)&v19->bCorpseOrientation = *v18++;
-                v19 = (actor_prone_info_s *)((char *)v19 + 4);
-                --v20;
-            } while (v20);
-        }
-        v21 = p_entnum[16];
-        if (v21 >= 0)
-        {
-            v22 = p_entnum + 17;
-            v23 = v11 + 1;
-            level.specialIndex[v21] = v10 + 1;
-            v24 = 6;
-            do
-            {
-                *(unsigned int *)&v23->bCorpseOrientation = *v22++;
-                v23 = (actor_prone_info_s *)((char *)v23 + 4);
-                --v24;
-            } while (v24);
-        }
-        v25 = p_entnum[24];
-        if (v25 >= 0)
-        {
-            v26 = p_entnum + 25;
-            v27 = v11 + 2;
-            level.specialIndex[v25] = v10 + 2;
-            v28 = 6;
-            do
-            {
-                *(unsigned int *)&v27->bCorpseOrientation = *v26++;
-                v27 = (actor_prone_info_s *)((char *)v27 + 4);
-                --v28;
-            } while (v28);
-        }
-        --v13;
-        v10 += 4;
-        p_entnum += 32;
-        v11 += 4;
-    } while (v13);
+    }
+    
     v29 = 2;
     v30 = 0;
     do
@@ -2062,8 +2055,10 @@ void __cdecl G_SendClientMessages()
         v29 += 4;
         v30 += 4;
     } while (v29 - 2 < 64);
+    
     if (level.bRegisterItems)
         SaveRegisteredItems();
+    
 }
 
 void __cdecl G_ArchiveSpecialEntityInfo(const entityState_s *es, MemoryFile *memFile)
@@ -2290,8 +2285,31 @@ void __cdecl ShowEntityInfo()
     }
 }
 
+// Retail PC G_RunFrame (iw3sp 0x4ba810) is a resumable stage machine.  With
+// SV_FRAME_DO_SMOOTHING it compares the low 32 bits of the time-stamp counter
+// against timeCap (an absolute counter value) after every stage and after
+// every entity of the per-entity stages, and returns 0 when the cap is
+// reached; the next call resumes at level.runFrameStage.  SV_FRAME_DO_ALL
+// never stops.  0x4ba6c0 is the stage-advance helper below.
+static bool G_RunFrameTimeUp(ServerFrameExtent extent, int timeCap)
+{
+    return extent != SV_FRAME_DO_ALL && (int32_t)((uint32_t)__rdtsc() - (uint32_t)timeCap) >= 0;
+}
+
+static bool G_RunFrameNextStage(ServerFrameExtent extent, int timeCap)
+{
+    ++level.runFrameStage;
+    return G_RunFrameTimeUp(extent, timeCap);
+}
+
+// Returns 1 when the frame is complete: for SV_FRAME_DO_ALL the whole frame,
+// for SV_FRAME_DO_SMOOTHING every stage before the end-of-frame client/corpse
+// updates (retail runs those only in the SV_FRAME_DO_ALL call that finishes
+// the frame from SV_WaitServer).  Returns 0 when a smoothing call ran out of
+// time.
 int __cdecl G_RunFrame(ServerFrameExtent extent, int timeCap)
 {
+    SWITCH_PERF_SCOPE_IF(SWITCH_PERF_GAME_TOTAL, Sys_IsMainThread());
     int currentIndex; // r5
     int num_entities; // r11
     gentity_s *i; // r30
@@ -2332,10 +2350,31 @@ int __cdecl G_RunFrame(ServerFrameExtent extent, int timeCap)
     unsigned __int16 *p_classname; // r31
     const char *v41; // r3
 
-    iassert(extent == SV_FRAME_DO_ALL);
-    iassert(!timeCap);
+    iassert(extent == SV_FRAME_DO_ALL || extent == SV_FRAME_DO_SMOOTHING);
+    iassert(extent != SV_FRAME_DO_ALL || !timeCap);
+
+    if (!level.runFrameStage)
+        level.runFrameStage = 1;
+
+    if (level.runFrameStage == 1)
+    {
+    // One-shot marker for the first game frame after a savegame load: the load
+    // path's own markers end inside G_LoadGame, so this is what says the guest
+    // came back out of it and the level is running again.
+    if (g_postLoadFrame >= 0 && level.framenum != g_postLoadFrame)
+    {
+        g_postLoadFrame = -1;
+        if (Killhouse_DiagMarkers())
+            Com_Printf(0, "KISAK_SAVE_STAGE postload=firstframe frame=%d time=%d\n",
+                       level.framenum, level.time);
+    }
+
+    if (Killhouse_DiagMarkers())
+        Com_Printf(0, "KILLHOUSE_GRF enter frame=%d time=%d ents=%d\n", level.framenum, level.time,
+               level.num_entities);
 
     {
+        SWITCH_PERF_SCOPE_IF(SWITCH_PERF_GAME_PLAYER_PRE, Sys_IsMainThread());
         PROF_SCOPED("update player");
         G_UpdatePlayer(level.gentities);
         G_UpdatePlayerTriggers(level.gentities);
@@ -2343,7 +2382,15 @@ int __cdecl G_RunFrame(ServerFrameExtent extent, int timeCap)
         iassert(!level.actorPredictDepth);
         level.currentIndex = 1;
     }
+    if (Killhouse_DiagMarkers())
+        Com_Printf(0, "KILLHOUSE_GRF after-update-player\n");
+    if (G_RunFrameNextStage(extent, timeCap))
+        return 0;
+    }
+    if (level.runFrameStage == 2)
     {
+    {
+        SWITCH_PERF_SCOPE_IF(SWITCH_PERF_GAME_ANIM_INIT, Sys_IsMainThread());
         PROF_SCOPED("update anim1");
         currentIndex = level.currentIndex;
         num_entities = level.num_entities;
@@ -2358,7 +2405,7 @@ int __cdecl G_RunFrame(ServerFrameExtent extent, int timeCap)
                         "s.number = %i, level.currentIndex = %i, classname = %s",
                         number,
                         currentIndex,
-                        (const char *)i->classname);
+                        SL_ConvertToString(i->classname));
                     MyAssertHandler(
                         "c:\\trees\\cod3\\cod3src\\src\\game\\g_main.cpp",
                         2643,
@@ -2370,6 +2417,8 @@ int __cdecl G_RunFrame(ServerFrameExtent extent, int timeCap)
                 SV_DObjInitServerTime(i, 0.05f);
                 currentIndex = ++level.currentIndex;
                 num_entities = level.num_entities;
+                if (G_RunFrameTimeUp(extent, timeCap))
+                    return 0;
             }
             else
             {
@@ -2378,20 +2427,40 @@ int __cdecl G_RunFrame(ServerFrameExtent extent, int timeCap)
         }
     }
     {
-        PROF_SCOPED("script threads1");
+        SWITCH_PERF_SCOPE_IF(SWITCH_PERF_GAME_SCRIPT_PRE, Sys_IsMainThread());
         memset(level.entTriggerIndex, 0, sizeof(level.entTriggerIndex));
         level.triggerIndex = 0;
         iassert(level.currentTriggerListSize == 0);
         Com_Memcpy(level.currentTriggerList, level.pendingTriggerList, 12 * level.pendingTriggerListSize);
         level.currentTriggerListSize = level.pendingTriggerListSize;
         level.pendingTriggerListSize = 0;
-        do
+    }
+    if (G_RunFrameNextStage(extent, timeCap))
+        return 0;
+    }
+    if (level.runFrameStage == 3)
+    {
+    {
+        SWITCH_PERF_SCOPE_IF(SWITCH_PERF_GAME_SCRIPT_PRE, Sys_IsMainThread());
+        PROF_SCOPED("script threads1");
+        if (Killhouse_DiagMarkers())
+            Com_Printf(0, "KILLHOUSE_GRF script1-enter triggers=%d\n", level.currentTriggerListSize);
+        // Retail checks the cap only between NotifyTriggers passes, never
+        // before the first one, so a resumed stage always makes progress.
+        v8 = NotifyTriggers();
+        G_ProcessCommandNotifies();
+        Scr_RunCurrentThreads();
+        while (v8)
         {
+            if (G_RunFrameTimeUp(extent, timeCap))
+                return 0;
             v8 = NotifyTriggers();
             G_ProcessCommandNotifies();
             Scr_RunCurrentThreads();
-        } while (v8);
+        }
         iassert(level.currentTriggerListSize == 0);
+        if (Killhouse_DiagMarkers())
+            Com_Printf(0, "KILLHOUSE_GRF script1-done\n");
         v9 = g_entities;
         v10 = 0;
         level.currentIndex = 1;
@@ -2406,8 +2475,16 @@ int __cdecl G_RunFrame(ServerFrameExtent extent, int timeCap)
             ++v10;
         }
     }
+    if (G_RunFrameNextStage(extent, timeCap))
+        return 0;
+    }
+    if (level.runFrameStage == 4)
     {
+    {
+        SWITCH_PERF_SCOPE_IF(SWITCH_PERF_GAME_ANIM_UPDATE, Sys_IsMainThread());
         PROF_SCOPED("update anim2");
+        if (Killhouse_DiagMarkers())
+            Com_Printf(0, "KILLHOUSE_GRF anim2-enter\n");
         v12 = level.currentIndex;
         for (k = &g_entities[level.currentIndex]; v12 < level.num_entities; level.currentIndex = v12)
         {
@@ -2422,6 +2499,8 @@ int __cdecl G_RunFrame(ServerFrameExtent extent, int timeCap)
                     Scr_RunCurrentThreads();
                     inuse = k->r.inuse;
                     level.checkAnimChange = 1;
+                    if (G_RunFrameTimeUp(extent, timeCap))
+                        return 0;
                 } while (inuse);
                 v12 = level.currentIndex;
             }
@@ -2437,47 +2516,72 @@ int __cdecl G_RunFrame(ServerFrameExtent extent, int timeCap)
                 level.checkAnimChange = 0;
                 if (level.num_entities > 1)
                 {
-                    p_inuse = &g_entities[1].r.inuse;
-                    do
+                    for (gentity_s *entity = &g_entities[1];
+                         level.currentIndex < level.num_entities;
+                         ++level.currentIndex, ++entity)
                     {
-                        if (*p_inuse)
+                        if (entity->r.inuse)
                         {
                             do
                             {
-                                v17 = *((unsigned int *)p_inuse + 34);
-                                if ((v17 & 0x40000) == 0 || (v17 & 0x1000) != 0)
+                                if ((entity->flags & 0x40000) == 0 || (entity->flags & 0x1000) != 0)
                                     break;
-                                if (!G_DObjUpdateServerTime((gentity_s *)(p_inuse - 168), 1))
+                                if (!G_DObjUpdateServerTime(entity, 1))
                                 {
                                     checkAnimChange = level.checkAnimChange;
                                     break;
                                 }
                                 Scr_RunCurrentThreads();
                                 checkAnimChange = 1;
-                                v18 = *p_inuse;
                                 level.checkAnimChange = 1;
-                            } while (v18);
+                            } while (entity->r.inuse);
                         }
-                        p_inuse += 628;
-                        ++level.currentIndex;
-                    } while (level.currentIndex < level.num_entities);
+                    }
                 }
             } while (checkAnimChange);
         }
+        if (Killhouse_DiagMarkers())
+            Com_Printf(0, "KILLHOUSE_GRF anim2-done\n");
     }
+    if (G_RunFrameNextStage(extent, timeCap))
+        return 0;
+    }
+    if (level.runFrameStage == 5)
     {
+    {
+        SWITCH_PERF_SCOPE_IF(SWITCH_PERF_GAME_SCRIPT_TIME, Sys_IsMainThread());
         PROF_SCOPED("script threads2");
         if (g_recordScriptPlace->current.enabled || (v19 = 0, g_dumpAnimsCommands->current.integer > 0))
             v19 = 1;
         Scr_SetRecordScriptPlace(v19);
+        if (Killhouse_DiagMarkers())
+            Com_Printf(0, "KILLHOUSE_GRF inctime-enter\n");
         Scr_IncTime();
+        if (Killhouse_DiagMarkers())
+            Com_Printf(0, "KILLHOUSE_GRF inctime-done\n");
         SV_ResetSkeletonCache();
     }
-    {
-        PROF_SCOPED("bad places");
-        Path_RunBadPlaces();
+    if (G_RunFrameNextStage(extent, timeCap))
+        return 0;
     }
+    if (level.runFrameStage == 6)
     {
+    {
+        SWITCH_PERF_SCOPE_IF(SWITCH_PERF_GAME_BADPLACES, Sys_IsMainThread());
+        PROF_SCOPED("bad places");
+        if (Killhouse_DiagMarkers())
+            Com_Printf(0, "KILLHOUSE_GRF badplaces-enter\n");
+        Path_RunBadPlaces();
+        if (Killhouse_DiagMarkers())
+            Com_Printf(0, "KILLHOUSE_GRF badplaces-done\n");
+    }
+    if (G_RunFrameNextStage(extent, timeCap))
+        return 0;
+    }
+    if (level.runFrameStage == 7)
+    {
+    {
+        SWITCH_PERF_SCOPE_IF(SWITCH_PERF_GAME_PLAYER_POST, Sys_IsMainThread());
         PROF_SCOPED("update player");
         G_UpdatePlayer(level.gentities);
         AimTarget_ClearTargetList();
@@ -2491,9 +2595,18 @@ int __cdecl G_RunFrame(ServerFrameExtent extent, int timeCap)
         }
     }
     iassert(level.currentEntityThink == -1);
+    ++level.runFrameStage;
     level.currentEntityThink = 0;
+    if (G_RunFrameTimeUp(extent, timeCap))
+        return 0;
+    }
+    if (level.runFrameStage == 8)
     {
+    {
+        SWITCH_PERF_SCOPE_IF(SWITCH_PERF_GAME_ENTITIES, Sys_IsMainThread());
         PROF_SCOPED("update ents");
+        if (Killhouse_DiagMarkers())
+            Com_Printf(0, "KILLHOUSE_GRF ents-enter num=%d\n", level.num_entities);
         currentEntityThink = level.currentEntityThink;
         v23 = level.num_entities;
         for (m = &g_entities[level.currentEntityThink]; currentEntityThink < v23; ++m)
@@ -2507,7 +2620,7 @@ int __cdecl G_RunFrame(ServerFrameExtent extent, int timeCap)
                         "s.number = %i, level.currentEntityThink = %i, classname = %s",
                         v25,
                         currentEntityThink,
-                        (const char *)m->classname);
+                        SL_ConvertToString(m->classname));
                     MyAssertHandler(
                         "c:\\trees\\cod3\\cod3src\\src\\game\\g_main.cpp",
                         2844,
@@ -2519,6 +2632,11 @@ int __cdecl G_RunFrame(ServerFrameExtent extent, int timeCap)
                 G_RunFrameForEntity(m);
                 currentEntityThink = ++level.currentEntityThink;
                 v23 = level.num_entities;
+                if ((currentEntityThink & 7) == 0)
+                    if (Killhouse_DiagMarkers())
+                        Com_Printf(0, "KILLHOUSE_GRF ent=%d\n", currentEntityThink);
+                if (G_RunFrameTimeUp(extent, timeCap))
+                    return 0;
             }
             else
             {
@@ -2526,12 +2644,27 @@ int __cdecl G_RunFrame(ServerFrameExtent extent, int timeCap)
             }
         }
     }
+    ++level.runFrameStage;
     level.currentEntityThink = -1;
+    if (Killhouse_DiagMarkers())
+        Com_Printf(0, "KILLHOUSE_GRF ents-done\n");
+    if (G_RunFrameTimeUp(extent, timeCap))
+        return 0;
+    }
+    // Retail: a smoothing call stops here; the client/corpse updates below run
+    // only in the SV_FRAME_DO_ALL call that completes the frame.
+    if (extent != SV_FRAME_DO_ALL)
+    {
+        return 1;
+    }
     if (level.actorPredictDepth)
         Com_Error(ERR_DROP, "unmatching beginPrediction and endPrediction");
 
     {
+        SWITCH_PERF_SCOPE_IF(SWITCH_PERF_GAME_CLIENT, Sys_IsMainThread());
         PROF_SCOPED("update client");
+        if (Killhouse_DiagMarkers())
+            Com_Printf(0, "KILLHOUSE_GRF client-enter\n");
 
         for (int i = 0; i < level.maxclients; i++)
         {
@@ -2560,10 +2693,17 @@ int __cdecl G_RunFrame(ServerFrameExtent extent, int timeCap)
         //        p_client += 157;
         //    } while (v28 < maxclients);
         //}
+        if (Killhouse_DiagMarkers())
+            Com_Printf(0, "KILLHOUSE_GRF client-done\n");
     }
     {
+        SWITCH_PERF_SCOPE_IF(SWITCH_PERF_GAME_CORPSES, Sys_IsMainThread());
         PROF_SCOPED("update corpses");
+        if (Killhouse_DiagMarkers())
+            Com_Printf(0, "KILLHOUSE_GRF corpses-enter\n");
         G_UpdateActorCorpses();
+        if (Killhouse_DiagMarkers())
+            Com_Printf(0, "KILLHOUSE_GRF corpses-done\n");
     }
     Path_DrawDebug();
     G_DrawVehiclePaths();
@@ -2585,7 +2725,116 @@ int __cdecl G_RunFrame(ServerFrameExtent extent, int timeCap)
         Actor_DumpEventListners();
         Dvar_SetBool(g_dumpAIEventListeners, 0);
     }
+    if (Killhouse_DiagMarkers())
+        Com_Printf(0, "KILLHOUSE_GRF done frame=%d time=%d\n", level.framenum, level.time);
     return 1;
+}
+
+// P2: the normal production Killhouse load must leave client
+// 0 linked to the authored start. The authored start is chosen by Killhouse's
+// own inside_start() script, which calls the player's `setorigin` method with
+// the inside_start entity's origin. Killhouse then immediately plays its
+// retail flying_intro cinematic (_introscreen.gsc), which moves the player
+// +16000z and links them to a script_model; that is expected mission-start
+// behavior, not the spawn. So the checkpoint records the authored teleport when
+// the real script makes it and then, at the end of G_LoadLevel, proves client 0
+// is linked with the normal capsule and that the recorded origin really is the
+// live inside_start entity. Coordinates are never hardcoded.
+static bool G_KillhouseOriginIsFinite(const float *v)
+{
+    for (int i = 0; i < 3; ++i)
+    {
+        if (!(v[i] == v[i]) || v[i] > 1.0e30f || v[i] < -1.0e30f)
+            return false;
+    }
+    return true;
+}
+
+bool g_p2InsideStartEstablished = false;
+float g_p2InsideStartOrigin[3] = { 0.0f, 0.0f, 0.0f };
+
+void G_P2_RecordInsideStartTeleport(const float *origin)
+{
+    if (!origin || !G_KillhouseOriginIsFinite(origin))
+        return;
+    if (origin[0] == 0.0f && origin[1] == 0.0f && origin[2] == 0.0f)
+        return;
+
+    unsigned __int16 insideName = (unsigned __int16)SL_FindString("inside_start");
+    gentity_s *startEnt = insideName
+        ? G_Find(0, offsetof(gentity_s, targetname), insideName)
+        : NULL;
+    if (!startEnt)
+        return;
+
+    const float dx = origin[0] - startEnt->r.currentOrigin[0];
+    const float dy = origin[1] - startEnt->r.currentOrigin[1];
+    const float dz = origin[2] - startEnt->r.currentOrigin[2];
+    if ((dx * dx + dy * dy) < (64.0f * 64.0f) && dz < 128.0f && dz > -128.0f)
+    {
+        g_p2InsideStartEstablished = true;
+        g_p2InsideStartOrigin[0] = origin[0];
+        g_p2InsideStartOrigin[1] = origin[1];
+        g_p2InsideStartOrigin[2] = origin[2];
+    }
+}
+
+static void G_KillhousePlayerSpawnCheckpoint()
+{
+    const char *mapName = Dvar_GetString("mapname");
+    if (!mapName || I_stricmp(mapName, "killhouse") != 0)
+        return;
+
+    gentity_s *ent = &level.gentities[0];
+    gclient_s *client = ent->client;
+    const bool linked = client != NULL && client == &level.clients[0] &&
+                        ent->r.inuse && client->ps.clientNum == 0;
+    const bool capsule = ent->r.mins[0] == -15.0f && ent->r.mins[1] == -15.0f &&
+                         ent->r.mins[2] == 0.0f && ent->r.maxs[0] == 15.0f &&
+                         ent->r.maxs[1] == 15.0f && ent->r.maxs[2] == 70.0f;
+    const bool ground = ent->s.groundEntityNum != ENTITYNUM_NONE;
+
+    unsigned __int16 insideName = (unsigned __int16)SL_FindString("inside_start");
+    gentity_s *startEnt = insideName
+        ? G_Find(0, offsetof(gentity_s, targetname), insideName)
+        : NULL;
+
+    const float *recorded = g_p2InsideStartEstablished
+        ? g_p2InsideStartOrigin
+        : (client ? client->ps.origin : vec3_origin);
+    const bool originLegal = G_KillhouseOriginIsFinite(recorded) &&
+                             (recorded[0] != 0.0f || recorded[1] != 0.0f || recorded[2] != 0.0f);
+    bool scriptStart = false;
+    if (startEnt && g_p2InsideStartEstablished && originLegal)
+    {
+        const float dx = recorded[0] - startEnt->r.currentOrigin[0];
+        const float dy = recorded[1] - startEnt->r.currentOrigin[1];
+        const float dz = recorded[2] - startEnt->r.currentOrigin[2];
+        scriptStart = (dx * dx + dy * dy) < (64.0f * 64.0f) && dz < 128.0f && dz > -128.0f;
+    }
+
+    if (linked && scriptStart && capsule && originLegal)
+    {
+        
+        return;
+    }
+
+    Com_Printf(0,
+               "FAIL: map=%s linked=%d script_start=%d capsule=%d "
+               "ground=%d origin_legal=%d established=%d start_ent=%d "
+               "recorded=(%g %g %g) live_origin=(%g %g %g) start_origin=(%g %g %g) "
+               "ground_ent=%d\n",
+               mapName, linked ? 1 : 0, scriptStart ? 1 : 0, capsule ? 1 : 0,
+               ground ? 1 : 0, originLegal ? 1 : 0, g_p2InsideStartEstablished ? 1 : 0,
+               startEnt ? 1 : 0,
+               recorded[0], recorded[1], recorded[2],
+               client ? client->ps.origin[0] : 0.0f,
+               client ? client->ps.origin[1] : 0.0f,
+               client ? client->ps.origin[2] : 0.0f,
+               startEnt ? startEnt->r.currentOrigin[0] : 0.0f,
+               startEnt ? startEnt->r.currentOrigin[1] : 0.0f,
+               startEnt ? startEnt->r.currentOrigin[2] : 0.0f,
+               ent->s.groundEntityNum);
 }
 
 void __cdecl G_LoadLevel()
@@ -2639,6 +2888,8 @@ void __cdecl G_LoadLevel()
         Scr_SetLoading(0);
     }
 
+    G_KillhousePlayerSpawnCheckpoint();
+
     iassert(level.gentities[0].client);
     level.initializing = 0;
 
@@ -2646,5 +2897,5 @@ void __cdecl G_LoadLevel()
         PROF_SCOPED("G_SendClientMessages");
         G_SendClientMessages();
     }
+    
 }
-

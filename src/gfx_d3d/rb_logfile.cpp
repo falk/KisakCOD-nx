@@ -30,7 +30,7 @@ void RB_CloseLogFile()
 void RB_OpenLogFile()
 {
     const char *v0; // eax
-    __int64 aclock; // [esp+0h] [ebp-10h] BYREF
+    time_t aclock; // [esp+0h] [ebp-10h] BYREF
     tm *newtime; // [esp+Ch] [ebp-4h]
 
     if (!r_logFileGlob.fp)

@@ -151,7 +151,7 @@ uint32_t __cdecl R_AddPotentiallyShadowedLight(
     {
         score = R_ShadowedSpotLightScore(&viewInfo->viewParms, &viewInfo->shadowableLights[shadowableLightIndex]);
         for (insertIndex = candidateLightCount;
-            insertIndex && candidateLights[insertIndex - 1].score < (double)score;
+            insertIndex && candidateLights[insertIndex - 1].score < score;
             --insertIndex)
         {
             v5 = candidateLights[insertIndex - 1].score;
@@ -313,7 +313,7 @@ void __cdecl R_LinkSphereEntityToPrimaryLights(
         Vec3Sub(origin, light->origin, diff);
         v5 = Vec3LengthSq(diff);
         v4 = (light->radius + radius) * (light->radius + radius);
-        if (v5 < (double)v4
+        if (v5 < v4
             && (light->type != GFX_LIGHT_TYPE_SPOT
                 || light->cosHalfFovExpanded < 0.0
                 || !CullSphereFromCone(light->origin, light->dir, light->cosHalfFovExpanded, origin, radius)))
@@ -487,39 +487,39 @@ char __cdecl R_CullBoxFromLightRegionHull(
     v30 = midPointOnAxis - hull->kdopMidPoint[3];
     v20 = I_fabs(v30);
     v19 = halfSizeOnAxis + hull->kdopHalfSize[3];
-    if (v20 >= (double)v19)
+    if (v20 >= v19)
         return 1;
     midPointOnAxisa = *boxMidPoint - boxMidPoint[1];
     v29 = midPointOnAxisa - hull->kdopMidPoint[4];
     v18 = I_fabs(v29);
     v17 = halfSizeOnAxis + hull->kdopHalfSize[4];
-    if (v18 >= (double)v17)
+    if (v18 >= v17)
         return 1;
     halfSizeOnAxisa = *boxHalfSize + boxHalfSize[2];
     midPointOnAxisb = *boxMidPoint + boxMidPoint[2];
     v28 = midPointOnAxisb - hull->kdopMidPoint[5];
     v16 = I_fabs(v28);
     v15 = halfSizeOnAxisa + hull->kdopHalfSize[5];
-    if (v16 >= (double)v15)
+    if (v16 >= v15)
         return 1;
     midPointOnAxisc = *boxMidPoint - boxMidPoint[2];
     v27 = midPointOnAxisc - hull->kdopMidPoint[6];
     v14 = I_fabs(v27);
     v13 = halfSizeOnAxisa + hull->kdopHalfSize[6];
-    if (v14 >= (double)v13)
+    if (v14 >= v13)
         return 1;
     halfSizeOnAxisb = boxHalfSize[1] + boxHalfSize[2];
     midPointOnAxisd = boxMidPoint[1] + boxMidPoint[2];
     v26 = midPointOnAxisd - hull->kdopMidPoint[7];
     v12 = I_fabs(v26);
     v11 = halfSizeOnAxisb + hull->kdopHalfSize[7];
-    if (v12 >= (double)v11)
+    if (v12 >= v11)
         return 1;
     midPointOnAxise = boxMidPoint[1] - boxMidPoint[2];
     v25 = midPointOnAxise - hull->kdopMidPoint[8];
     v10 = I_fabs(v25);
     v9 = halfSizeOnAxisb + hull->kdopHalfSize[8];
-    if (v10 >= (double)v9)
+    if (v10 >= v9)
         return 1;
     for (axisIter = 0; axisIter < hull->axisCount; ++axisIter)
     {
@@ -532,7 +532,7 @@ char __cdecl R_CullBoxFromLightRegionHull(
         v24 = midPointOnAxisf - dir->midPoint;
         v5 = I_fabs(v24);
         v4 = halfSizeOnAxisc + dir->halfSize;
-        if (v5 >= (double)v4)
+        if (v5 >= v4)
             return 1;
     }
     return 0;
@@ -602,7 +602,7 @@ void __cdecl R_LinkDynEntToPrimaryLights(
                 Com_BitSetAssert(rgp.world->primaryLightDynEntShadowVis[drawType], bitIndex, 0xFFFFFFF);
                 Vec3Sub(boxMidPoint, light->origin, v);
                 distSq = Vec3LengthSq(v);
-                if (minDistSq > (double)distSq)
+                if (minDistSq > distSq)
                 {
                     bestPrimaryLightIndex = primaryLightIndex;
                     minDistSq = distSq;
@@ -710,6 +710,8 @@ bool __cdecl R_IsDynEntVisibleToPrimaryLight(
 {
     uint32_t bitIndex; // [esp+Ch] [ebp-4h]
 
+    if (!rgp.world || !rgp.world->primaryLightDynEntShadowVis[drawType])
+        return false;
     bitIndex = R_GetPrimaryLightDynEntShadowBit(dynEntId, primaryLightIndex);
     return Com_BitCheckAssert(rgp.world->primaryLightDynEntShadowVis[drawType], bitIndex, 0xFFFFFFF);
 }
@@ -721,10 +723,10 @@ int __cdecl R_IsEntityVisibleToAnyShadowedPrimaryLight(const GfxViewInfo *viewIn
     uint32_t ignoredPrimaryLightCount; // [esp+8h] [ebp-8h]
     uint32_t spotShadowIndex; // [esp+Ch] [ebp-4h]
 
+    if (!rgp.world || !rgp.world->primaryLightEntityShadowVis)
+        return 0;
     ignoredPrimaryLightCount = rgp.world->sunPrimaryLightIndex + 1;
     relevantPrimaryLightCount = rgp.world->primaryLightCount - ignoredPrimaryLightCount;
-    baseBitIndex = relevantPrimaryLightCount * (entityNum + gfxCfg.entCount * viewInfo->localClientNum)
-        - ignoredPrimaryLightCount;
     if (relevantPrimaryLightCount + 1 < viewInfo->spotShadowCount)
         MyAssertHandler(
             ".\\r_primarylights.cpp",
@@ -733,6 +735,8 @@ int __cdecl R_IsEntityVisibleToAnyShadowedPrimaryLight(const GfxViewInfo *viewIn
             "relevantPrimaryLightCount + GFX_MAX_EMISSIVE_SPOT_LIGHTS >= viewInfo->spotShadowCount\n\t%i, %i",
             relevantPrimaryLightCount + 1,
             viewInfo->spotShadowCount);
+    baseBitIndex = relevantPrimaryLightCount * (entityNum + gfxCfg.entCount * viewInfo->localClientNum)
+        - ignoredPrimaryLightCount;
     for (spotShadowIndex = 0; spotShadowIndex < viewInfo->spotShadowCount; ++spotShadowIndex)
     {
         if (R_IsEntityVisibleToShadowedPrimaryLight(
@@ -748,6 +752,8 @@ int __cdecl R_IsEntityVisibleToAnyShadowedPrimaryLight(const GfxViewInfo *viewIn
 bool __cdecl R_IsEntityVisibleToShadowedPrimaryLight(uint32_t baseBitIndex, uint32_t shadowableLightIndex)
 {
     return R_IsPrimaryLight(shadowableLightIndex)
+        && rgp.world
+        && rgp.world->primaryLightEntityShadowVis
         && Com_BitCheckAssert(rgp.world->primaryLightEntityShadowVis, shadowableLightIndex + baseBitIndex, 0xFFFFFFF);
 }
 
@@ -760,6 +766,8 @@ int __cdecl R_IsDynEntVisibleToAnyShadowedPrimaryLight(
     uint32_t ignoredPrimaryLightCount; // [esp+8h] [ebp-8h]
     uint32_t spotShadowIndex; // [esp+Ch] [ebp-4h]
 
+    if (!rgp.world || !rgp.world->primaryLightDynEntShadowVis[drawType])
+        return 0;
     ignoredPrimaryLightCount = rgp.world->sunPrimaryLightIndex + 1;
     relevantPrimaryLightCount = rgp.world->primaryLightCount - ignoredPrimaryLightCount;
     if (relevantPrimaryLightCount + 1 < viewInfo->spotShadowCount)
@@ -789,6 +797,8 @@ bool __cdecl R_IsDynEntVisibleToShadowedPrimaryLight(
     uint32_t shadowableLightIndex)
 {
     return R_IsPrimaryLight(shadowableLightIndex)
+        && rgp.world
+        && rgp.world->primaryLightDynEntShadowVis[drawType]
         && Com_BitCheckAssert(
             rgp.world->primaryLightDynEntShadowVis[drawType],
             shadowableLightIndex + baseBitIndex,
@@ -835,7 +845,18 @@ uint32_t __cdecl R_GetNonSunPrimaryLightForBox(
             }
         LABEL_17:
             if (!v4)
+            {
+                if (light->type != GFX_LIGHT_TYPE_SPOT && light->type != GFX_LIGHT_TYPE_OMNI)
+                {
+                    static int s_lightPickDbg = 0;
+                    if (s_lightPickDbg < 16)
+                    {
+                        ++s_lightPickDbg;
+                        
+                    }
+                }
                 return primaryLightIndex;
+            }
         }
     }
     return 0;
@@ -935,53 +956,53 @@ char __cdecl R_CullSphereFromLightRegionHull(const GfxLightRegionHull *hull, con
     v33 = *origin - hull->kdopMidPoint[0];
     v23 = I_fabs(v33);
     v22 = radius + hull->kdopHalfSize[0];
-    if (v23 >= (double)v22)
+    if (v23 >= v22)
         return 1;
     v32 = origin[1] - hull->kdopMidPoint[1];
     v21 = I_fabs(v32);
     v20 = radius + hull->kdopHalfSize[1];
-    if (v21 >= (double)v20)
+    if (v21 >= v20)
         return 1;
     v31 = origin[2] - hull->kdopMidPoint[2];
     v19 = I_fabs(v31);
     v18 = radius + hull->kdopHalfSize[2];
-    if (v19 >= (double)v18)
+    if (v19 >= v18)
         return 1;
     originOnAxis = *origin + origin[1];
     v30 = originOnAxis - hull->kdopMidPoint[3];
     v17 = I_fabs(v30);
     v16 = radius + hull->kdopHalfSize[3];
-    if (v17 >= (double)v16)
+    if (v17 >= v16)
         return 1;
     originOnAxisa = *origin - origin[1];
     v29 = originOnAxisa - hull->kdopMidPoint[4];
     v15 = I_fabs(v29);
     v14 = radius + hull->kdopHalfSize[4];
-    if (v15 >= (double)v14)
+    if (v15 >= v14)
         return 1;
     originOnAxisb = *origin + origin[2];
     v28 = originOnAxisb - hull->kdopMidPoint[5];
     v13 = I_fabs(v28);
     v12 = radius + hull->kdopHalfSize[5];
-    if (v13 >= (double)v12)
+    if (v13 >= v12)
         return 1;
     originOnAxisc = *origin - origin[2];
     v27 = originOnAxisc - hull->kdopMidPoint[6];
     v11 = I_fabs(v27);
     v10 = radius + hull->kdopHalfSize[6];
-    if (v11 >= (double)v10)
+    if (v11 >= v10)
         return 1;
     originOnAxisd = origin[1] + origin[2];
     v26 = originOnAxisd - hull->kdopMidPoint[7];
     v9 = I_fabs(v26);
     v8 = radius + hull->kdopHalfSize[7];
-    if (v9 >= (double)v8)
+    if (v9 >= v8)
         return 1;
     originOnAxise = origin[1] - origin[2];
     v25 = originOnAxise - hull->kdopMidPoint[8];
     v7 = I_fabs(v25);
     v6 = radius + hull->kdopHalfSize[8];
-    if (v7 >= (double)v6)
+    if (v7 >= v6)
         return 1;
     for (axisIter = 0; axisIter < hull->axisCount; ++axisIter)
     {
@@ -991,7 +1012,7 @@ char __cdecl R_CullSphereFromLightRegionHull(const GfxLightRegionHull *hull, con
         v24 = originOnAxisf - hull->axis[axisIter].midPoint;
         v5 = I_fabs(v24);
         v4 = radius + hull->axis[axisIter].halfSize;
-        if (v5 >= (double)v4)
+        if (v5 >= v4)
             return 1;
     }
     return 0;

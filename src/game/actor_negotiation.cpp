@@ -69,8 +69,9 @@ actor_think_result_t __cdecl Actor_Negotiation_Think(actor_s *pSelf)
     }
     else
     {
-        HasNegotiationNode = (pathnode_t *)Path_HasNegotiationNode(&pSelf->Path);
-        if ((_BYTE)HasNegotiationNode)
+        // LP64: Path_HasNegotiationNode returns bool; test it directly
+        // instead of through a pointer slot's low byte.
+        if (Path_HasNegotiationNode(&pSelf->Path))
         {
             if (pSelf->Path.wNegotiationStartNode >= pSelf->Path.wPathLen)
                 MyAssertHandler(

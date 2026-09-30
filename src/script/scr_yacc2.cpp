@@ -1282,7 +1282,31 @@ yynewstate:
 			switch (yyn)
 			{
 			case 1:
-				yaccResult = node1(yyvsp[-1].val.type, yyvsp->val);// node2_
+				// `script : include_list thread_list`. This built the root
+				// node via node1(yyvsp[-1].val.type, yyvsp->val) -- reading
+				// the include-list's *own* sval_u (a pointer-bearing value,
+				// not a plain Enum_t) through its narrow `.type` member. On
+				// ILP32, sval_u was 4 bytes total, so `.type` *was* the
+				// whole union and this was an accidental but correct
+				// whole-value copy (hence the decompiler's own "node2_"
+				// note -- it recognized this as node2-shaped). Under LP64
+				// sval_u is 8 bytes (it holds real pointer members), so
+				// `.type` is only the low 4 bytes: this silently dropped
+				// the high half of the include list's pointer, corrupting
+				// slot 0 of the value ScriptCompile's EmitIncludeList(val.
+				// node[0]) dereferences first, before anything thread-
+				// related runs. Neither node[0] here is ever meant to be a
+				// bare Enum_t tag -- both are real payloads (the include
+				// list and the thread list) -- so build the 2-slot node
+				// directly instead of laundering one through node1's
+				// type-tag parameter.
+				{
+					sval_u scriptRoot;
+					scriptRoot.node = Scr_AllocNode(2);
+					scriptRoot.node[0] = yyvsp[-1].val;
+					scriptRoot.node[1] = yyvsp->val;
+					yaccResult = scriptRoot;
+				}
 				break;
 			case 2:
 				yaccResult = node1(ENUM_expression, yyvsp->val);// node1
@@ -1819,13 +1843,13 @@ yynewstate:
 				break;
 			case 111:
 				valstack[4].sourcePosValue = yyvsp->pos;
-				valstack[5] = node1(yyvsp->val.type, valstack[4]);
+				valstack[5] = node_value_pair(yyvsp->val, valstack[4]);
 				yyval.val = prepend_node(valstack[5], yyvsp[-2].val);
 				break;
 			case 112:
 				valstack[3].sourcePosValue = yyvsp->pos;
 				valstack[5] = node0(ENUM_NOP);
-				valstack[4] = node1(yyvsp->val.type, valstack[3]);
+				valstack[4] = node_value_pair(yyvsp->val, valstack[3]);
 				yyval.val = prepend_node(valstack[4], valstack[5]);
 				break;
 			case 114:
@@ -1835,13 +1859,13 @@ yynewstate:
 				valstack[5].sourcePosValue = yyvsp->pos;
 				valstack[4].stringValue = LowerCase(yyvsp->val.stringValue);
 				yyvsp->val = valstack[4];
-				valstack[3] = node1(valstack[4].type, valstack[5]);
+				valstack[3] = node_value_pair(valstack[4], valstack[5]);
 				yyval.val = append_node(yyvsp[-2].val, valstack[3]);
 				break;
 			case 116:
 				yyvsp->val.stringValue = LowerCase(yyvsp->val.stringValue);
 				valstack[5].sourcePosValue = yyvsp->pos;
-				valstack[4] = node1(yyvsp->val.type, valstack[5]);
+				valstack[4] = node_value_pair(yyvsp->val, valstack[5]);
 				valstack[3] = node0(ENUM_NOP);
 				valstack[2] = linked_list_end(valstack[3]);
 				yyval.val = append_node(valstack[2], valstack[4]);
@@ -1854,13 +1878,16 @@ yynewstate:
 				valstack[5].sourcePosValue = yyvsp->pos;
 				valstack[4].stringValue = LowerCase(yyvsp->val.stringValue);
 				yyvsp->val = valstack[4];
-				valstack[3] = node1(valstack[4].type, valstack[5]);
+				valstack[3] = node_value_pair(valstack[4], valstack[5]);
 				yyval.val = append_node(yyvsp[-2].val, valstack[3]);
 				break;
 			case 120:
 				valstack[5].sourcePosValue = yyvsp->pos;
 				valstack[4] = yyvsp->val;
-				valstack[3] = node1(valstack[4].type, valstack[5]);
+				// The singleton argument is a full sval_u AST value.  Using
+				// it as node1's Enum_t tag discarded the high half of its
+				// pointer on LP64, leaving EmitExpression with an invalid AST.
+				valstack[3] = node_value_pair(valstack[4], valstack[5]);
 				valstack[2] = node0(ENUM_NOP);
 				valstack[1] = linked_list_end(valstack[2]);
 				yyval.val = append_node(valstack[1], valstack[3]);
@@ -1868,26 +1895,29 @@ yynewstate:
 			case 121:
 				valstack[5].sourcePosValue = yyvsp->pos;
 				valstack[4] = yyvsp->val;
-				valstack[3] = node1(valstack[4].type, valstack[5]);
+				// As case 120: retain the complete semantic value, not only
+				// its 32-bit type alias.
+				valstack[3] = node_value_pair(valstack[4], valstack[5]);
 				yyval.val = append_node(yyvsp[-2].val, valstack[3]);
 				break;
 			case 122:
 				valstack[5].sourcePosValue = yyvsp->pos;
 				valstack[4] = yyvsp->val;
-				valstack[3] = node1(valstack[4].type, valstack[5]);
+				// As cases 120/121: preserve the complete AST value.
+				valstack[3] = node_value_pair(valstack[4], valstack[5]);
 				valstack[2] = node0(ENUM_NOP);
 				valstack[1] = linked_list_end(valstack[2]);
 				yyval.val = append_node(valstack[1], valstack[3]);
 				break;
 			case 123:
 				valstack[4].sourcePosValue = yyvsp->pos;
-				valstack[5] = node1(yyvsp->val.type, valstack[4]);
+				valstack[5] = node_value_pair(yyvsp->val, valstack[4]);
 				yyval.val = prepend_node(valstack[5], yyvsp[-2].val);
 				break;
 			case 124:
 				valstack[3].sourcePosValue = yyvsp->pos;
 				valstack[5] = node0(ENUM_NOP);
-				valstack[4] = node1(yyvsp->val.type, valstack[3]);
+				valstack[4] = node_value_pair(yyvsp->val, valstack[3]);
 				yyval.val = prepend_node(valstack[4], valstack[5]);
 				break;
 			case 125:

@@ -621,7 +621,7 @@ void __cdecl SV_ClipMoveToEntity(const moveclip_t *clip, svEntity_s *check, trac
                 v3,
                 touch->r.currentOrigin,
                 angles);
-            if (oldFraction > (double)trace->fraction)
+            if (oldFraction > trace->fraction)
             {
                 if (touch->s.number != LOWORD(touch->s.number))
                     MyAssertHandler(
@@ -1233,7 +1233,7 @@ int __cdecl SV_SightTraceToEntity(float *start, float *mins, float *maxs, float 
 
     for (i = 0; i < 3; ++i)
     {
-        if (start[i] >= (double)end[i])
+        if (start[i] >= end[i])
         {
             boxmins[i] = end[i] + mins[i] - 1.0;
             v7 = start[i] + maxs[i] + 1.0;
@@ -1245,12 +1245,12 @@ int __cdecl SV_SightTraceToEntity(float *start, float *mins, float *maxs, float 
         }
         boxmaxs[i] = v7;
     }
-    if (boxmaxs[0] < (double)ent->r.absmin[0]
-        || boxmaxs[1] < (double)ent->r.absmin[1]
-        || boxmaxs[2] < (double)ent->r.absmin[2]
-        || boxmins[0] > (double)ent->r.absmax[0]
-        || boxmins[1] > (double)ent->r.absmax[1]
-        || boxmins[2] > (double)ent->r.absmax[2])
+    if (boxmaxs[0] < ent->r.absmin[0]
+        || boxmaxs[1] < ent->r.absmin[1]
+        || boxmaxs[2] < ent->r.absmin[2]
+        || boxmins[0] > ent->r.absmax[0]
+        || boxmins[1] > ent->r.absmax[1]
+        || boxmins[2] > ent->r.absmax[2])
     {
         return 0;
     }

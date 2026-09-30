@@ -11,6 +11,7 @@
 #include <cgame/cg_local.h>
 #include "r_model_lighting.h"
 #include "r_dobj_skin.h"
+#include <database/db_retail_frame_evidence.h>
 
 
 void __cdecl R_DrawXModelRigidModelSurf(GfxCmdBufContext context, XSurface *xsurf)

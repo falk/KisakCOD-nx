@@ -61,10 +61,10 @@ double __cdecl FresnelTerm(float n0, float n1, float cosIncidentAngle)
 {
     float v4; // [esp+10h] [ebp-5Ch]
     float v5; // [esp+14h] [ebp-58h]
-    long double sinTransmissionAngle; // [esp+1Ch] [ebp-50h]
+    double sinTransmissionAngle; // [esp+1Ch] [ebp-50h]
     double sinRatio; // [esp+24h] [ebp-48h]
     double tanSum; // [esp+2Ch] [ebp-40h]
-    long double tanRatio; // [esp+3Ch] [ebp-30h]
+    double tanRatio; // [esp+3Ch] [ebp-30h]
     double incidentAngle; // [esp+44h] [ebp-28h]
     double transmissionAngle; // [esp+4Ch] [ebp-20h]
     double sinSum; // [esp+54h] [ebp-18h]

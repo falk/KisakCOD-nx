@@ -1,5 +1,7 @@
 #include <universal/q_shared.h>
 #include "r_image.h"
+#include <database/db_retail_frame_evidence.h>
+#include <platform/switch/switch_diag_dvars.h>
 #include <qcommon/mem_track.h>
 #include <qcommon/qcommon.h>
 #include <universal/com_memory.h>
@@ -17,8 +19,57 @@
 #include "rb_state.h"
 #include "r_state.h"
 #include "r_outdoor.h"
+#include <deko9/deko9_native.h> // Deko9_SetDebugName: r_deko9Census per-texture upload table
+
+#include "r_image_live_memo.h"
 
 #include <algorithm>
+#include <atomic>
+#include <unordered_set>
+#include <mutex>
+
+static std::unordered_set<void *> s_liveD3DTextures;
+static std::mutex s_liveD3DTexturesMutex;
+// Bumped (under the mutex) by every removal; see r_image_live_memo.h.
+static std::atomic<uint32_t> s_liveD3DTexturesRemovalGen{1};
+static thread_local LivePointerMemo s_liveD3DTexturesMemo;
+
+static void RegisterLiveD3DTexture(void *tex)
+{
+    if (!tex)
+        return;
+    std::lock_guard<std::mutex> lock(s_liveD3DTexturesMutex);
+    s_liveD3DTextures.insert(tex);
+}
+
+static bool UnregisterLiveD3DTexture(void *tex)
+{
+    if (!tex)
+        return false;
+    std::lock_guard<std::mutex> lock(s_liveD3DTexturesMutex);
+    const bool erased = s_liveD3DTextures.erase(tex) > 0;
+    if (erased)
+    {
+        uint32_t next = s_liveD3DTexturesRemovalGen.load(std::memory_order_relaxed) + 1;
+        if (!next)
+            next = 1; // 0 marks an empty memo entry
+        s_liveD3DTexturesRemovalGen.store(next, std::memory_order_release);
+    }
+    return erased;
+}
+
+bool Image_IsLiveD3DTexture(void *tex)
+{
+    if (!tex)
+        return false;
+    if (s_liveD3DTexturesMemo.Find(tex, s_liveD3DTexturesRemovalGen.load(std::memory_order_acquire)))
+        return true;
+    std::lock_guard<std::mutex> lock(s_liveD3DTexturesMutex);
+    const bool live = s_liveD3DTextures.find(tex) != s_liveD3DTextures.end();
+    if (live)
+        s_liveD3DTexturesMemo.Store(tex, s_liveD3DTexturesRemovalGen.load(std::memory_order_relaxed));
+    return live;
+}
 
 static const char *g_imageProgNames[14] =
 {
@@ -93,15 +144,51 @@ void __cdecl R_DelayLoadImage(XAssetHeader header)
         int externalDataSize = image->cardMemory.platform[0];
         image->cardMemory.platform[0] = 0;
         image->cardMemory.platform[1] = 0;
-        if (r_loadForRenderer->current.enabled && !dx.deviceLost)
+        // dx.device guard: Switch zone loads can run before device creation
+        // (boot zones during Com_Init), where the original never executed.
+        // Leave the pixels unloaded -- a later sweep or the draw-time
+        // materialize path loads them once the device exists.
         {
-            if (!Image_LoadFromFile(image))
-                Image_AssignDefaultTexture(image);
-            if (!image->texture.basemap)
+            extern const dvar_t *com_diagMarkers;
+            if (com_diagMarkers && com_diagMarkers->current.enabled)
+                Com_Printf(0, "DELAY_IMAGE name=%s device=%d lost=%d loadForRenderer=%d resourceSize=%d cat=%d\n",
+                           image->name, dx.device ? 1 : 0, dx.deviceLost ? 1 : 0,
+                           r_loadForRenderer->current.enabled ? 1 : 0,
+                           image->texture.loadDef ? image->texture.loadDef->resourceSize : -1,
+                           image->category);
+        }
+        if (r_loadForRenderer->current.enabled && dx.device && !dx.deviceLost)
+        {
+            // A loadDef is an inline retail payload (or a generated water
+            // setup when category is IMG_CATEGORY_WATER).  Calling
+            // Image_LoadFromFile first overwrites this union and incorrectly
+            // turns the image into a missing-IWI lookup.
+            //
+            // The payload also wins over a same-named builtin generator:
+            // retail loads every fastfile image from its loadDef.  In
+            // particular the level's baked `$outdoor` height map must not be
+            // replaced by R_GenerateOutdoorImage, which only works on the
+            // loadobj path (outdoorGlob is never set up for fastfiles, so it
+            // produced an all-zero map and precipitation drew indoors).
+            bool loaded = false;
+            if (Image_HasInlinePayload(image))
             {
-                HRESULT hr = dx.device->TestCooperativeLevel();
-                if (hr != 0x88760868 && hr != 0x88760869)
-                    Com_Error(ERR_DROP, "Couldn't load image '%s'\n", image->name);
+                Load_Texture(&image->texture, image);
+                loaded = image->texture.basemap &&
+                         Image_IsLiveD3DTexture(image->texture.basemap);
+            }
+            if (!loaded)
+                loaded = Image_MaterializeBuiltin(image);
+            if (!loaded)
+                loaded = Image_LoadFromFile(image);
+            if (!loaded || !image->texture.basemap ||
+                !Image_IsLiveD3DTexture(image->texture.basemap))
+            {
+                // Do not install a default texture for any failed delayed
+                // image.  In particular, inline/lightmap and generated water
+                // payloads have no legal disk fallback; all other missing
+                // IWIs must remain a visible fatal load error as well.
+                Com_Error(ERR_DROP, "Couldn't load image '%s'\n", image->name);
             }
         }
         DB_LoadedExternalData(externalDataSize);
@@ -184,8 +271,10 @@ void __cdecl Image_Release(GfxImage *image)
     }
     if (image->texture.basemap)
     {
-        //image->texture.basemap->Release(image->texture.basemap);
-        image->texture.basemap->Release();
+        if (UnregisterLiveD3DTexture(image->texture.basemap))
+        {
+            image->texture.basemap->Release();
+        }
         image->texture.basemap = 0;
         image->cardMemory.platform[0] = 0;
         image->cardMemory.platform[1] = 0;
@@ -194,6 +283,18 @@ void __cdecl Image_Release(GfxImage *image)
     {
         iassert( !image->cardMemory.platform[PICMIP_PLATFORM_USED] );
     }
+}
+
+// Render targets created outside Image_Setup (rb_halfres_particles.cpp):
+// R_SetSampler binds only textures in the live set.
+void Image_RegisterLiveTexture(GfxImage *image)
+{
+    RegisterLiveD3DTexture(image->texture.basemap);
+}
+
+void Image_UnregisterLiveTexture(GfxImage *image)
+{
+    UnregisterLiveD3DTexture(image->texture.basemap);
 }
 
 GfxImage *__cdecl Image_AllocProg(int imageProgType, uint8_t category, uint8_t semantic)
@@ -427,6 +528,38 @@ GfxImage *__cdecl Image_Register(const char *imageName, uint8_t semantic, int im
 
 GfxImage *__cdecl Image_Register_FastFile(const char *imageName)
 {
+    if (imageName && imageName[0] == '$' && dx.device)
+    {
+        GfxImage *existing = DB_FindXAssetHeaderNoDefault(ASSET_TYPE_IMAGE, imageName).image;
+        if (existing && existing->texture.basemap && Image_IsLiveD3DTexture(existing->texture.basemap))
+            return existing;
+
+        for (uint32_t i = 0; i < sizeof(constructorTable) / sizeof(constructorTable[0]); ++i)
+        {
+            if (!strcmp(constructorTable[i].name, imageName))
+            {
+                GfxImage *builtin = Image_LoadBuiltin((char *)imageName, 1u, 0);
+                if (builtin)
+                {
+                    if (existing && existing != builtin)
+                    {
+                        existing->texture = builtin->texture;
+                        existing->width = builtin->width;
+                        existing->height = builtin->height;
+                        existing->depth = builtin->depth;
+                        existing->mapType = builtin->mapType;
+                        existing->category = builtin->category;
+                        existing->semantic = builtin->semantic;
+                    }
+                    DB_RegisterImage(builtin);
+                    return builtin;
+                }
+                break;
+            }
+        }
+        if (existing)
+            return existing;
+    }
     return Image_FindExisting(imageName);
 }
 
@@ -579,6 +712,50 @@ GfxImage *__cdecl Image_LoadBuiltin(char *name, uint8_t semantic, uint8_t imageT
     return image;
 }
 
+bool __cdecl Image_HasInlinePayload(const GfxImage *image)
+{
+    // Only meaningful while image->texture still holds the zone's loadDef
+    // (no live D3D texture yet): the union is read as a loadDef.
+    return image && image->texture.loadDef &&
+           (image->texture.loadDef->resourceSize > 0 || image->category == IMG_CATEGORY_WATER);
+}
+
+bool __cdecl Image_MaterializeBuiltin(GfxImage *image)
+{
+    if (!image || !image->name || !image->name[0])
+        return false;
+
+    for (uint32_t i = 0; i < sizeof(constructorTable) / sizeof(constructorTable[0]); ++i)
+    {
+        if (strcmp(constructorTable[i].name, image->name))
+            continue;
+
+        GfxImage *generated = Image_LoadBuiltin(const_cast<char *>(image->name),
+                                                image->semantic, image->track);
+        if (!generated || !generated->texture.basemap ||
+            !Image_IsLiveD3DTexture(generated->texture.basemap))
+            return false;
+
+        // Image_LoadBuiltin allocates a normal hunk image, so retaining its
+        // texture pointer is safe for the lifetime of the renderer.  Copy the
+        // complete runtime image metadata into the fastfile registry object;
+        // replacing only basemap would leave stale map type/card-memory state.
+        image->texture = generated->texture;
+        image->picmip = generated->picmip;
+        image->cardMemory = generated->cardMemory;
+        image->width = generated->width;
+        image->height = generated->height;
+        image->depth = generated->depth;
+        image->mapType = generated->mapType;
+        image->category = generated->category;
+        image->semantic = generated->semantic;
+        image->delayLoadPixels = false;
+        image->substitutedTexture = false;
+        return true;
+    }
+    return false;
+}
+
 void __cdecl Image_Construct(
     char *name,
     int nameSize,
@@ -626,7 +803,10 @@ GfxImage *__cdecl Image_Alloc(
 
     iassert( name );
     v5 = strlen(name);
-    image = (GfxImage *)Hunk_Alloc(v5 + 37, "Image_Alloc", 22);
+    // The retail size (name length + 0x25) describes the 32-bit GfxImage
+    // layout.  On AArch64 the pointer-bearing struct is wider; allocating
+    // the legacy constant lets Image_Construct overwrite the hunk.
+    image = (GfxImage *)Hunk_Alloc(sizeof(GfxImage) + v5 + 1, "Image_Alloc", 22);
     iassert( image );
     image->name = (const char *)&image[1];
     Image_Construct(name, v5 + 1, category, semantic, imageTrack, image);
@@ -1048,6 +1228,8 @@ char __cdecl R_DuplicateTexture(GfxImage *dstImage, const GfxImage *srcImage)
 
 char __cdecl Image_AssignDefaultTexture(GfxImage *image)
 {
+    image->substitutedTexture = true;
+    RetailKillhouseNoteDefaultBind();
 #ifdef KISAK_RADIANT
     // Editor diagnostic (white-xmodel bug): every image that reaches here failed to
     // load — log the first 32 so the runtime log NAMES the images behind solid-white
@@ -1208,6 +1390,9 @@ void __cdecl Image_CreateCubeTexture_PC(
             hr,
             v4);
     }
+    RegisterLiveD3DTexture(image->texture.basemap);
+    if (image->texture.basemap)
+        Deko9_SetDebugName(image->texture.basemap, image->name);
     if (hr != -2005530520 && !image->texture.basemap)
     {
         v5 = R_ErrorDescription(hr);
@@ -1253,7 +1438,11 @@ void __cdecl Image_Create3DTexture_PC(
     }
     else
     {
-        v7 = dx.device->CreateVolumeTexture(width, height, depth, mipmapCount, 0, imageFormat, (_D3DPOOL)(usage == 0), (IDirect3DVolumeTexture9 **)&image->texture, 0);
+        // Decompiler slip: pass the computed usage (retail does), or an
+        // IMG_FLAG_DYNAMIC volume (the model-lighting volume) is created as a
+        // DEFAULT texture with no DYNAMIC usage -- a lock D3D9 would reject,
+        // and on deko9 a GPU readback plus drain on every patch frame.
+        v7 = dx.device->CreateVolumeTexture(width, height, depth, mipmapCount, usage, imageFormat, (_D3DPOOL)(usage == 0), (IDirect3DVolumeTexture9 **)&image->texture, 0);
     }
     hr = v7;
     if (v7 < 0)
@@ -1271,6 +1460,9 @@ void __cdecl Image_Create3DTexture_PC(
             hr,
             v8);
     }
+    RegisterLiveD3DTexture(image->texture.basemap);
+    if (image->texture.basemap)
+        Deko9_SetDebugName(image->texture.basemap, image->name);
     if (hr != -2005530520 && !image->texture.basemap)
     {
         v9 = R_ErrorDescription(hr);
@@ -1376,6 +1568,9 @@ void __cdecl Image_Create2DTexture_PC(
             hr,
             v7);
     }
+    RegisterLiveD3DTexture(image->texture.basemap);
+    if (image->texture.basemap)
+        Deko9_SetDebugName(image->texture.basemap, image->name);
     if (hr != -2005530520 && !image->texture.basemap)
     {
         v8 = R_ErrorDescription(hr);
@@ -1462,3 +1657,50 @@ void __cdecl R_ReloadImages()
 }
 
 #endif
+
+// one-shot audit of every image asset once the level is up. For each
+// image with a live 2D texture, print the port's own dims beside what D3D was
+// actually asked to create (level-0 desc + level count). A texture that the
+// port believes is 512x512 but D3D holds as 512x1, or with one mip where the
+// IWI carries ten, is the smear. Gated on com_diagMarkers; emitted once.
+#include <database/db_retail_frame_evidence.h>
+#include <platform/switch/switch_diag_dvars.h>
+void R_SwitchAuditImages(void)
+{
+    static bool s_done = false;
+    if (s_done || !com_diagMarkers || !com_diagMarkers->current.enabled || !dx.device)
+        return;
+    s_done = true;
+    static XAssetHeader assets[2048];
+    const int32_t n = DB_GetAllXAssetOfType(ASSET_TYPE_IMAGE, assets, 2048);
+    Com_Printf(0, "KILLHOUSE_IMAGE_AUDIT count=%d\n", n);
+    for (int32_t i = 0; i < n; ++i)
+    {
+        const GfxImage *g = assets[i].image;
+        if (!g || !g->name)
+            continue;
+        IDirect3DBaseTexture9 *bt = g->texture.basemap;
+        const bool live = bt && Image_IsLiveD3DTexture(bt);
+        unsigned dw = 0, dh = 0, fmt = 0, levels = 0, type = 0;
+        if (live)
+        {
+            type = (unsigned)bt->GetType();
+            levels = bt->GetLevelCount();
+            if (type == D3DRTYPE_TEXTURE)
+            {
+                D3DSURFACE_DESC d;
+                if (SUCCEEDED(static_cast<IDirect3DTexture9 *>(bt)->GetLevelDesc(0, &d)))
+                {
+                    dw = d.Width; dh = d.Height; fmt = (unsigned)d.Format;
+                }
+            }
+        }
+        Com_Printf(0, "KILLHOUSE_IMAGE_AUDIT name=%s port=%ux%ux%u map=%u cat=%u sem=%u flags=%s "
+                      "live=%d d3d=%ux%u fmt=%u levels=%u type=%u subst=%d delay=%d\n",
+                   g->name, (unsigned)g->width, (unsigned)g->height, (unsigned)g->depth,
+                   (unsigned)g->mapType, (unsigned)g->category, (unsigned)g->semantic,
+                   (g->texture.loadDef && g->texture.loadDef->resourceSize > 0) ? "inline" : "disk",
+                   live ? 1 : 0, dw, dh, fmt, levels, type,
+                   g->substitutedTexture ? 1 : 0, g->delayLoadPixels ? 1 : 0);
+    }
+}

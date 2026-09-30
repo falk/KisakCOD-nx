@@ -10,7 +10,15 @@
 #include <universal/profile.h>
 #include <script/scr_vm.h>
 #include <universal/com_files.h>
+#ifndef __SWITCH__
 #include <win32/win_local.h>
+#else
+// win_local.h is skipped on Switch (it pulls in genuine Win32-only content
+// elsewhere), but critical_section.h is a portable declaration it happens to
+// carry; xanim's Sys_Enter/LeaveCriticalSection(CRITSECT_XANIM_ALLOC) calls
+// need it directly.
+#include <universal/critical_section.h>
+#endif
 
 #ifdef KISAK_MP
 #include <cgame_mp/cg_local_mp.h>
@@ -147,7 +155,7 @@ XAnimParts *__cdecl XAnimClone(XAnimParts *fromParts, void *(__cdecl *Alloc)(int
     __int16 notifyInfoIndex; // [esp+18h] [ebp-8h]
     uint16_t *boneNames; // [esp+1Ch] [ebp-4h]
 
-    toParts = (XAnimParts*)Alloc(88);
+    toParts = (XAnimParts*)Alloc(sizeof(XAnimParts)); // LP64: was the ILP32 88
     qmemcpy(toParts, fromParts, sizeof(XAnimParts));
     boneNames = toParts->names;
     size = toParts->boneCount[9];
@@ -280,7 +288,12 @@ XAnim_s* __cdecl XAnimCreateAnims(const char* debugName, uint32_t size, void* (_
     iassert(debugName);
     iassert(Alloc);
 
-    anims = (XAnim_s*)Alloc(8 * size + 12);
+    // LP64: XAnimEntry is 8 bytes on the ILP32 reference ABI but 16 here
+    // (its parts/animation parent union carries a real pointer), so the old
+    // literal `8 * size + 12` no longer matches the trailing flexible array
+    // and every entry write overran the allocation. The debug-name table is
+    // a pointer array for the same reason.
+    anims = (XAnim_s*)Alloc(offsetof(XAnim_s, entries) + sizeof(XAnimEntry) * size);
     anims->size = size;
 
     if (g_anim_developer)
@@ -294,7 +307,7 @@ XAnim_s* __cdecl XAnimCreateAnims(const char* debugName, uint32_t size, void* (_
             *v5++ = *v6++;
         } while (v4);
         anims->debugName = newDebugName;
-        anims->debugAnimNames = (const char**)Hunk_AllocDebugMem(4 * size, "XAnimCreateAnims");
+        anims->debugAnimNames = (const char**)Hunk_AllocDebugMem(sizeof(const char*) * size, "XAnimCreateAnims");
     }
 
     if (Hunk_DataOnHunk((unsigned char*)anims))
@@ -420,8 +433,11 @@ void XAnimResetAnimMap(const DObj_s *obj, uint32_t infoIndex)
     iassert(obj->numModels < 256); // lwss add
 
     PROF_SCOPED("XAnimSetModel");
+    
     XAnimInitModelMap(obj->models, obj->numModels, modelMap);
+    
     XAnimResetAnimMap_r(modelMap, infoIndex);
+    
 }
 
 void __cdecl XAnimInitModelMap(XModel* const* models, uint32_t numModels, XModelNameMap* modelMap)
@@ -437,12 +453,15 @@ void __cdecl XAnimInitModelMap(XModel* const* models, uint32_t numModels, XModel
 
     memset((unsigned __int8*)modelMap, 0, 1024);
     boneIndex = 0;
+    
 
     for (i = 0; i < numModels; ++i)
     {
         model = models[i];
+        
         boneNames = model->boneNames;
         boneCount = model->numBones;
+        
 
         iassert(boneCount < DOBJ_MAX_PARTS);
 
@@ -471,7 +490,9 @@ void __cdecl XAnimResetAnimMap_r(XModelNameMap* modelMap, uint32_t infoIndex)
     if (info->animToModel)
     {
         iassert(!info->children);
+        
         XAnimResetAnimMapLeaf(modelMap, infoIndex);
+        
     }
     else
     {
@@ -479,6 +500,7 @@ void __cdecl XAnimResetAnimMap_r(XModelNameMap* modelMap, uint32_t infoIndex)
         {
             iassert(childInfoIndex && (childInfoIndex < 4096));
             iassert(g_xAnimInfo[childInfoIndex].inuse);
+            
             XAnimResetAnimMap_r(modelMap, childInfoIndex);
         }
     }
@@ -687,7 +709,7 @@ bool __cdecl XAnimHasFinished(const XAnimTree_s* tree, uint32_t animIndex)
             "(infoIndex && (infoIndex < 4096))",
             infoIndex);
     state = &g_xAnimInfo[infoIndex].state;
-    return state->oldTime > (double)state->currentAnimTime
+    return state->oldTime > state->currentAnimTime
         || state->currentAnimTime == 1.0
         || state->cycleCount > state->oldCycleCount;
 }
@@ -825,6 +847,32 @@ void __cdecl XAnimUpdateOldTime(
     if (dtime < 0.0)
         MyAssertHandler(".\\xanim\\xanim.cpp", 1669, 0, "%s\n\t(dtime) = %g", "(dtime >= 0)", dtime);
     if (!infoIndex || infoIndex >= 0x1000)
+    {
+        // Name the DObj/tree the bad index came from: the index is a walk of
+        // tree->children/.next, so an out-of-range value means the tree this
+        // object is bound to is not a tree this VM built (savegame load), or an
+        // info in it was freed and reused.  Dump the tree's first infos to see
+        // which link is bad.
+        Com_Printf(0,
+                   "KISAK_SAVE_XANIM infoIndex=%i entnum=%i tree=%p treeChildren=%u anims=%p animsName=%s infoUsage=%i dtime=%g\n",
+                   infoIndex, obj->entnum, (void *)tree, tree->children,
+                   (const void *)tree->anims,
+                   tree->anims && tree->anims->debugName ? tree->anims->debugName : "(none)",
+                   tree->info_usage, dtime);
+        {
+            uint32_t walk = tree->children;
+            int printed = 0;
+            while (walk && walk < 0x1000 && printed < 24)
+            {
+                const XAnimInfo *step = &g_xAnimInfo[walk];
+                Com_Printf(0,
+                           "KISAK_SAVE_XANIM info=%u tree=%p animIndex=%u children=%u next=%u parent=%u inuse=%d\n",
+                           walk, (const void *)step->tree, step->animIndex, step->children,
+                           step->next, step->parent, step->inuse ? 1 : 0);
+                walk = g_xAnimInfo[walk].next;
+                ++printed;
+            }
+        }
         MyAssertHandler(
             ".\\xanim\\xanim.cpp",
             1671,
@@ -832,11 +880,12 @@ void __cdecl XAnimUpdateOldTime(
             "%s\n\t(infoIndex) = %i",
             "(infoIndex && (infoIndex < 4096))",
             infoIndex);
+    }
     info = &g_xAnimInfo[infoIndex];
     if (!info->inuse)
         MyAssertHandler(".\\xanim\\xanim.cpp", 1674, 0, "%s", "info->inuse");
     state = &info->state;
-    if (parentHasWeight && dtime < (double)info->state.goalTime)
+    if (parentHasWeight && dtime < info->state.goalTime)
     {
         info->state.weight = (info->state.goalWeight - info->state.weight) * dtime / info->state.goalTime
             + info->state.weight;
@@ -1287,7 +1336,25 @@ void __cdecl XAnimUpdateTimeAndNotetrackLeaf(
         time = g_xAnimInfo[infoIndex].state.oldTime + dtimea;
         cycleCount = g_xAnimInfo[infoIndex].state.cycleCount;
         if (time < 0.0)
+        {
+            // Producer hunt: name the factor behind
+            // the tiny negative `time` seen here, instead of
+            // guessing between parts->frequency and state.rate. Gated and
+            // capped so it cannot spam a real play session; remove once the
+            // producer is fixed at the source.
+            extern const dvar_t *com_diagMarkers;
+            static uint32_t s_d40NegativeTimeLog = 0;
+            if (com_diagMarkers && com_diagMarkers->current.enabled && s_d40NegativeTimeLog < 8)
+            {
+                ++s_d40NegativeTimeLog;
+                Com_Printf(0, "KISAK_D40_NEGTIME name=%s rate=%.9g frequency=%.9g framerate=%.9g "
+                              "dtime=%.9g dtimea=%.9g oldTime=%.9g time=%.9g infoIndex=%u\n",
+                           parts->name ? parts->name : "(null)",
+                           g_xAnimInfo[infoIndex].state.rate, parts->frequency, parts->framerate,
+                           dtime, dtimea, g_xAnimInfo[infoIndex].state.oldTime, time, infoIndex);
+            }
             MyAssertHandler(".\\xanim\\xanim.cpp", 1245, 0, "%s\n\t(time) = %g", "(time >= 0)", time);
+        }
         if (time >= 1.0)
         {
             if (parts->bLoop)
@@ -1395,17 +1462,17 @@ void __cdecl XAnimProcessClientNotify(XAnimInfo* info, float dtime)
             if (notifyIndex >= (int)parts->notifyCount)
                 MyAssertHandler(".\\xanim\\xanim.cpp", 1087, 0, "%s", "notifyIndex < parts->notifyCount");
             notifyInfo = &parts->notify[notifyIndex];
-            if (info->state.oldTime <= (double)info->state.currentAnimTime)
+            if (info->state.oldTime <= info->state.currentAnimTime)
             {
                 if (state->currentAnimTime == 1.0)
                 {
                     if (parts->bLoop)
                         MyAssertHandler(".\\xanim\\xanim.cpp", 1134, 0, "%s", "!parts->bLoop");
-                    if (notifyInfo->time >= (double)info->state.oldTime)
+                    if (notifyInfo->time >= info->state.oldTime)
                     {
                         do
                         {
-                            if (notifyInfo->time < (double)info->state.oldTime)
+                            if (notifyInfo->time < info->state.oldTime)
                                 MyAssertHandler(".\\xanim\\xanim.cpp", 1141, 0, "%s", "state->oldTime <= notifyInfo->time");
                             frace = XAnimGetNotifyFracLeaf(state, state, notifyInfo->time, dtime);
                             XAnimAddClientNotify(notifyInfo->name, frace, notifyType);
@@ -1414,26 +1481,26 @@ void __cdecl XAnimProcessClientNotify(XAnimInfo* info, float dtime)
                         } while (notifyIndex < (int)parts->notifyCount);
                     }
                 }
-                else if (notifyInfo->time < (double)state->currentAnimTime && notifyInfo->time >= (double)info->state.oldTime)
+                else if (notifyInfo->time < state->currentAnimTime && notifyInfo->time >= info->state.oldTime)
                 {
                     do
                     {
-                        if (notifyInfo->time < (double)info->state.oldTime)
+                        if (notifyInfo->time < info->state.oldTime)
                             MyAssertHandler(".\\xanim\\xanim.cpp", 1158, 0, "%s", "state->oldTime <= notifyInfo->time");
                         fracf = XAnimGetNotifyFracLeaf(state, state, notifyInfo->time, dtime);
                         XAnimAddClientNotify(notifyInfo->name, fracf, notifyType);
                         ++notifyInfo;
                         ++notifyIndex;
-                    } while (notifyIndex < (int)parts->notifyCount && notifyInfo->time < (double)state->currentAnimTime);
+                    } while (notifyIndex < (int)parts->notifyCount && notifyInfo->time < state->currentAnimTime);
                 }
             }
-            else if (notifyInfo->time >= (double)state->currentAnimTime)
+            else if (notifyInfo->time >= state->currentAnimTime)
             {
-                if (notifyInfo->time >= (double)info->state.oldTime)
+                if (notifyInfo->time >= info->state.oldTime)
                 {
                     do
                     {
-                        if (notifyInfo->time < (double)info->state.oldTime)
+                        if (notifyInfo->time < info->state.oldTime)
                             MyAssertHandler(".\\xanim\\xanim.cpp", 1110, 0, "%s", "state->oldTime <= notifyInfo->time");
                         fracc = XAnimGetNotifyFracLeaf(state, state, notifyInfo->time, dtime);
                         XAnimAddClientNotify(notifyInfo->name, fracc, notifyType);
@@ -1441,7 +1508,7 @@ void __cdecl XAnimProcessClientNotify(XAnimInfo* info, float dtime)
                         ++notifyIndex;
                     } while (notifyIndex < (int)parts->notifyCount);
                     notifyIndexa = 0;
-                    for (notifyInfoa = parts->notify; (notifyInfoa->time < (double)state->currentAnimTime); notifyInfoa = notifyInfob + 1)
+                    for (notifyInfoa = parts->notify; (notifyInfoa->time < state->currentAnimTime); notifyInfoa = notifyInfob + 1)
                     {
                         fracd = XAnimGetNotifyFracLeaf(state, state, notifyInfoa->time, dtime);
                         XAnimAddClientNotify(notifyInfoa->name, fracd, notifyType);
@@ -1459,10 +1526,10 @@ void __cdecl XAnimProcessClientNotify(XAnimInfo* info, float dtime)
                     XAnimAddClientNotify(notifyInfo->name, fracb, notifyType);
                     ++notifyInfo;
                     ++notifyIndex;
-                } while (notifyIndex < (int)parts->notifyCount && notifyInfo->time < (double)state->currentAnimTime);
+                } while (notifyIndex < (int)parts->notifyCount && notifyInfo->time < state->currentAnimTime);
             }
         }
-        else if (info->state.oldTime > (double)info->state.currentAnimTime || state->currentAnimTime == 1.0)
+        else if (info->state.oldTime > info->state.currentAnimTime || state->currentAnimTime == 1.0)
         {
             fraca = XAnimGetNotifyFracLeaf(state, state, 1.0, dtime);
             XAnimAddClientNotify(g_endNotetrackName, fraca, notifyType);
@@ -1494,7 +1561,7 @@ uint16_t __cdecl XAnimGetNextNotifyIndex(const XAnimParts* parts, float time)
         testTime = notifyInfo->time;
         if (testTime < 0.0)
             MyAssertHandler(".\\xanim\\xanim.cpp", 914, 0, "%s", "testTime >= 0");
-        if (time <= (double)testTime && bestTime > (double)testTime)
+        if (time <= testTime && bestTime > testTime)
         {
             bestTime = testTime;
             bestNotifyInfo = notifyInfo;
@@ -1503,7 +1570,7 @@ uint16_t __cdecl XAnimGetNextNotifyIndex(const XAnimParts* parts, float time)
     }
     if (!bestNotifyInfo)
         MyAssertHandler(".\\xanim\\xanim.cpp", 924, 0, "%s", "bestNotifyInfo");
-    if (bestNotifyInfo != parts->notify && bestNotifyInfo[-1].time >= (double)bestNotifyInfo->time)
+    if (bestNotifyInfo != parts->notify && bestNotifyInfo[-1].time >= bestNotifyInfo->time)
         MyAssertHandler(
             ".\\xanim\\xanim.cpp",
             925,
@@ -1519,10 +1586,10 @@ double __cdecl XAnimGetNotifyFracLeaf(const XAnimState* state, const XAnimState*
         MyAssertHandler(".\\xanim\\xanim.cpp", 940, 0, "%s", "dtime");
     if (nextState->oldTime == 1.0)
         return 1.0;
-    if (nextState->oldTime <= (double)nextState->currentAnimTime)
+    if (nextState->oldTime <= nextState->currentAnimTime)
     {
-        if ((time < (double)nextState->currentAnimTime || nextState->currentAnimTime == 1.0)
-            && time >= (double)nextState->oldTime)
+        if ((time < nextState->currentAnimTime || nextState->currentAnimTime == 1.0)
+            && time >= nextState->oldTime)
         {
             return (float)(((double)(nextState->oldCycleCount - state->oldCycleCount) + time - state->oldTime) / dtime);
         }
@@ -1531,9 +1598,9 @@ double __cdecl XAnimGetNotifyFracLeaf(const XAnimState* state, const XAnimState*
             return 1.0;
         }
     }
-    else if (time >= (double)nextState->currentAnimTime)
+    else if (time >= nextState->currentAnimTime)
     {
-        if (time < (double)nextState->oldTime)
+        if (time < nextState->oldTime)
             return 1.0;
         else
             return (float)(((double)(nextState->oldCycleCount - state->oldCycleCount) + time - state->oldTime) / dtime);
@@ -1562,7 +1629,7 @@ void __cdecl XAnimAddClientNotify(uint32_t notetrackName, float frac, uint32_t n
     for (i = g_notifyListSize - 1; i >= 0; --i)
     {
         notify = &g_notifyList[i];
-        if (notify->timeFrac <= (double)frac)
+        if (notify->timeFrac <= frac)
             break;
         notify[1].name = notify->name;
         notify[1].type = notify->type;
@@ -1795,19 +1862,19 @@ void __cdecl XAnimProcessServerNotify(const DObj_s* obj, XAnimInfo* info, float 
                     if (notifyIndex >= parts->notifyCount)
                         MyAssertHandler(".\\xanim\\xanim.cpp", 1993, 0, "%s", "notifyIndex < parts->notifyCount");
                     notifyInfo = &parts->notify[notifyIndex];
-                    if (info->state.currentAnimTime <= (double)time)
+                    if (info->state.currentAnimTime <= time)
                     {
                         if (time == 1.0)
                         {
                             if (parts->bLoop)
                                 MyAssertHandler(".\\xanim\\xanim.cpp", 2042, 0, "%s", "!parts->bLoop");
-                            if (notifyInfo->time >= (double)info->state.currentAnimTime)
+                            if (notifyInfo->time >= info->state.currentAnimTime)
                             {
                                 if (notifyIndex >= parts->notifyCount)
                                     MyAssertHandler(".\\xanim\\xanim.cpp", 2047, 0, "%s", "notifyIndex < parts->notifyCount");
                                 do
                                 {
-                                    if (notifyInfo->time < (double)info->state.currentAnimTime)
+                                    if (notifyInfo->time < info->state.currentAnimTime)
                                         MyAssertHandler(
                                             ".\\xanim\\xanim.cpp",
                                             2051,
@@ -1820,13 +1887,13 @@ void __cdecl XAnimProcessServerNotify(const DObj_s* obj, XAnimInfo* info, float 
                                 } while (notifyIndex < parts->notifyCount);
                             }
                         }
-                        else if (notifyInfo->time < (double)time && notifyInfo->time >= (double)info->state.currentAnimTime)
+                        else if (notifyInfo->time < time && notifyInfo->time >= info->state.currentAnimTime)
                         {
                             if (notifyIndex >= parts->notifyCount)
                                 MyAssertHandler(".\\xanim\\xanim.cpp", 2066, 0, "%s", "notifyIndex < parts->notifyCount");
                             do
                             {
-                                if (notifyInfo->time < (double)info->state.currentAnimTime)
+                                if (notifyInfo->time < info->state.currentAnimTime)
                                     MyAssertHandler(
                                         ".\\xanim\\xanim.cpp",
                                         2070,
@@ -1836,18 +1903,18 @@ void __cdecl XAnimProcessServerNotify(const DObj_s* obj, XAnimInfo* info, float 
                                 NotifyServerNotetrack(obj, info->notifyName, notifyInfo->name);
                                 ++notifyInfo;
                                 ++notifyIndex;
-                            } while (notifyIndex < parts->notifyCount && notifyInfo->time < (double)time);
+                            } while (notifyIndex < parts->notifyCount && notifyInfo->time < time);
                         }
                     }
-                    else if (notifyInfo->time >= (double)time)
+                    else if (notifyInfo->time >= time)
                     {
-                        if (notifyInfo->time >= (double)info->state.currentAnimTime)
+                        if (notifyInfo->time >= info->state.currentAnimTime)
                         {
                             if (notifyIndex >= parts->notifyCount)
                                 MyAssertHandler(".\\xanim\\xanim.cpp", 2015, 0, "%s", "notifyIndex < parts->notifyCount");
                             do
                             {
-                                if (notifyInfo->time < (double)info->state.currentAnimTime)
+                                if (notifyInfo->time < info->state.currentAnimTime)
                                     MyAssertHandler(
                                         ".\\xanim\\xanim.cpp",
                                         2019,
@@ -1859,7 +1926,7 @@ void __cdecl XAnimProcessServerNotify(const DObj_s* obj, XAnimInfo* info, float 
                                 ++notifyIndex;
                             } while (notifyIndex < parts->notifyCount);
                             notifyIndexa = 0;
-                            for (notifyInfoa = parts->notify; notifyInfoa->time < (double)time; ++notifyInfoa)
+                            for (notifyInfoa = parts->notify; notifyInfoa->time < time; ++notifyInfoa)
                             {
                                 if (notifyIndexa >= parts->notifyCount)
                                     MyAssertHandler(".\\xanim\\xanim.cpp", 2030, 0, "%s", "notifyIndex < parts->notifyCount");
@@ -1877,16 +1944,16 @@ void __cdecl XAnimProcessServerNotify(const DObj_s* obj, XAnimInfo* info, float 
                             NotifyServerNotetrack(obj, info->notifyName, notifyInfo->name);
                             ++notifyInfo;
                             ++notifyIndex;
-                        } while (notifyIndex < parts->notifyCount && notifyInfo->time < (double)time);
+                        } while (notifyIndex < parts->notifyCount && notifyInfo->time < time);
                     }
                 }
-                else if (info->state.currentAnimTime > (double)time || time == 1.0)
+                else if (info->state.currentAnimTime > time || time == 1.0)
                 {
                     Scr_AddConstString(g_endNotetrackName);
                     Scr_NotifyNum(obj->entnum - 1, 0, info->notifyName, 1u);
                 }
             }
-            else if (info->state.currentAnimTime > (double)time || time == 1.0)
+            else if (info->state.currentAnimTime > time || time == 1.0)
             {
                 Scr_AddConstString(g_endNotetrackName);
                 Scr_NotifyNum(obj->entnum - 1, 0, info->notifyName, 1u);
@@ -1949,7 +2016,7 @@ int __cdecl DObjUpdateServerInfo(DObj_s* obj, float dtime, int bNotify)
 
             iassert(frac >= 0);
 
-            if (frac == 1.0 || (fracDtime = dtime * frac + EQUAL_EPSILON, dtime < (double)fracDtime))
+            if (frac == 1.0 || (fracDtime = dtime * frac + EQUAL_EPSILON, dtime < fracDtime))
             {
                 XAnimUpdateTimeAndNotetrack(obj, tree->children, dtime, 1);
                 return 0;
@@ -2209,7 +2276,7 @@ double __cdecl XAnimGetServerNotifyFracSyncTotal(
         if (infoa->state.weight != 0.0 && infoa->state.goalWeight != 0.0)
         {
             testFrac = XAnimGetServerNotifyFracSyncTotal(obj, infoa, syncState, nextSyncState, dtime);
-            if (minFrac > (double)testFrac)
+            if (minFrac > testFrac)
                 minFrac = testFrac;
         }
     }
@@ -2715,7 +2782,7 @@ void __cdecl XAnimCalcRelDeltaParts(
 
     XAnim_CalcDeltaForTime(parts, time1, Q[0], &vec1);
     XAnim_CalcDeltaForTime(parts, time2, Q[1], &vec2);
-    if (parts->bLoop && time1 > (double)time2)
+    if (parts->bLoop && time1 > time2)
     {
         part = parts->deltaPart;
         trans = part->trans;
@@ -3595,7 +3662,7 @@ int __cdecl XAnimSetGoalWeightNode(
         }
         if (goalWeight != 0.0)
         {
-            if (info->state.weight > (double)goalWeight)
+            if (info->state.weight > goalWeight)
                 v7 = (info->state.weight - goalWeight) / info->state.weight * goalTime;
             else
                 v7 = (goalWeight - info->state.weight) / goalWeight * goalTime;
@@ -3610,6 +3677,27 @@ int __cdecl XAnimSetGoalWeightNode(
         }
     }
     info->state.goalWeight = goalWeight;
+    // this is the single chokepoint every gameplay
+    // caller writes `state.rate` through, so a probe here catches *any*
+    // producer of a negative playback rate, not just the viewmodel one the
+    // weapon anim-rate offset table produced.  A negative rate is what makes
+    // `dtimea` negative in XAnimUpdateTimeAndNotetrackLeaf and trips
+    // `ASSERT FAIL xanim.cpp:1245 (time >= 0)` (and the sibling `time >= 0`
+    // asserts at 903/1305/1799/1840, which the same producer feeds).  The
+    // retail `iassert(rate >= 0)` above is compiled out of release builds, so
+    // this is the only report a hardware run can make.  Gated and capped; the
+    // rate is deliberately written through unchanged.
+    if (rate < 0.0f)
+    {
+        extern const dvar_t *com_diagMarkers;
+        static uint32_t s_d40NegativeRateLog = 0;
+        if (com_diagMarkers && com_diagMarkers->current.enabled && s_d40NegativeRateLog < 8)
+        {
+            ++s_d40NegativeRateLog;
+            Com_Printf(0, "KISAK_D40_NEGRATE rate=%.9g animIndex=%u infoIndex=%u goalWeight=%.9g goalTime=%.9g\n",
+                       rate, animIndex, infoIndex, goalWeight, goalTime);
+        }
+    }
     info->state.rate = rate;
     info->notifyName = notifyName;
     if (notifyName)
@@ -3653,7 +3741,7 @@ uint32_t __cdecl XAnimGetDescendantWithGreatestWeight(const XAnimTree_s* tree, u
         for (infoIndexa = info->children; infoIndexa; infoIndexa = g_xAnimInfo[infoIndexa].next)
         {
             testWeight = g_xAnimInfo[infoIndexa].state.goalWeight;
-            if (bestWeight < (double)testWeight)
+            if (bestWeight < testWeight)
             {
                 test = XAnimGetDescendantWithGreatestWeight(tree, infoIndexa);
                 if (test)
@@ -4104,6 +4192,8 @@ static void XAnimCloneClientAnimInfo(const XAnimInfo *from, XAnimInfo *to)
     to->notifyName = 0;
 }
 
+static int s_cloneDiag = 0;
+
 static void XAnimCloneClientAnimTree_r(
     const XAnimTree_s *from,
     XAnimTree_s *to,
@@ -4125,6 +4215,11 @@ static void XAnimCloneClientAnimTree_r(
     fromInfo = &g_xAnimInfo[fromInfoIndex];
     iassert(fromInfo->inuse);
     animToModel = fromInfo->animToModel;
+    if (s_cloneDiag < 40)
+    {
+        ++s_cloneDiag;
+        
+    }
     if (fromInfo->animToModel)
         SL_AddRefToString(fromInfo->animToModel);
     toInfoIndex = XAnimAllocInfoWithParent(to, animToModel, fromInfo->animIndex, toInfoParentIndex, 1);
@@ -4145,8 +4240,10 @@ void XAnimCloneClientAnimTree(const XAnimTree_s *from, XAnimTree_s *to)
     iassert(to->anims == from->anims);
     iassert(!to->children);
 
+    
     if (from->children)
         XAnimCloneClientAnimTree_r(from, to, from->children, 0);
+    
 }
 
 static uint32_t XAnimTransfer_r(

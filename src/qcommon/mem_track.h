@@ -45,7 +45,6 @@ void __cdecl CG_track_init();
 void __cdecl TRACK_g_memtrack();
 void __cdecl G_track_init();
 void __cdecl TRACK_memtrack();
-void __cdecl track_addbasicinfo(meminfo_t* info, int type, int size);
 void __cdecl track_z_commit(int size, int type);
 void __cdecl track_physical_alloc(int size, const char* name, int type);
 void __cdecl track_hunk_alloc(int size, int pos, const char* name, int type);

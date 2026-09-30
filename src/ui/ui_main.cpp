@@ -39,6 +39,13 @@ const dvar_t *ui_extraBigFont;
 const dvar_t *ui_nextMission;
 const dvar_t *uiscript_debug;
 const dvar_t *ui_autoContinue;
+// Port test knob: > 0 closes the pregame briefing ("press to continue") this
+// many ms after it opened, through the same UI_PlayerStart a button press
+// takes.  Lets a run hold the briefing for a chosen time hands-free (the
+// briefing-length determinism proof); 0 = retail (movie end or a press).
+static const dvar_t *switch_briefingAutoContinueMs;
+static int s_pregameOpenedMs;
+static const char *s_playerStartReason = "playerstart";
 const dvar_t *ui_smallFont;
 const dvar_t *ui_hideMap;
 const dvar_t *ui_savegame;
@@ -54,10 +61,6 @@ static char g_mapname[64];
 static char g_gametype[64];
 static int ui_serverFilterType;
 static bool g_ingameMenusLoaded;
-
-uiInfo_s uiInfo;
-sharedUiInfo_t sharedUiInfo;
-SaveTimeGlob ui_saveTimeGlob;
 
 uiMenuCommand_t g_currentMenuType;
 
@@ -83,6 +86,10 @@ void UI_RegisterDvars()
         0,
         0,
         "Automatically 'click to continue' after loading a level");
+    switch_briefingAutoContinueMs = Dvar_RegisterInt(
+        "switch_briefingAutoContinueMs", 0, 0, 600000, 0,
+        "Test: close the pregame briefing this many ms after it opens (0 = movie end or a press)");
+    Dvar_RegisterBool("switch_loadBarDiag", 0, 0, "Log the briefing loadbar fraction over the load (LOADBAR lines)");
     ui_showList = Dvar_RegisterBool("ui_showList", 0, 0x80u, "Show list of currently visible menus");
     ui_showMenuOnly = Dvar_RegisterString(
         "ui_showMenuOnly",
@@ -138,6 +145,12 @@ void UI_AssetCache()
     // LWSS END
     sharedUiInfo.assets.bigFont = CL_RegisterFont("fonts/bigfont", IMAGE_TRACK_MISC);
     sharedUiInfo.assets.smallFont = CL_RegisterFont("fonts/smallfont", IMAGE_TRACK_MISC);
+#ifdef __SWITCH__
+    {
+        char dbg[128];
+        snprintf(dbg, sizeof(dbg), "UI_AssetCache: smallFont returned %p\n", sharedUiInfo.assets.smallFont);
+    }
+#endif
     sharedUiInfo.assets.consoleFont = CL_RegisterFont("fonts/consolefont", IMAGE_TRACK_MISC);
     sharedUiInfo.assets.boldFont = CL_RegisterFont("fonts/boldfont", IMAGE_TRACK_MISC);
     sharedUiInfo.assets.textFont = CL_RegisterFont("fonts/normalfont", IMAGE_TRACK_MISC);
@@ -682,7 +695,6 @@ void __cdecl UI_DrawSaveGameShot(rectDef_s *rect, double scale, float *color)
     int v4; // r3
     int v5; // r30
     Material *sshotImage; // r3
-    int v11; // r30
 
     v4 = UI_SavegameIndexFromFilename(uiInfo.savegameName);
     if (v4 >= 0 && (v5 = uiInfo.savegameStatus.displaySavegames[v4], v5 >= 0))
@@ -694,15 +706,18 @@ void __cdecl UI_DrawSaveGameShot(rectDef_s *rect, double scale, float *color)
                 goto LABEL_14;
             sshotImage = uiInfo.sshotImage;
         }
-        v11 = v5 << 6;
-        if (*(const char **)((char *)&uiInfo.savegameList[0].imageName + v11))
+        // LP64: the decompiled code indexed savegameList by `v5 << 6`, the
+        // ILP32 sizeof(SavegameInfo) (64). The LP64 record is larger, so any
+        // save past the first read a garbage imageName pointer.
+        const char *imageName = uiInfo.savegameList[v5].imageName;
+        if (imageName)
         {
-            sshotImage = Material_RegisterRawImage(*(const char **)((char *)&uiInfo.savegameList[0].imageName + v11), IMAGE_TRACK_UI);
+            sshotImage = Material_RegisterRawImage(imageName, IMAGE_TRACK_UI);
             uiInfo.sshotImage = sshotImage;
         }
-        if (!*(const char **)((char *)&uiInfo.savegameList[0].imageName + v11) || !sshotImage)
+        if (!imageName || !sshotImage)
             uiInfo.sshotImage = Material_RegisterHandle("unknownsave", IMAGE_TRACK_UI);
-        I_strncpyz(uiInfo.sshotImageName, *(const char **)((char *)&uiInfo.savegameList[0].imageName + v11), 64);
+        I_strncpyz(uiInfo.sshotImageName, imageName, 64);
     }
     else
     {
@@ -1272,7 +1287,6 @@ void __cdecl UI_Init()
     String_Init();
     Menu_Setup(&uiInfo.uiDC);
 
-
     CL_GetScreenDimensions(&uiInfo.uiDC.screenWidth, &uiInfo.uiDC.screenHeight, &uiInfo.uiDC.screenAspect);
     if (480 * uiInfo.uiDC.screenWidth <= 640 * uiInfo.uiDC.screenHeight)
         uiInfo.uiDC.bias = 0.0;
@@ -1296,6 +1310,7 @@ void __cdecl UI_Init()
     {
         UI_AddMenuList(&uiInfo.uiDC, UI_LoadMenus((char *)"ui/menus.txt", 3));
     }
+    Com_Printf(0, "UI_Init: total uiInfo.uiDC.menuCount = %d\n", uiInfo.uiDC.menuCount);
     if (g_mapname[0] && !IsFastFileLoad())
     {
         UI_MapLoadInfo(va("maps/%s.csv", g_mapname));
@@ -1305,30 +1320,6 @@ void __cdecl UI_Init()
     Menus_CloseAll(&uiInfo.uiDC);
     Dvar_RegisterBool("ui_multiplayer", 0, 0x40u, "True if the game is multiplayer");
     uiscript_debug = Dvar_RegisterInt("uiscript_debug", 0, 0, 2, 0, "spam debug info for the ui script");
-}
-
-void __cdecl UI_KeyEvent(int localClientNum, int key, int down)
-{
-    menuDef_t *Focused; // r30
-
-    if (Menu_Count(&uiInfo.uiDC))
-    {
-        Focused = Menu_GetFocused(&uiInfo.uiDC);
-        if (!Focused)
-            goto LABEL_10;
-        if (key != 2 || !down || Menus_AnyFullScreenVisible(&uiInfo.uiDC) || Focused->onESC)
-            Menu_HandleKey(&uiInfo.uiDC, Focused, key, down);
-        else
-            Menus_CloseAll(&uiInfo.uiDC);
-        if (!Menu_GetFocused(&uiInfo.uiDC))
-        {
-        LABEL_10:
-            Key_RemoveCatcher(localClientNum, ~KEYCATCH_UI);
-            Key_ClearStates(localClientNum);
-            if (!CL_SkipRendering())
-                Dvar_SetIntByName("cl_paused", 0);
-        }
-    }
 }
 
 uiMenuCommand_t __cdecl UI_GetActiveMenu(int localClientNum)
@@ -1414,25 +1405,13 @@ char *__cdecl UI_SafeTranslateString(const char *reference)
             Com_Error(ERR_LOCALIZATION, "Could not translate string \"%s\"", v1);
         else
             Com_PrintWarning(CON_CHANNEL_UI, "WARNING: Could not translate string \"%s\"\n", v1);
-        v3 = errorString;
-        v4 = "^1UNLOCALIZED(^7";
-        v5 = 17;
-        do
-        {
-            *v3++ = *v4++;
-            --v5;
-        } while (v5);
-        I_strncat(errorString, 1024, v1);
-        I_strncat(errorString, 1024, "^1)^7");
+        I_strncpyz(errorString, "^1UNLOCALIZED(^7", sizeof(errorString));
+        I_strncat(errorString, sizeof(errorString), v1);
+        I_strncat(errorString, sizeof(errorString), "^1)^7");
     }
     else
     {
-        v6 = (char*)v1;
-        do
-        {
-            v7 = *(unsigned __int8 *)v6;
-            (v6++)[errorString - v1] = v7;
-        } while (v7);
+        I_strncpyz(errorString, v1, sizeof(errorString));
     }
     return errorString;
 }
@@ -1489,12 +1468,6 @@ void __cdecl UI_ReplaceConversions(
     int v13; // r28
     char *v14; // r30
     int v15; // r31
-    int v16; // r31
-    unsigned __int8 *v17; // r11
-    unsigned __int8 *v19; // r10
-    int v20; // r11
-    int v21; // r10
-    char v22; // r9
 
     if (!sourceString)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\ui\\ui_main.cpp", 2701, 0, "%s", "sourceString");
@@ -1553,23 +1526,17 @@ void __cdecl UI_ReplaceConversions(
                         "%s\n\t(argIndex) = %i",
                         "(argIndex < 9)",
                         v15);
-                v16 = 4 * (v15 + 1);
-                if (!*(int *)((char *)&arguments->argCount + v16))
+                // LP64: read args[] through the typed field. The decompiler
+                // addressed it as `(char *)&arguments->argCount + 4 * (i + 1)`
+                // (ILP32: argCount at 0, args[] at 4, 4-byte pointers). Here
+                // args[] starts at 8 with 8-byte pointers, so that offset read
+                // uninitialized padding and asserted / dereferenced garbage the
+                // first time a use hint carried a `&&N` conversion.
+                const char *argString = arguments->args[v15];
+                if (!argString)
                     MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\ui\\ui_main.cpp", 2731, 0, "%s", "arguments->args[argIndex]");
-                v17 = *(unsigned __int8 **)((char *)&arguments->argCount + v16);
-                while (*v17++)
-                    ;
-                v19 = &v17[-*(int *)((char *)&arguments->argCount + v16)];
-                v20 = 0;
-                v21 = (int)(v19 - 1);
-                if (v21 > 0)
-                {
-                    do
-                    {
-                        v22 = *(_BYTE *)(*(int *)((char *)&arguments->argCount + v16) + v20++);
-                        outputString[v12++] = v22;
-                    } while (v20 < v21);
-                }
+                while (*argString)
+                    outputString[v12++] = *argString++;
                 v13 += 3;
             }
         }
@@ -1654,6 +1621,10 @@ void UI_PlayerStart()
             "%s\n\t(UI_GetActiveMenu( 0 )) = %i",
             "(UI_GetActiveMenu( 0 ) == UIMENU_PREGAME || UI_GetActiveMenu( 0 ) == UIMENU_MAIN)",
             g_currentMenuType);
+    if (g_currentMenuType == UIMENU_PREGAME)
+        Com_Printf(CON_CHANNEL_SERVER, "BRIEFING_EXIT reason=%s briefing_ms=%d\n", s_playerStartReason,
+                   Sys_Milliseconds() - s_pregameOpenedMs);
+    s_playerStartReason = "playerstart";
     CL_SetSkipRendering(0);
     UI_SetActiveMenu(0, UIMENU_NONE);
     if (R_Cinematic_IsNextReady())
@@ -1694,6 +1665,23 @@ void UI_LoadModsList()
 
 void __cdecl UI_Refresh()
 {
+#ifdef KISAK_SP
+    // A menu opened by the game (PlayerCmd_OpenMenu -> "openmenu" ->
+    // UI_OpenMenu_f) never goes through UI_SetActiveMenu, which is where every
+    // other menu takes the UI key catcher. Without the catcher the Switch pad
+    // keeps treating A/B as gameplay buttons (switch_input.c's menu-only
+    // bindings are withheld while Switch_ClientGameplayActive() is true), so a
+    // script menu cannot be answered at all: killhouse's invert_axis popup in
+    // the rifle training was unselectable, the same class as the pad never
+    // delivering console commands. Take the catcher
+    // while any menu is open, and release exactly that bit once the last one
+    // closes -- the menu can be dismissed by its own item action, so this
+    // cannot live in UI_CloseMenu_f alone.
+    if (uiInfo.uiDC.openMenuCount)
+        Key_SetCatcher(0, 16); // KEYCATCH_UI
+    else if ((clientUIActives[0].keyCatchers & 16) != 0)
+        Key_SetCatcher(0, clientUIActives[0].keyCatchers & ~16);
+#endif
     UI_UpdateSaveUI();
     if (Menu_Count(&uiInfo.uiDC) > 0)
     {
@@ -1703,7 +1691,16 @@ void __cdecl UI_Refresh()
             if (Menu_IsMenuOpenAndVisible(0, "pregame"))
             {
                 if (R_Cinematic_IsFinished())
+                {
+                    s_playerStartReason = "movie_end";
                     UI_PlayerStart();
+                }
+                else if (switch_briefingAutoContinueMs && switch_briefingAutoContinueMs->current.integer > 0
+                         && Sys_Milliseconds() - s_pregameOpenedMs >= switch_briefingAutoContinueMs->current.integer)
+                {
+                    s_playerStartReason = "auto_ms";
+                    UI_PlayerStart();
+                }
             }
         }
 
@@ -2107,7 +2104,7 @@ void UI_CreatePlayerProfile()
 
     if (strlen(ui_playerProfileNameNew->current.string))
     {
-        I_strncpyz(name, (char *)ui_playerProfileNameNew->current.integer, 32);
+        I_strncpyz(name, ui_playerProfileNameNew->current.string, 32);
         Dvar_SetString((dvar_s *)ui_playerProfileNameNew, (char *)"");
 
         uiInfo_s *uiInfo = &::uiInfo;
@@ -2486,8 +2483,20 @@ int __cdecl UI_SetActiveMenu(int localClientNum, uiMenuCommand_t menu)
     uiMenuCommand_t v4; // r11
     const char *String; // r3
 
+#ifdef __SWITCH__
+    char bootBuf[128];
+    snprintf(bootBuf, sizeof(bootBuf), "UI_SetActiveMenu: localClientNum=%d, menu=%d, menuCount=%d\n", localClientNum, (int)menu, Menu_Count(&uiInfo.uiDC));
+#endif
     if (Menu_Count(&uiInfo.uiDC) <= 0)
-        return 0;
+    {
+        MenuList *menus = UI_LoadMenus((char *)"ui/menus.txt", 3);
+        if (menus)
+        {
+            UI_AddMenuList(&uiInfo.uiDC, menus);
+        }
+        if (Menu_Count(&uiInfo.uiDC) <= 0)
+            return 0;
+    }
     if (menu == UIMENU_BRIEFING)
     {
         if (g_currentMenuType == UIMENU_BRIEFING)
@@ -2535,8 +2544,10 @@ int __cdecl UI_SetActiveMenu(int localClientNum, uiMenuCommand_t menu)
         }
         break;
     case UIMENU_PREGAME:
+        s_pregameOpenedMs = Sys_Milliseconds();
         if (UI_AutoContinue())
         {
+            s_playerStartReason = "ui_autoContinue";
             UI_PlayerStart();
             result = 1;
         }
@@ -2615,40 +2626,28 @@ void __cdecl UI_DrawConnectScreen()
 
 char *__cdecl UI_ReplaceConversionString(const char *sourceString, const char *replaceString)
 {
-    int v2[2]; // r10
-    ConversionArguments v4; // [sp+50h] [-440h] BYREF
-    char v5[1032]; // [sp+80h] [-410h] BYREF
+    ConversionArguments v4;
+    char v5[1032];
 
-    v2[1] = 0;
-    v2[0] = (int)replaceString;
-    *(_QWORD *)&v4.args[1] = *(_QWORD *)v2;
-    *(_QWORD *)&v4.args[3] = *(_QWORD *)v2;
-    *(_QWORD *)&v4.args[5] = *(_QWORD *)v2;
-    *(_QWORD *)&v4.args[7] = *(_QWORD *)v2;
+    memset(&v4, 0, sizeof(v4));
     v4.args[0] = replaceString;
     v4.argCount = 1;
     UI_ReplaceConversions(sourceString, &v4, v5, 1024);
-    return va(v5);
+    return va("%s", v5);
 }
 
 char *__cdecl UI_ReplaceConversionInt(const char *sourceString, int replaceInt)
 {
-    __int64 v2; // r10
-    ConversionArguments v5; // [sp+50h] [-460h] BYREF
-    char v6[32]; // [sp+80h] [-430h] BYREF
-    char v7[1024]; // [sp+A0h] [-410h] BYREF
+    ConversionArguments v5;
+    char v6[32];
+    char v7[1024];
 
-    LODWORD(v2) = 0;
-    HIDWORD(v2) = 0x82000000;
-    *(_QWORD *)&v5.args[1] = v2;
-    *(_QWORD *)&v5.args[3] = v2;
-    *(_QWORD *)&v5.args[5] = v2;
-    *(_QWORD *)&v5.args[7] = v2;
+    memset(&v5, 0, sizeof(v5));
     snprintf(v6, ARRAYSIZE(v6), "%d", replaceInt);
     v5.argCount = 1;
     v5.args[0] = v6;
-    UI_ReplaceConversions(sourceString, &v5, v7, 0x400u);
-    return va(v7);
+    UI_ReplaceConversions(sourceString, &v5, v7, 1024);
+    return va("%s", v7);
 }
 
 char *__cdecl UI_ReplaceConversionInts(

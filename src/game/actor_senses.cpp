@@ -198,9 +198,15 @@ int __cdecl Actor_CanShootFrom(actor_s *self, const float *vTarget, const float 
     return v11;
 }
 
-int __cdecl compare_sentient_sort(unsigned int *pe1, unsigned int *pe2)
+int __cdecl compare_sentient_sort(const void *pe1, const void *pe2)
 {
-    return pe2[1] - pe1[1];
+    const sentient_sort_t *sentient1 = static_cast<const sentient_sort_t *>(pe1);
+    const sentient_sort_t *sentient2 = static_cast<const sentient_sort_t *>(pe2);
+    if (sentient1->fMetric < sentient2->fMetric)
+        return 1;
+    if (sentient1->fMetric > sentient2->fMetric)
+        return -1;
+    return 0;
 }
 
 void __cdecl Actor_UpdateLastKnownPos(actor_s *self, sentient_s *other)
@@ -797,7 +803,7 @@ void __cdecl Actor_UpdateSight(actor_s *self)
 
         if (iCheckCount > 1)
         {
-            qsort(check, iCheckCount, sizeof(sentient_sort_t), (int(__cdecl *)(const void *, const void *))compare_sentient_sort);
+            qsort(check, iCheckCount, sizeof(*check), compare_sentient_sort);
         }
     }
 
@@ -814,4 +820,3 @@ void __cdecl Actor_UpdateSight(actor_s *self)
         }
     }
 }
-

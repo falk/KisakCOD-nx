@@ -20,12 +20,12 @@ void EmitStatement(sval_u val, bool lastStatement, uint32_t endSourcePos, scr_bl
 void EmitOpcode(uint32_t op, int offset, int callType);
 void Scr_CalcLocalVarsVariableExpressionRef(sval_u expr, scr_block_s *block);
 void Scr_CalcLocalVarsDeveloperStatementList(sval_u val, scr_block_s *block, sval_u *devStatBlock);
-void EmitExpression(sval_u expr, scr_block_s *block);
+void EmitExpression(const sval_u &expr, scr_block_s *block);
 void Scr_CalcLocalVarsStatementList(sval_u val, scr_block_s *block);
 void Scr_CalcLocalVarsStatement(sval_u val, scr_block_s *block);
-bool EmitOrEvalPrimitiveExpression(sval_u expr, VariableCompileValue *constValue, scr_block_s *block);
-void EmitExpression(sval_u expr, scr_block_s *block);
-bool EmitOrEvalExpression(sval_u expr, VariableCompileValue *constValue, scr_block_s *block);
+bool EmitOrEvalPrimitiveExpression(const sval_u &expr, VariableCompileValue *constValue, scr_block_s *block);
+void EmitExpression(const sval_u &expr, scr_block_s *block);
+bool EmitOrEvalExpression(const sval_u &expr, VariableCompileValue *constValue, scr_block_s *block);
 bool EvalExpression(sval_u expr, VariableCompileValue *constValue);
 void EmitStatementList(sval_u val, bool lastStatement, uint32_t endSourcePos, scr_block_s *block);
 void EmitPrimitiveExpressionFieldObject(sval_u expr, sval_u sourcePos, scr_block_s *block);
@@ -88,12 +88,12 @@ CompareCaseInfo
 */
 int CompareCaseInfo(const void *elem1, const void *elem2)
 {
-	if (*(intptr_t *)elem1 > *(intptr_t *)elem2)
+	if (*(const uint32_t *)elem1 > *(const uint32_t *)elem2)
 	{
 		return -1;
 	}
 
-	return *(intptr_t *)elem1 < *(intptr_t *)elem2;
+	return *(const uint32_t *)elem1 < *(const uint32_t *)elem2;
 }
 
 /*
@@ -253,7 +253,7 @@ sval_u *GetSingleParameter(sval_u exprlist)
 EmitExpressionList
 ============
 */
-int EmitExpressionList(sval_u exprlist, scr_block_s *block)
+int EmitExpressionList(const sval_u &exprlist, scr_block_s *block)
 {
 	sval_u *node;
 	int expr_count = 0;
@@ -608,7 +608,7 @@ void EmitCaseStatementInfo(uint32_t name, sval_u sourcePos)
 	}
 
 	//newCaseStatement = (CaseStatementInfo *)Hunk_AllocateTempMemoryHighInternal(sizeof(*newCaseStatement));
-	newCaseStatement = (CaseStatementInfo *)Hunk_AllocateTempMemoryHigh(16, "EmitCaseStatementInfo");
+	newCaseStatement = (CaseStatementInfo *)Hunk_AllocateTempMemoryHigh(sizeof(*newCaseStatement), "EmitCaseStatementInfo");
 
 	newCaseStatement->name = name;
 	newCaseStatement->codePos = (char *)TempMalloc(0);
@@ -639,7 +639,7 @@ void ConnectContinueStatements()
 
 	for (ContinueStatementInfo *statement = scrCompileGlob.currentContinueStatement; statement; statement = statement->next)
 	{
-		*(intptr_t *)statement->codePos = codePos - statement->nextCodePos;
+		*(int *)statement->codePos = static_cast<int>(codePos - statement->nextCodePos);
 	}
 }
 
@@ -655,7 +655,7 @@ void ConnectBreakStatements()
 
 	for (BreakStatementInfo *statement = scrCompileGlob.currentBreakStatement; statement; statement = statement->next)
 	{
-		*(intptr_t *)statement->codePos = codePos - statement->nextCodePos;
+		*(int *)statement->codePos = static_cast<int>(codePos - statement->nextCodePos);
 	}
 }
 
@@ -697,7 +697,7 @@ void Scr_BeginDevScript(int *type, char **savedPos)
 	*type = BUILTIN_DEVELOPER_ONLY;
 }
 
-int __cdecl AddFunction(int func, const char *name)
+int __cdecl AddFunction(intptr_t func, const char *name)
 {
 	int i; // [esp+0h] [ebp-4h]
 
@@ -1411,7 +1411,7 @@ void EmitGetInteger(int value, sval_u sourcePos)
 	}
 	EmitOpcode(OP_GetInteger, 1, 0);
 	AddOpcodePos(sourcePos.stringValue, 1);
-	EmitCodepos((const char*)value);
+	EmitInteger(value);
 }
 
 /*
@@ -1930,7 +1930,8 @@ void EmitPostScriptThreadPointer(sval_u expr, int param_count, bool bMethod, sva
 		EmitOpcode(OP_ScriptThreadCallPointer, -param_count, CALL_THREAD);
 
 	AddOpcodePos(sourcePos.sourcePosValue, SOURCE_TYPE_BREAKPOINT);
-	EmitCodepos((const char *)param_count);
+	// Thread parameter counts remain 32-bit script operands.
+	EmitInteger(param_count);
 }
 
 /*
@@ -2464,7 +2465,7 @@ void EmitContinueStatement(sval_u sourcePos, scr_block_s *block)
 	EmitOpcode(OP_jump, 0, CALL_NONE);
 	AddOpcodePos(sourcePos.stringValue, SOURCE_TYPE_BREAKPOINT);
 
-	EmitCodepos(0);
+	EmitInteger(0);
 
 	//newContinueStatement = (ContinueStatementInfo *)Hunk_AllocateTempMemoryHighInternal(sizeof(*newContinueStatement));
 	newContinueStatement = (ContinueStatementInfo*)Hunk_AllocateTempMemoryHigh(sizeof(ContinueStatementInfo), "EmitContinueStatement");
@@ -2499,7 +2500,7 @@ void EmitBreakStatement(sval_u sourcePos, scr_block_s *block)
 	EmitOpcode(OP_jump, 0, CALL_NONE);
 	AddOpcodePos(sourcePos.sourcePosValue, SOURCE_TYPE_BREAKPOINT);
 
-	EmitCodepos(0);
+	EmitInteger(0);
 
 	//newBreakStatement = (BreakStatementInfo *)Hunk_AllocateTempMemoryHighInternal(sizeof(*newBreakStatement));
 	newBreakStatement = (BreakStatementInfo *)Hunk_AllocateTempMemoryHigh(sizeof(BreakStatementInfo), "EmitBreakStatement");
@@ -2688,7 +2689,12 @@ uint32_t SpecifyThreadPosition(uint32_t posId, uint32_t name, uint32_t sourcePos
 	if (pos.type == VAR_UNDEFINED)
 	{
 		pos.type = (Vartype_t)type;
-		pos.u.intValue = 0;
+		// LP64: this slot is read back as pos.u.codePosValue, so the whole
+		// pointer-width union must be cleared. Writing only u.intValue left
+		// the high four bytes of the stack local uninitialized; a forward
+		// far-function reference then read a garbage code position and
+		// emitted it verbatim (e.g. maps\_vehicle::scripted_spawn).
+		pos.u.codePosValue = 0;
 
 		SetNewVariableValue(id, &pos);
 		return id;
@@ -2938,9 +2944,10 @@ void EmitObject(sval_u expr, sval_u sourcePos)
 	entnum = atoi(s + 1);
 	if (!entnum && s[1] != 48)
 		goto LABEL_17;
-	EmitOpcode(0x81u, 1, 0);
-	EmitCodepos((const char*)classnum);
-	EmitCodepos((const char*)entnum);
+	EmitOpcode(OP_object, 1, CALL_NONE);
+	// OP_object consumes two serialized 32-bit IDs, never code positions.
+	EmitInteger(classnum);
+	EmitInteger(entnum);
 }
 
 /*
@@ -3399,7 +3406,8 @@ void EmitPostScriptThread(sval_u func, int param_count, bool bMethod, sval_u sou
 
 	AddOpcodePos(sourcePos.sourcePosValue, SOURCE_TYPE_BREAKPOINT | SOURCE_TYPE_CALL);
 	EmitFunction(func, sourcePos);
-	EmitCodepos((const char *)param_count);
+	// Thread parameter counts remain 32-bit script operands.
+	EmitInteger(param_count);
 }
 
 /*
@@ -3999,7 +4007,7 @@ script_method:
 	EmitCallBuiltinMethodOpcode(param_count, sourcePos);
 
 	//EmitUnsignedShort(AddFunction(meth, pName));
-	EmitShort(AddFunction((int)meth, pName));
+	EmitShort(AddFunction((intptr_t)meth, pName));
 
 	AddOpcodePos(methodSourcePos.sourcePosValue, SOURCE_TYPE_NONE);
 	AddExpressionListOpcodePos(params);
@@ -4022,7 +4030,7 @@ script_method:
 EmitCall
 ============
 */
-void EmitCall(sval_u func_name, sval_u params, bool bStatement, scr_block_s *block)
+void EmitCall(const sval_u &func_name, const sval_u &params, bool bStatement, scr_block_s *block)
 {
 	VariableValue value;
 	uint32_t funcId, name;
@@ -4226,7 +4234,7 @@ void EmitCallExpressionFieldObject(sval_u expr, scr_block_s *block)
 EmitCallExpression
 ============
 */
-void EmitCallExpression(sval_u expr, bool bStatement, scr_block_s *block)
+void EmitCallExpression(const sval_u &expr, bool bStatement, scr_block_s *block)
 {
 	if (expr.node[0].type == ENUM_call)
 	{
@@ -4402,7 +4410,7 @@ void EmitVariableExpression(sval_u expr, scr_block_s *block)
 EmitOrEvalPrimitiveExpression
 ============
 */
-bool EmitOrEvalPrimitiveExpression(sval_u expr, VariableCompileValue *constValue, scr_block_s *block)
+bool EmitOrEvalPrimitiveExpression(const sval_u &expr, VariableCompileValue *constValue, scr_block_s *block)
 {
 	switch (expr.node[0].type)
 	{
@@ -4467,7 +4475,7 @@ bool EmitOrEvalPrimitiveExpression(sval_u expr, VariableCompileValue *constValue
 EmitOrEvalExpression
 ============
 */
-bool EmitOrEvalExpression(sval_u expr, VariableCompileValue *constValue, scr_block_s *block)
+bool EmitOrEvalExpression(const sval_u &expr, VariableCompileValue *constValue, scr_block_s *block)
 {
 	switch (expr.node[0].type)
 	{
@@ -4579,7 +4587,7 @@ void EmitForStatement(sval_u stmt1, sval_u expr, sval_u stmt2, sval_u stmt, sval
 	oldContinueChildCount = scrCompileGlob.continueChildCount;
 	breakChildCount = 0;
 	continueChildCount = 0;
-	continueChildBlocks = (scr_block_s**)Hunk_AllocateTempMemoryHigh(4096, "EmitForStatement");
+		continueChildBlocks = (scr_block_s**)Hunk_AllocateTempMemoryHigh(sizeof(*continueChildBlocks) * 1024, "EmitForStatement");
 	scrCompileGlob.continueChildBlocks = continueChildBlocks;
 	scrCompileGlob.continueChildCount = &continueChildCount;
 	scrCompileGlob.breakBlock = forStatBlock->block;
@@ -4587,7 +4595,7 @@ void EmitForStatement(sval_u stmt1, sval_u expr, sval_u stmt2, sval_u stmt, sval
 	{
 		pos2 = 0;
 		nextPos2 = 0;
-		breakChildBlocks = (scr_block_s**)Hunk_AllocateTempMemoryHigh(4096, "EmitForStatement");
+			breakChildBlocks = (scr_block_s**)Hunk_AllocateTempMemoryHigh(sizeof(*breakChildBlocks) * 1024, "EmitForStatement");
 		scrCompileGlob.breakChildCount = &breakChildCount;
 	}
 	else
@@ -4708,7 +4716,7 @@ void EmitWhileStatement(sval_u expr, sval_u stmt, sval_u sourcePos, sval_u while
 	{
 		pos2 = 0;
 		nextPos2 = 0;
-		breakChildBlocks = (scr_block_s**)Hunk_AllocateTempMemoryHigh(4096, "EmitWhileStatement");
+			breakChildBlocks = (scr_block_s**)Hunk_AllocateTempMemoryHigh(sizeof(*breakChildBlocks) * 1024, "EmitWhileStatement");
 		scrCompileGlob.breakChildCount = &breakChildCount;
 	}
 	else
@@ -4774,7 +4782,7 @@ void EmitWhileStatement(sval_u expr, sval_u stmt, sval_u sourcePos, sval_u while
 EmitExpression
 ============
 */
-void EmitExpression(sval_u expr, scr_block_s *block)
+void EmitExpression(const sval_u &expr, scr_block_s *block)
 {
 	VariableCompileValue constValue;
 
@@ -4851,22 +4859,22 @@ void EmitSwitchStatement(sval_u expr, sval_u stmtlist, sval_u sourcePos, bool la
 
 	while (caseStatement)
 	{
-		EmitCodepos((const char*)caseStatement->name);
+		EmitInteger(static_cast<int>(caseStatement->name));
 		EmitCodepos(caseStatement->codePos);
 		caseStatement = caseStatement->next;
 		num++;
 	}
 
 	*(unsigned short *)pos2 = num;
-	qsort(pos3, num, 8u, CompareCaseInfo);
+	qsort(pos3, num, sizeof(uint32_t) + sizeof(const char *), CompareCaseInfo);
 
 	while (num > 1)
 	{
-		if (*(intptr_t *)pos3 == *((intptr_t *)pos3 + 2))
+		if (*(uint32_t *)pos3 == *(uint32_t *)(pos3 + sizeof(uint32_t) + sizeof(const char *)))
 		{
 			for (CaseStatementInfo *caseStatementa = scrCompileGlob.currentCaseStatement; caseStatementa; caseStatementa = caseStatementa->next)
 			{
-				if (caseStatementa->name == *(intptr_t *)pos3)
+			if (caseStatementa->name == *(uint32_t *)pos3)
 				{
 					CompileError(caseStatementa->sourcePos, "duplicate case expression");
 					return;
@@ -4874,7 +4882,7 @@ void EmitSwitchStatement(sval_u expr, sval_u stmtlist, sval_u sourcePos, bool la
 			}
 		}
 		--num;
-		pos3 += 8;
+		pos3 += sizeof(uint32_t) + sizeof(const char *);
 	}
 
 	ConnectBreakStatements();
@@ -5049,7 +5057,7 @@ void EmitIfElseStatement(sval_u expr, sval_u stmt1, sval_u stmt2, sval_u sourceP
 	if (lastStatement)
 	{
 		EmitEnd();
-		EmitCodepos(0);
+		EmitInteger(0);
 		AddOpcodePos(endSourcePos, SOURCE_TYPE_BREAKPOINT);
 
 		pos2 = NULL;
@@ -5059,7 +5067,12 @@ void EmitIfElseStatement(sval_u expr, sval_u stmt1, sval_u stmt2, sval_u sourceP
 	{
 		EmitOpcode(OP_jump, 0, CALL_NONE);
 		AddOpcodePos(elseSourcePos.sourcePosValue, SOURCE_TYPE_BREAKPOINT);
-		EmitCodepos(0);
+		// LP64: OP_jump's operand is a 4-byte int offset in the VM
+		// (VM_ExecuteInternal's `Scr_ReadInt`), and OP_endswitch's per-case
+		// stride / ConnectBreakStatements' `*(int*)codePos` patch both use
+		// sizeof(int). EmitCodepos writes sizeof(const char*) (8 on LP64),
+		// which desynced the instruction stream after the first if/else.
+		EmitInteger(0);
 
 		pos2 = (const char *)scrCompileGlob.codePos;
 		nextPos2 = TempMalloc(0);
@@ -5085,7 +5098,7 @@ void EmitIfElseStatement(sval_u expr, sval_u stmt1, sval_u stmt2, sval_u sourceP
 	if (!lastStatement)
 	{
 		offset = TempMallocAlignStrict(0) - nextPos2;
-		*(intptr_t *)pos2 = offset;
+		*(int *)pos2 = static_cast<int>(offset);
 	}
 
 	Scr_InitFromChildBlocks(childBlocks, childCount, block);

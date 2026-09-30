@@ -392,15 +392,15 @@ struct ItemKeyHandler // sizeof=0xC
 
 union operandInternalDataUnion // sizeof=0x4
 {                                       // ...
-    operandInternalDataUnion()
+    operandInternalDataUnion() : string(nullptr) // LP64: clear the pointer-width member first
     {
         intVal = 0;
     }
-    operandInternalDataUnion(int i)
+    operandInternalDataUnion(int i) : string(nullptr) // LP64: clear the pointer-width member first
     {
         intVal = i;
     }
-    operandInternalDataUnion(float f)
+    operandInternalDataUnion(float f) : string(nullptr) // LP64: clear the pointer-width member first
     {
         floatVal = f;
     }
@@ -416,6 +416,10 @@ union operandInternalDataUnion // sizeof=0x4
     operator float()
     {
         return floatVal;
+    }
+    operator const char *()
+    {
+        return string;
     }
     int intVal;
     float floatVal;
@@ -545,15 +549,15 @@ struct menuDef_t // sizeof=0x11C
 
 union UILocalVar_u // sizeof=0x4
 {                                       // ...
-    UILocalVar_u()
+    UILocalVar_u() : string(nullptr) // LP64: clear the pointer-width member first
     {
         integer = 0;
     }
-    UILocalVar_u(int i)
+    UILocalVar_u(int i) : string(nullptr) // LP64: clear the pointer-width member first
     {
         integer = i;
     }
-    UILocalVar_u(float f)
+    UILocalVar_u(float f) : string(nullptr) // LP64: clear the pointer-width member first
     {
         value = f;
     }
@@ -677,7 +681,7 @@ struct __declspec(align(8)) token_s // sizeof=0x430
     // padding byte
     // padding byte
     // padding byte
-    long double floatvalue;             // ...
+    double floatvalue;             // ...
     char *whitespace_p;                 // ...
     char *endwhitespace_p;              // ...
     int line;                           // ...
@@ -695,7 +699,7 @@ struct __declspec(align(8)) value_s // sizeof=0x20
     // padding byte
     // padding byte
     // padding byte
-    long double floatvalue;
+    double floatvalue;
     int parentheses;
     value_s *prev;
     value_s *next;
@@ -1409,10 +1413,13 @@ struct KeywordHashEntry
     }
     int KeywordHash_PickSeed(int count)
     {
-        for (int seed = 0; !IsValidSeed(count, HASH_SEED); seed++)
+        // Unfinished: the pasted bodies below were never completed; this
+        // template is not instantiated anywhere (see ui_shared_obj.cpp).
+        for (int seed = 0; !KeywordHash_IsValidSeed(count, HASH_SEED); seed++)
         {
             iassert(seed != 65536);
         }
+        return 0;
     }
     void KeywordHash_Validate()
     {

@@ -171,7 +171,7 @@ void __cdecl CM_Trace(
     iassert((tw.size[0] - tw.size[2]) < CAPSULE_SIZE_EPSILON);
     iassert((tw.size[1] - tw.size[2]) < CAPSULE_SIZE_EPSILON);
 
-    if (tw.size[2] >= (double)tw.size[0])
+    if (tw.size[2] >= tw.size[0])
         tw.radius = tw.size[0];
     else
         tw.radius = tw.size[2];
@@ -268,7 +268,7 @@ void __cdecl CM_Trace(
     }
     if (!results->walkable && !results->startsolid)
         results->walkable = results->normal[2] >= 0.699999988079071;
-    if (oldFrac > (double)results->fraction)
+    if (oldFrac > results->fraction)
     {
         iassert( results->surfaceFlags != SURF_INVALID );
     }
@@ -297,12 +297,31 @@ void __cdecl CM_GetTraceThreadInfo(TraceThreadInfo *threadInfo)
     if (!threadInfo->checkcount.partitions)
     {
         if (cm.partitionCount)
+        {
+            extern TraceThreadInfo g_traceThreadInfo[];
+            static int s_traceMissingDiag;
+            if (s_traceMissingDiag < 3)
+            {
+                ++s_traceMissingDiag;
+                
+                void **fp = (void **)__builtin_frame_address(0);
+                int depth;
+                for (depth = 0; depth < 10 && fp && (uintptr_t)fp > 0x1000; ++depth)
+                {
+                    void **caller = (void **)fp[0];
+                    
+                    if (!caller || caller <= fp)
+                        break;
+                    fp = caller;
+                }
+            }
             MyAssertHandler(
                 ".\\qcommon\\cm_trace.cpp",
                 62,
                 0,
                 "%s",
                 "threadInfo->checkcount.partitions || cm.partitionCount == 0");
+        }
     }
 }
 
@@ -322,9 +341,9 @@ bool __cdecl CM_TestInLeafBrushNode(traceWork_t *tw, cLeaf_t *leaf, trace_t *tra
     iassert( leaf->leafBrushNode );
     for (i = 0; i < 3; ++i)
     {
-        if (leaf->mins[i] >= (double)tw->bounds[1][i])
+        if (leaf->mins[i] >= tw->bounds[1][i])
             return 0;
-        if (leaf->maxs[i] <= (double)tw->bounds[0][i])
+        if (leaf->maxs[i] <= tw->bounds[0][i])
             return 0;
     }
     CM_TestInLeafBrushNode_r(tw, &cm.leafbrushNodes[leaf->leafBrushNode], trace);
@@ -361,9 +380,9 @@ void __cdecl CM_TestInLeafBrushNode_r(const traceWork_t *tw, cLeafBrushNode_s *n
             if (trace->allsolid)
                 return;
         }
-        if (node->data.children.dist >= (double)tw->bounds[0][node->axis])
+        if (node->data.children.dist >= tw->bounds[0][node->axis])
         {
-            if (node->data.children.dist <= (double)tw->bounds[1][node->axis])
+            if (node->data.children.dist <= tw->bounds[1][node->axis])
             {
                 CM_TestInLeafBrushNode_r(tw, &node[node->data.children.childOffset[0]], trace);
                 if (trace->allsolid)
@@ -410,12 +429,12 @@ void __cdecl CM_TestBoxInBrush(const traceWork_t *tw, cbrush_t *brush, trace_t *
             "%s",
             "!IS_NAN((tw->extents.end)[0]) && !IS_NAN((tw->extents.end)[1]) && !IS_NAN((tw->extents.end)[2])");
     }
-    if (brush->maxs[0] > (double)tw->bounds[0][0]
-        && brush->maxs[1] > (double)tw->bounds[0][1]
-        && brush->maxs[2] > (double)tw->bounds[0][2]
-        && brush->mins[0] < (double)tw->bounds[1][0]
-        && brush->mins[1] < (double)tw->bounds[1][1]
-        && brush->mins[2] < (double)tw->bounds[1][2])
+    if (brush->maxs[0] > tw->bounds[0][0]
+        && brush->maxs[1] > tw->bounds[0][1]
+        && brush->maxs[2] > tw->bounds[0][2]
+        && brush->mins[0] < tw->bounds[1][0]
+        && brush->mins[1] < tw->bounds[1][1]
+        && brush->mins[2] < tw->bounds[1][2])
     {
         side = brush->sides;
         i = brush->numsides;
@@ -846,7 +865,7 @@ void __cdecl CM_TraceThroughBrush(const traceWork_t *tw, cbrush_t *brush, trace_
                 if (d2 > 0.0)
                 {
                     fraca = d1 * tw->extents.invDelta[j] * sign;
-                    if (enterFrac >= (double)fraca)
+                    if (enterFrac >= fraca)
                         return;
                     allsolid = 0;
                     v7 = fraca - leaveFrac;
@@ -864,14 +883,14 @@ void __cdecl CM_TraceThroughBrush(const traceWork_t *tw, cbrush_t *brush, trace_
                     v8 = 0.125;
                 else
                     v8 = d1;
-                if (v8 <= (double)d2)
+                if (v8 <= d2)
                     return;
                 frac = (d1 - 0.125) * tw->extents.invDelta[j] * sign;
-                if (leaveFrac <= (double)frac)
+                if (leaveFrac <= frac)
                     return;
                 if (d2 > 0.0)
                     allsolid = 0;
-                if (enterFrac >= (double)frac)
+                if (enterFrac >= frac)
                 {
                     if (leadside)
                         continue;
@@ -938,7 +957,7 @@ void __cdecl CM_TraceThroughBrush(const traceWork_t *tw, cbrush_t *brush, trace_
                     if (d1a > leaveFrac * delta)
                     {
                         leaveFrac = d1a / delta;
-                        if (leaveFrac <= (double)enterFrac)
+                        if (leaveFrac <= enterFrac)
                             return;
                     }
                     allsolid = 0;
@@ -951,7 +970,7 @@ void __cdecl CM_TraceThroughBrush(const traceWork_t *tw, cbrush_t *brush, trace_
                     v3 = 0.125;
                 else
                     v3 = d1a;
-                if (v3 <= (double)d2)
+                if (v3 <= d2)
                     return;
                 if (d2 > 0.0)
                     allsolid = 0;
@@ -967,7 +986,7 @@ void __cdecl CM_TraceThroughBrush(const traceWork_t *tw, cbrush_t *brush, trace_
                 else
                 {
                     enterFrac = f / delta;
-                    if (leaveFrac <= (double)enterFrac)
+                    if (leaveFrac <= enterFrac)
                         return;
                 LABEL_86:
                     leadside = side;
@@ -1035,22 +1054,22 @@ void __cdecl CM_TraceCapsuleThroughCapsule(const traceWork_t *tw, trace_t *trace
     float bottom[3]; // [esp+A4h] [ebp-Ch] BYREF
 
     v8 = tw->threadInfo.box_model->maxs[0] + 1.0;
-    if (tw->bounds[0][0] <= (double)v8)
+    if (tw->bounds[0][0] <= v8)
     {
         v7 = tw->threadInfo.box_model->maxs[1] + 1.0;
-        if (tw->bounds[0][1] <= (double)v7)
+        if (tw->bounds[0][1] <= v7)
         {
             v6 = tw->threadInfo.box_model->maxs[2] + 1.0;
-            if (tw->bounds[0][2] <= (double)v6)
+            if (tw->bounds[0][2] <= v6)
             {
                 v5 = tw->threadInfo.box_model->mins[0] - 1.0;
-                if (tw->bounds[1][0] >= (double)v5)
+                if (tw->bounds[1][0] >= v5)
                 {
                     v4 = tw->threadInfo.box_model->mins[1] - 1.0;
-                    if (tw->bounds[1][1] >= (double)v4)
+                    if (tw->bounds[1][1] >= v4)
                     {
                         v3 = tw->threadInfo.box_model->mins[2] - 1.0;
-                        if (tw->bounds[1][2] >= (double)v3)
+                        if (tw->bounds[1][2] >= v3)
                         {
                             starttop[0] = tw->extents.start[0];
                             starttop[1] = tw->extents.start[1];
@@ -1072,7 +1091,7 @@ void __cdecl CM_TraceCapsuleThroughCapsule(const traceWork_t *tw, trace_t *trace
                             }
                             halfwidth = symetricSize[1][0];
                             halfheight = symetricSize[1][2];
-                            if (symetricSize[1][2] >= (double)symetricSize[1][0])
+                            if (symetricSize[1][2] >= symetricSize[1][0])
                                 v2 = halfwidth;
                             else
                                 v2 = halfheight;
@@ -1084,9 +1103,9 @@ void __cdecl CM_TraceCapsuleThroughCapsule(const traceWork_t *tw, trace_t *trace
                             bottom[0] = offset[0];
                             bottom[1] = offset[1];
                             bottom[2] = offset[2] - offs;
-                            if (top[2] >= (double)startbottom[2])
+                            if (top[2] >= startbottom[2])
                             {
-                                if (bottom[2] > (double)starttop[2]
+                                if (bottom[2] > starttop[2]
                                     && (!CM_TraceSphereThroughSphere(tw, starttop, endtop, bottom, radius, trace) || tw->delta[2] <= 0.0))
                                 {
                                     return;
@@ -1099,12 +1118,12 @@ void __cdecl CM_TraceCapsuleThroughCapsule(const traceWork_t *tw, trace_t *trace
                             }
                             if (CM_TraceCylinderThroughCylinder(tw, offset, offs, radius, trace))
                             {
-                                if (top[2] >= (double)endbottom[2])
+                                if (top[2] >= endbottom[2])
                                 {
-                                    if (bottom[2] > (double)endtop[2] && bottom[2] <= (double)starttop[2])
+                                    if (bottom[2] > endtop[2] && bottom[2] <= starttop[2])
                                         CM_TraceSphereThroughSphere(tw, starttop, endtop, bottom, radius, trace);
                                 }
-                                else if (top[2] >= (double)startbottom[2])
+                                else if (top[2] >= startbottom[2])
                                 {
                                     CM_TraceSphereThroughSphere(tw, startbottom, endbottom, top, radius, trace);
                                 }
@@ -1161,7 +1180,7 @@ int __cdecl CM_TraceSphereThroughSphere(
                 fDeltaLen = Vec3NormalizeTo(vDelta, vNormal);
                 v9 = sqrt(fDiscriminant);
                 fEntry = (-fB - v9) / fA + fDeltaLen * 0.125 / fB;
-                if (trace->fraction <= (double)fEntry)
+                if (trace->fraction <= fEntry)
                 {
                     return 1;
                 }
@@ -1261,7 +1280,7 @@ int __cdecl CM_TraceCylinderThroughCylinder(
                 fEpsilon = fDeltaLen * 0.125 / fB;
                 v9 = sqrt(fDiscriminant);
                 fEntry = (-fB - v9) / fA + fEpsilon;
-                if (trace->fraction <= (double)fEntry)
+                if (trace->fraction <= fEntry)
                 {
                     return 1;
                 }
@@ -1271,7 +1290,7 @@ int __cdecl CM_TraceCylinderThroughCylinder(
                     fHitHeight = (fEntry - fEpsilon) * tw->delta[2] + tw->extents.start[2] - vStationary[2];
                     iassert( fTotalHeight >= 0 );
                     v8 = I_fabs(fHitHeight);
-                    if (fTotalHeight >= (double)v8)
+                    if (fTotalHeight >= v8)
                     {
                         v7 = fEntry - 0.0;
                         if (v7 < 0.0)
@@ -1316,7 +1335,7 @@ int __cdecl CM_TraceCylinderThroughCylinder(
         fTotalHeight = tw->size[2] - tw->radius + fStationaryHalfHeight;
         iassert( fTotalHeight >= 0 );
         v11 = I_fabs(vDelta[2]);
-        if (fTotalHeight >= (double)v11)
+        if (fTotalHeight >= v11)
         {
             trace->fraction = 0.0;
             trace->startsolid = 1;
@@ -1328,7 +1347,7 @@ int __cdecl CM_TraceCylinderThroughCylinder(
             Vec3Sub(tw->extents.end, vStationary, vDelta);
             iassert( fTotalHeight >= 0 );
             v10 = I_fabs(vDelta[2]);
-            if (fTotalHeight >= (double)v10)
+            if (fTotalHeight >= v10)
                 trace->allsolid = 1;
             return 0;
         }
@@ -1393,7 +1412,7 @@ void __cdecl CM_TraceThroughTree(const traceWork_t *tw, int num, const float *p1
             v13 = t2;
         else
             v13 = t1;
-        if (offset > (double)v13)
+        if (offset > v13)
         {
             v12 = t1 - t2;
             if (v12 < 0.0)
@@ -1402,7 +1421,7 @@ void __cdecl CM_TraceThroughTree(const traceWork_t *tw, int num, const float *p1
                 v11 = t1;
             if (v11 > -offset)
             {
-                if (p1[3] >= (double)trace->fraction)
+                if (p1[3] >= trace->fraction)
                     return;
                 diff = t2 - t1;
                 v10 = I_fabs(diff);
@@ -1472,7 +1491,7 @@ void __cdecl CM_SetAxialCullOnly(traceWork_t *tw)
     totalVolume = totalExtents[0] * totalExtents[1] * totalExtents[2];
     boxOctantVolume = tw->size[0] * tw->size[1] * tw->size[2];
     twiceSweptVolume = boxOctantVolume * 16.0 * tw->deltaLen;
-    tw->axialCullOnly = totalVolume < (double)twiceSweptVolume;
+    tw->axialCullOnly = totalVolume < twiceSweptVolume;
 }
 
 void __cdecl CM_TransformedBoxTraceRotated(
@@ -1511,7 +1530,7 @@ void __cdecl CM_TransformedBoxTraceRotated(
     G_RotatePoint(end_l, matrix);
     oldFraction = results->fraction;
     CM_Trace(results, start_l, end_l, symetricSize[0], symetricSize[1], model, brushmask);
-    if (oldFraction > (double)results->fraction)
+    if (oldFraction > results->fraction)
     {
         G_TransposeMatrix(matrix, transpose);
         G_RotatePoint(results->normal, transpose);
@@ -1608,6 +1627,24 @@ int __cdecl CM_BoxSightTrace(
     trace_t trace; // [esp+11Ch] [ebp-34h] BYREF
     int i; // [esp+148h] [ebp-8h]
     int hitNum; // [esp+14Ch] [ebp-4h]
+
+    // Capability boundary (clipmap activation is its own slice;
+    // the bounded first-frame route runs collision=0 by design).
+    // With no collision world active, answer "no sight blocker" so the
+    // light-grid needsTrace suppression sampler (the one renderer caller)
+    // interpolates lighting without it, instead of walking a null node
+    // array. Warn once, never per call.
+    if (!cm.isInUse)
+    {
+        static bool warnedNoClipMap = false;
+        if (!warnedNoClipMap)
+        {
+            Com_Printf(0,
+                       "CM_BoxSightTrace: no collision world active; returning no hit\n");
+            warnedNoClipMap = true;
+        }
+        return 0;
+    }
 
     memset(&trace, 0, sizeof(trace_t));
 
@@ -1789,7 +1826,7 @@ int __cdecl CM_SightTraceThroughBrush(const traceWork_t *tw, cbrush_t *brush)
                 if (d2 > 0.0)
                 {
                     fraca = d1 * tw->extents.invDelta[j] * sign;
-                    if (enterFrac >= (double)fraca)
+                    if (enterFrac >= fraca)
                         return 0;
                     v5 = fraca - leaveFrac;
                     if (v5 < 0.0)
@@ -1804,7 +1841,7 @@ int __cdecl CM_SightTraceThroughBrush(const traceWork_t *tw, cbrush_t *brush)
                 if (d2 > 0.0)
                     return 0;
                 frac = d1 * tw->extents.invDelta[j] * sign;
-                if (leaveFrac <= (double)frac)
+                if (leaveFrac <= frac)
                     return 0;
                 v7 = enterFrac - frac;
                 if (v7 < 0.0)
@@ -1856,7 +1893,7 @@ int __cdecl CM_SightTraceThroughBrush(const traceWork_t *tw, cbrush_t *brush)
                 if (d1a > leaveFrac * delta)
                 {
                     leaveFrac = d1a / delta;
-                    if (leaveFrac <= (double)enterFrac)
+                    if (leaveFrac <= enterFrac)
                         return 0;
                 }
             }
@@ -1871,7 +1908,7 @@ int __cdecl CM_SightTraceThroughBrush(const traceWork_t *tw, cbrush_t *brush)
             if (d1a > enterFrac * delta)
             {
                 enterFrac = d1a / delta;
-                if (leaveFrac <= (double)enterFrac)
+                if (leaveFrac <= enterFrac)
                     return 0;
             }
         }
@@ -1991,7 +2028,7 @@ int __cdecl CM_SightTraceThroughLeafBrushNode_r(
         else
             v11 = t1;
         tmin = v11;
-        if (offset > (double)v11)
+        if (offset > v11)
         {
             if (tmax > -offset)
             {
@@ -2096,22 +2133,22 @@ int __cdecl CM_SightTraceCapsuleThroughCapsule(const traceWork_t *tw, trace_t *t
     float bottom[3]; // [esp+A4h] [ebp-Ch] BYREF
 
     v9 = tw->threadInfo.box_model->maxs[0] + 1.0;
-    if (tw->bounds[0][0] > (double)v9)
+    if (tw->bounds[0][0] > v9)
         return 0;
     v8 = tw->threadInfo.box_model->maxs[1] + 1.0;
-    if (tw->bounds[0][1] > (double)v8)
+    if (tw->bounds[0][1] > v8)
         return 0;
     v7 = tw->threadInfo.box_model->maxs[2] + 1.0;
-    if (tw->bounds[0][2] > (double)v7)
+    if (tw->bounds[0][2] > v7)
         return 0;
     v6 = tw->threadInfo.box_model->mins[0] - 1.0;
-    if (tw->bounds[1][0] < (double)v6)
+    if (tw->bounds[1][0] < v6)
         return 0;
     v5 = tw->threadInfo.box_model->mins[1] - 1.0;
-    if (tw->bounds[1][1] < (double)v5)
+    if (tw->bounds[1][1] < v5)
         return 0;
     v4 = tw->threadInfo.box_model->mins[2] - 1.0;
-    if (tw->bounds[1][2] < (double)v4)
+    if (tw->bounds[1][2] < v4)
         return 0;
 
     starttop[0] = tw->extents.start[0];
@@ -2217,7 +2254,7 @@ bool __cdecl CM_SightTraceSphereThroughSphere(
     fDeltaLen = Vec3NormalizeTo(vDelta, vNormal);
     v7 = sqrt(fDiscriminant);
     fEntry = (-fB - v7) / fA + fB * 0.125 / fDeltaLen;
-    return trace->fraction <= (double)fEntry;
+    return trace->fraction <= fEntry;
 }
 
 bool __cdecl CM_SightTraceCylinderThroughCylinder(
@@ -2262,13 +2299,13 @@ bool __cdecl CM_SightTraceCylinderThroughCylinder(
                 fEpsilon = fB * 0.125 / fDeltaLen;
                 v7 = sqrt(fDiscriminant);
                 fEntry = (-fB - v7) / fA + fEpsilon;
-                if (trace->fraction > (double)fEntry)
+                if (trace->fraction > fEntry)
                 {
                     fTotalHeight = tw->size[2] - tw->radius + fStationaryHalfHeight;
                     fHitHeight = (fEntry - fEpsilon) * tw->delta[2] + tw->extents.start[2] - vStationary[2];
                     iassert( fTotalHeight >= 0 );
                     v6 = I_fabs(fHitHeight);
-                    return fTotalHeight < (double)v6;
+                    return fTotalHeight < v6;
                 }
                 else
                 {
@@ -2290,7 +2327,7 @@ bool __cdecl CM_SightTraceCylinderThroughCylinder(
         fTotalHeight = tw->size[2] - tw->radius + fStationaryHalfHeight;
         iassert( fTotalHeight >= 0 );
         v8 = I_fabs(vDelta[2]);
-        return fTotalHeight < (double)v8;
+        return fTotalHeight < v8;
     }
 }
 
@@ -2348,7 +2385,7 @@ int __cdecl CM_SightTraceThroughTree(const traceWork_t *tw, int num, const float
                 }
                 v15 = t2 - t1;
                 v14 = v15 < 0.0 ? t2 : t1;
-                if (offset > (double)v14)
+                if (offset > v14)
                     break;
                 num = node->children[0];
             }

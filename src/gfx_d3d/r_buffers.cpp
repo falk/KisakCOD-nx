@@ -7,6 +7,7 @@
 #include "rb_logfile.h"
 #include "r_utils.h"
 #include <universal/profile.h>
+#include <deko9/deko9_native.h> // Deko9_SetBufferRole: r_deko9Census dynamic-buffer table
 
 
 //struct GfxBuffers gfxBuf   85b3aa20     gfx_d3d : r_buffers.obj
@@ -49,7 +50,12 @@ void *__cdecl R_AllocStaticVertexBuffer(IDirect3DVertexBuffer9 **vb, int sizeInB
     iassert( (sizeInBytes > 0) );
     if (!r_loadForRenderer->current.enabled)
         return 0;
-    hr = dx.device->CreateVertexBuffer(sizeInBytes, 8, 0, D3DPOOL_DEFAULT, vb, 0);
+    // Original pool: a static world vertex buffer is D3DPOOL_DEFAULT. The
+    // r_killhouseManagedVb diagnostic override was removed: it
+    // silently changed the renderer's resource lifetime, and renderer
+    // diagnostics must not be able to reshape a production checkpoint.
+    const D3DPOOL pool = D3DPOOL_DEFAULT;
+    hr = dx.device->CreateVertexBuffer(sizeInBytes, 8, 0, pool, vb, 0);
     if (hr < 0)
     {
         v3 = R_ErrorDescription(hr);
@@ -207,6 +213,26 @@ void __cdecl R_CreateDynamicBuffers()
         R_InitDynamicIndexBufferState(&gfxBuf.preTessIndexBufferPool[bufferIterc], 0x100000);
     gfxBuf.preTessIndexBuffer = gfxBuf.preTessIndexBufferPool;
     gfxBuf.preTessBufferFrame = 0;
+    // r_deko9Census dynamic-buffer table: tag each pool's role once, right
+    // after creation (Deko9_SetBufferRole ignores a null buffer).
+    for (GfxVertexBufferState &vb : gfxBuf.dynamicVertexBufferPool)
+        Deko9_SetBufferRole(vb.buffer, "dynamicVB");
+    for (GfxVertexBufferState &vb : gfxBuf.skinnedCacheVbPool)
+        Deko9_SetBufferRole(vb.buffer, "skinnedCacheVB");
+    for (GfxIndexBufferState &ib : gfxBuf.dynamicIndexBufferPool)
+        Deko9_SetBufferRole(ib.buffer, "dynamicIB");
+    for (GfxIndexBufferState &ib : gfxBuf.preTessIndexBufferPool)
+        Deko9_SetBufferRole(ib.buffer, "preTessIB");
+}
+
+void __cdecl R_ResetDynamicVbIbRings()
+{
+    // Each frame starts a fresh frame-arena span (deko9_arena.h): `used`
+    // wrapping to 0 is what R_SetVertexData/R_SetIndexData read as "wrap or
+    // first use this frame" to allocate one. Out of scope for this slice:
+    // skinnedCacheVbPool/preTessIndexBufferPool still rename via Lock.
+    gfxBuf.dynamicVertexBuffer->used = 0;
+    gfxBuf.dynamicIndexBuffer->used = 0;
 }
 
 void __cdecl R_FinishStaticIndexBuffer(IDirect3DIndexBuffer9 *ib)
@@ -278,9 +304,11 @@ void __cdecl R_CreateParticleCloudBuffer()
             for (zIter = 0; zIter != 16; ++zIter)
             {
                 particleId = zIter + (xIter << 7) + 16 * yIter;
-                pos[0] = ((double)rand() / 32767.0 + (double)xIter) * 0.25 + -1.0;
-                pos[1] = ((double)rand() / 32767.0 + (double)yIter) * 0.25 + -1.0;
-                pos[2] = ((double)rand() / 32767.0 + (double)zIter) * 0.125 + -1.0;
+                // rand()/32767 assumed 15-bit RAND_MAX; scale by the real one so
+                // the particle-cloud verts stay inside their [-1,1] cells.
+                pos[0] = ((double)rand() / (RAND_MAX + 1.0) + (double)xIter) * 0.25 + -1.0;
+                pos[1] = ((double)rand() / (RAND_MAX + 1.0) + (double)yIter) * 0.25 + -1.0;
+                pos[2] = ((double)rand() / (RAND_MAX + 1.0) + (double)zIter) * 0.125 + -1.0;
                 for (cornerIter = 0; cornerIter != 4; ++cornerIter)
                 {
                     particleVertsIter->xyz[0] = pos[0];

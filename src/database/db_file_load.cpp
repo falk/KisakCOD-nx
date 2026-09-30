@@ -17,7 +17,14 @@ struct DB_LoadData // sizeof=0x68
     const char* filename;               // ...
     XZoneMemory* zoneMem;               // ...
     int32_t outstandingReads;               // ...
+#if defined(__SWITCH__)
+    // This whole loader is a Windows overlapped-I/O implementation that
+    // never runs on Switch (see the trapped functions below); the field
+    // stays only to keep DB_LoadData's shape stable across platforms.
+    uint8_t overlapped[32];
+#else
     OVERLAPPED overlapped;             // ...
+#endif
     z_stream_s stream;                  // ...
     uint8_t* compressBufferStart; // ...
     uint8_t* compressBufferEnd; // ...
@@ -50,6 +57,9 @@ static void __cdecl Load_XAssetArrayCustom(int32_t count);
 
 void __cdecl DB_CancelLoadXFile()
 {
+#if defined(__SWITCH__)
+    Com_Error(ERR_FATAL, "DB_CancelLoadXFile is unsupported on Switch; retail zones load through db_retail_walk.cpp");
+#else
     if (g_load.compressBufferStart)
     {
         while (g_load.outstandingReads)
@@ -59,10 +69,15 @@ void __cdecl DB_CancelLoadXFile()
             MyAssertHandler(".\\database\\db_file_load.cpp", 165, 0, "%s", "g_load.f");
         CloseHandle(g_load.f);
     }
+#endif
 }
 
 int32_t DB_WaitXFileStage()
 {
+#if defined(__SWITCH__)
+    Com_Error(ERR_FATAL, "DB_WaitXFileStage is unsupported on Switch; retail zones load through db_retail_walk.cpp");
+    return 0;
+#else
     int32_t result; // eax
 
     if (!g_load.f)
@@ -74,6 +89,7 @@ int32_t DB_WaitXFileStage()
     result = InterlockedIncrement(&g_loadedSize);
     g_load.stream.avail_in += 0x40000;
     return result;
+#endif
 }
 
 void __cdecl DB_LoadedExternalData(int32_t size)
@@ -89,7 +105,34 @@ double __cdecl DB_GetLoadedFraction()
     double totalBytesExternal; // [esp+2Ch] [ebp-8h]
 
     if (!g_totalSize)
-        return 0.0;
+    {
+        // g_totalSize/g_loadedSize are only ever written by the classic
+        // overlapped-I/O loader below, which is trapped on Switch: zones are
+        // loaded by the retail walk (RetailWalkLoadZoneAssets) instead. Feed
+        // the retail briefing loadbar (UI_DrawLoadBar ->
+        // UI_LoadBarProgress_FastFile) the same quantities from the walk:
+        //   * only a tracked load sizes the bar (DB_ResetZoneSize(1): a
+        //     DB_ZONE_GAME zone) and only when file + external >= 1 MB --
+        //     otherwise retail's sizes stay 0 and the bar stays empty;
+        //   * internal = compressed bytes read / the zone file's size,
+        //     external = image bytes DB_LoadedExternalData reported /
+        //     XFile.externalSize, combined exactly as below.
+        // On the classic path no walk sizes anything, so this returns 0.0
+        // until the loader sizes the zone, preserving retail behavior.
+        uint64_t readBytes = 0;
+        uint64_t fileBytes = 0;
+        uint32_t externalBytes = 0;
+        if (!g_trackLoadProgress || !FS_GetRetailLoadProgress(&readBytes, &fileBytes, &externalBytes))
+            return 0.0;
+        if (fileBytes + externalBytes < 0x100000)
+            return 0.0;
+        if (readBytes > fileBytes)
+            readBytes = fileBytes;
+        uint64_t loadedExternal = g_loadedExternalBytes > 0 ? (uint64_t)g_loadedExternalBytes : 0;
+        if (loadedExternal > externalBytes)
+            loadedExternal = externalBytes;
+        return (double)(readBytes + loadedExternal) / (double)(fileBytes + externalBytes);
+    }
     totalBytesInternal = (double)g_totalSize * 262144.0;
     loadedBytesInternal = (double)g_loadedSize * 262144.0;
     if (loadedBytesInternal < 0.0)
@@ -152,6 +195,9 @@ void __cdecl DB_LoadXFileData(uint8_t *pos, uint32_t size)
 
 void DB_ReadXFileStage()
 {
+#if defined(__SWITCH__)
+    Com_Error(ERR_FATAL, "DB_ReadXFileStage is unsupported on Switch; retail zones load through db_retail_walk.cpp");
+#else
     if (g_load.f)
     {
         if (g_load.outstandingReads)
@@ -159,10 +205,15 @@ void DB_ReadXFileStage()
         if (!DB_ReadData() && GetLastError() != 38)
             Com_Error(ERR_DROP, "Read error of file '%s'", g_load.filename);
     }
+#endif
 }
 
 int32_t __cdecl DB_ReadData()
 {
+#if defined(__SWITCH__)
+    Com_Error(ERR_FATAL, "DB_ReadData is unsupported on Switch; retail zones load through db_retail_walk.cpp");
+    return 0;
+#else
     uint8_t *fileBuffer; // [esp+0h] [ebp-4h]
 
     if (!g_load.compressBufferStart)
@@ -178,8 +229,10 @@ int32_t __cdecl DB_ReadData()
     ++g_load.outstandingReads;
     g_load.overlapped.Offset += 0x40000;
     return 1;
+#endif
 }
 
+#if !defined(__SWITCH__)
 void __stdcall DB_FileReadCompletion(
     uint32_t dwErrorCode,
     uint32_t dwNumberOfBytesTransfered,
@@ -187,11 +240,94 @@ void __stdcall DB_FileReadCompletion(
 {
     ;
 }
+#endif
+
+#if defined(__SWITCH__)
+// Delayed-image sweep profile (com_diagMarkers): the zone load's second big
+// phase was a single opaque number. This wrapper keeps the per-image timing
+// and names the slowest images so a slow sweep points at its actual cause
+// (wavelet decode, IWD inflate, upload) instead of the aggregate.
+struct DB_DelayImageProfile
+{
+    uint32_t enumerated;
+    uint32_t delayed;
+    uint64_t delayedBytes;
+    uint64_t imageMs;
+    struct SlowEntry
+    {
+        char name[48];
+        int32_t ms;
+        uint32_t bytes;
+    } slow[8];
+};
+
+static void __cdecl DB_ProfileDelayLoadImage(XAssetHeader header, void *inData)
+{
+    DB_DelayImageProfile *profile = static_cast<DB_DelayImageProfile *>(inData);
+    if (!profile || !header.image)
+        return;
+    GfxImage *image = header.image;
+    ++profile->enumerated;
+    if (!image->delayLoadPixels)
+        return;
+    const uint32_t bytes = image->cardMemory.platform[0];
+    const int start = Sys_Milliseconds();
+    R_DelayLoadImage(header);
+    const int elapsed = Sys_Milliseconds() - start;
+    ++profile->delayed;
+    profile->delayedBytes += bytes;
+    profile->imageMs += elapsed;
+    int slot = -1;
+    for (int i = 0; i < 8; ++i)
+    {
+        if (elapsed > profile->slow[i].ms)
+        {
+            slot = i;
+            break;
+        }
+    }
+    if (slot >= 0)
+    {
+        for (int i = 7; i > slot; --i)
+            profile->slow[i] = profile->slow[i - 1];
+        I_strncpyz(profile->slow[slot].name, image->name, sizeof(profile->slow[slot].name));
+        profile->slow[slot].ms = elapsed;
+        profile->slow[slot].bytes = bytes;
+    }
+}
+#endif
 
 void __cdecl DB_LoadDelayedImages()
 {
     uint32_t copyIter; // [esp+0h] [ebp-4h]
 
+#if defined(__SWITCH__)
+    extern const dvar_t *com_diagMarkers;
+    if (com_diagMarkers && com_diagMarkers->current.enabled)
+    {
+        DB_DelayImageProfile profile{};
+        const int start = Sys_Milliseconds();
+        DB_EnumXAssets(ASSET_TYPE_IMAGE, DB_ProfileDelayLoadImage, &profile, 0);
+        for (copyIter = 0; copyIter < g_copyInfoCount; ++copyIter)
+        {
+            if (g_copyInfo[copyIter]->asset.type == ASSET_TYPE_IMAGE)
+                DB_ProfileDelayLoadImage(g_copyInfo[copyIter]->asset.header, &profile);
+        }
+        Com_Printf(0, "KILLHOUSE_LOAD_DELAYIMAGE enumerated=%u delayed=%u bytes=%llu image_ms=%llu total_ms=%d copies=%u\n",
+                   profile.enumerated, profile.delayed,
+                   static_cast<unsigned long long>(profile.delayedBytes),
+                   static_cast<unsigned long long>(profile.imageMs),
+                   Sys_Milliseconds() - start, g_copyInfoCount);
+        for (int i = 0; i < 8; ++i)
+        {
+            if (profile.slow[i].ms <= 0)
+                continue;
+            Com_Printf(0, "KILLHOUSE_LOAD_DELAYIMAGE_SLOW rank=%d name=%s ms=%d bytes=%u\n",
+                       i, profile.slow[i].name, profile.slow[i].ms, profile.slow[i].bytes);
+        }
+        return;
+    }
+#endif
     DB_EnumXAssets(ASSET_TYPE_IMAGE, (void(__cdecl *)(XAssetHeader, void *))R_DelayLoadImage, 0, 0);
     for (copyIter = 0; copyIter < g_copyInfoCount; ++copyIter)
     {
@@ -216,6 +352,9 @@ void __cdecl DB_FinishGeometryBlocks(XZoneMemory *zoneMem)
 
 void __cdecl DB_LoadXFileInternal()
 {
+#if defined(__SWITCH__)
+    Com_Error(ERR_FATAL, "DB_LoadXFileInternal is unsupported on Switch; retail zones load through db_retail_walk.cpp");
+#else
     int32_t err; // [esp+8h] [ebp-4Ch]
     bool fileIsSecure; // [esp+Fh] [ebp-45h]
     uint32_t version; // [esp+10h] [ebp-44h]
@@ -312,6 +451,7 @@ void __cdecl DB_LoadXFileInternal()
 	g_anyFastFileLoaded = true;
 #endif
     DB_CancelLoadXFile();
+#endif
 }
 
 bool __cdecl DB_IsMinimumFastFileLoaded()
@@ -356,6 +496,9 @@ void __cdecl DB_ResetZoneSize(int32_t trackLoadProgress)
     g_totalExternalBytes = 0;
     g_loadedExternalBytes = 0;
     g_trackLoadProgress = trackLoadProgress;
+    // The retail walk's loadbar sizing (the Switch stand-in for the counters
+    // above; see DB_GetLoadedFraction).
+    FS_ResetRetailLoadProgress();
 }
 
 void __cdecl DB_LoadXFile(

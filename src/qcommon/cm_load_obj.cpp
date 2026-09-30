@@ -8,6 +8,39 @@
 #include <game/game_public.h>
 #include <universal/profile.h>
 
+// LP64 allocation strides for this loader's native arrays.
+//
+// Same class of defect as the renderer's loadobj loader (see the matching
+// block in r_bsp_load_obj.cpp): the decompiled code sized several
+// `CM_Hunk_Alloc` calls with the literal *serialized* (ILP32) record size and
+// then filled the result as a native array (`array[i]`, `++ptr`). Each type
+// below carries a pointer member, so its native LP64 record is wider and
+// those allocations under-allocated. Sizing now uses `sizeof(T)`. The disk
+// lump strides (`Com_GetBspLump`'s element size, the `in += 36` walks) are
+// legitimately the *wire* numbers and are deliberately left alone.
+//
+// This is an allocation-size correction only. It changes no control flow and
+// does not make this loader any more reachable than it already is: the SP
+// retail path returns from SV_SpawnServer before CM_LoadMap, and
+// CM_LoadMapData dispatches here only when !IsFastFileLoad().
+//
+//   type                native (LP64)   serialized (ILP32 reference)
+//   cStaticModel_s            88                80
+//   cNode_t                   16                 8
+//   cbrushside_t              16                12
+//   cbrush_t                  88                80
+#if UINTPTR_MAX == UINT32_MAX // serialized sizes hold on the 32-bit reference ABI only
+static_assert(sizeof(cStaticModel_s) == 80);
+static_assert(sizeof(cNode_t) == 8);
+static_assert(sizeof(cbrushside_t) == 12);
+static_assert(sizeof(cbrush_t) == 80);
+#else
+static_assert(sizeof(cStaticModel_s) == 88);
+static_assert(sizeof(cNode_t) == 16);
+static_assert(sizeof(cbrushside_t) == 16);
+static_assert(sizeof(cbrush_t) == 88);
+#endif
+
 struct DiskCollBorder // sizeof=0x1C
 {
     float distEq[3];
@@ -139,6 +172,7 @@ void __cdecl CM_InitStaticModel(cStaticModel_s *staticModel, float *origin, floa
     }
 }
 
+
 uint8_t *__cdecl CM_Hunk_AllocXModel(uint32_t size)
 {
     return Hunk_Alloc(size, "CM_Hunk_AllocXModel", 21);
@@ -247,7 +281,8 @@ void __cdecl CM_LoadStaticModels()
     }
     if (numStaticModels)
     {
-        cm.staticModelList = (cStaticModel_s *)CM_Hunk_Alloc(80 * numStaticModels, "CM_CreateStaticModel", 27);
+        cm.staticModelList = (cStaticModel_s *)CM_Hunk_Alloc(
+            sizeof(cStaticModel_s) * numStaticModels, "CM_CreateStaticModel", 27);
         ptr = Com_EntityString(0);
         iassert( ptr );
         ProfLoad_Begin("Create static model collision");
@@ -502,7 +537,7 @@ void CMod_LoadNodes()
     in = Com_GetBspLump(LUMP_NODES, 0x24u, &count);
     if (!count)
         Com_Error(ERR_DROP, "Map has no nodes");
-    cm.nodes = (cNode_t*)CM_Hunk_Alloc(8 * count, "CMod_LoadNodes", 25);
+    cm.nodes = (cNode_t*)CM_Hunk_Alloc(sizeof(cNode_t) * count, "CMod_LoadNodes", 25);
     result = (cNode_t*)count;
     cm.numNodes = count;
     out = cm.nodes;
@@ -664,7 +699,10 @@ MapEnts *__cdecl MapEnts_GetFromString(char *name, const char *entityString, int
     const char *begin; // [esp+A38h] [ebp-4h]
     char *entityStringa; // [esp+A48h] [ebp+Ch]
 
-    mapEnts = (MapEnts*)CM_Hunk_Alloc(0xCu, "CMod_LoadEntityString", 30);
+    // sizeof(MapEnts), not the decompiler's ILP32 0xC: the struct holds two
+    // pointers, so it is 0x18 here and the three field writes below (name,
+    // entityString, numEntityChars) would run 12 bytes past a 12-byte record.
+    mapEnts = (MapEnts*)CM_Hunk_Alloc(sizeof(MapEnts), "CMod_LoadEntityString", 30);
     nameLen = strlen(name);
     mapEnts->name = (const char*)CM_Hunk_Alloc(nameLen + 1, "CMod_LoadEntityString", 30);
     memcpy((void*)mapEnts->name, name, nameLen + 1);
@@ -814,6 +852,18 @@ void __cdecl CMod_LoadBrushRelated(uint32_t version, bool usePvs)
     ++cm.leafbrushNodes;
     leafbrushNodesCount = (TempMalloc(0) - (char*)cm.leafbrushNodes) / 20;
     cm.leafbrushNodesCount = leafbrushNodesCount + 1;
+    // DELIBERATELY NOT restrided to sizeof(cLeafBrushNode_s) (native 24 vs
+    // serialized 20). Unlike the arrays corrected above, this allocation is
+    // entangled with sentinel/arena math that assumes the same stride in four
+    // more places within this one function: the temp arena is backed up by
+    // one raw record (`TempMalloc(0) - 20`), advanced by one *typed* record
+    // (`++cm.leafbrushNodes`, already native stride -- so 20 and 24 are
+    // mixed here today), the element count is derived from a raw byte span
+    // (`(TempMalloc(0) - (char *)cm.leafbrushNodes) / 20`), and the payload
+    // is bulk-copied at 20-stride into a native-stride array on the next
+    // line. Correcting only the allocation would leave four inconsistent
+    // strides behind. That is arena-layout work, not static allocation-size
+    // math, so it is reported rather than guessed at.
     leafbrushNodes = (cLeafBrushNode_s*)CM_Hunk_Alloc(20 * (leafbrushNodesCount + 1), "CMod_LoadBrushRelated", 26);
     memcpy(&leafbrushNodes[1].axis, &cm.leafbrushNodes->axis, 20 * leafbrushNodesCount);
     cm.leafbrushNodes = leafbrushNodes;
@@ -979,7 +1029,11 @@ void __cdecl CMod_PartionLeafBrushes(uint16_t *leafBrushes, int numLeafBrushes, 
     }
 }
 
+#ifdef __SWITCH__
+uintptr_t __cdecl CM_Hunk_AllocateTempMemoryHigh(int size, const char *name)
+#else
 uint32_t __cdecl CM_Hunk_AllocateTempMemoryHigh(int size, const char *name)
+#endif
 {
     return Hunk_AllocateTempMemoryHigh(size, name);
 }
@@ -1150,7 +1204,7 @@ cLeafBrushNode_s *__cdecl CMod_AllocLeafBrushNode()
 {
     cLeafBrushNode_s *result; // eax
 
-    result = (cLeafBrushNode_s*)TempMalloc(0x14u);
+    result = (cLeafBrushNode_s*)TempMalloc(sizeof(cLeafBrushNode_s));
     result->axis = 0;
     result->leafBrushCount = 0;
     result->contents = 0;
@@ -1283,7 +1337,7 @@ void CMod_LoadBrushes()
     memcpy(cm.brushEdges, inEdges, allocSizeEdges);
     outEdges = cm.brushEdges;
     sidesCount -= 6 * brushCount;
-    allocSizeSides = 12 * sidesCount;
+    allocSizeSides = sizeof(cbrushside_t) * sidesCount;
     if (sidesCount)
         cm.brushsides = (cbrushside_t *)CM_Hunk_Alloc(allocSizeSides, "CMod_LoadBrushSides", 26);
     else
@@ -1291,7 +1345,7 @@ void CMod_LoadBrushes()
     cm.numBrushSides = sidesCount;
     outSides = cm.brushsides;
     countAllocatedBrushes = brushCount + 1;
-    allocSizeBrushes = 80 * (brushCount + 1);
+    allocSizeBrushes = sizeof(cbrush_t) * (brushCount + 1);
     cm.brushes = (cbrush_t*)CM_Hunk_Alloc(allocSizeBrushes, "CMod_LoadBrushes", 26);
     cm.numBrushes = brushCount;
     if (brushCount != brushCount)
@@ -1570,4 +1624,3 @@ void CMod_LoadCollisionAabbTrees()
         ++out;
     }
 }
-

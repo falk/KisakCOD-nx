@@ -19,8 +19,10 @@
 #include "r_draw_xmodel.h"
 #include "r_pretess.h"
 #include <EffectsCore/fx_marks.h>
+#include <database/db_retail_frame_evidence.h>
 
 GfxScaledPlacement s_manualObjectPlacement;
+
 
 void __cdecl RB_ShowTess(GfxCmdBufContext context, const float *center, const char *tessName, const float *color)
 {
@@ -180,6 +182,7 @@ uint32_t __cdecl R_TessCodeMeshList(const GfxDrawSurfListArgs *listArgs, GfxCmdB
         {
             if (args.triCount)
             {
+                R_NOTE_SETIDX(SWITCH_PERF_EV_SETIDX_CODEMESH);
                 args.baseIndex = R_SetIndexData(&context.state->prim, indices, args.triCount);
                 R_DrawIndexedPrimitive(&context.state->prim, &args);
                 args.triCount = 0;
@@ -199,6 +202,7 @@ uint32_t __cdecl R_TessCodeMeshList(const GfxDrawSurfListArgs *listArgs, GfxCmdB
 
     if (args.triCount)
     {
+        R_NOTE_SETIDX(SWITCH_PERF_EV_SETIDX_CODEMESH);
         args.baseIndex = R_SetIndexData(&context.state->prim, indices, args.triCount);
         R_DrawIndexedPrimitive(&context.state->prim, &args);
     }
@@ -346,6 +350,7 @@ uint32_t __cdecl R_TessMarkMeshList(const GfxDrawSurfListArgs *listArgs, GfxCmdB
             if (args.triCount)
             {
                 R_SetupPassPerPrimArgs(context);
+                R_NOTE_SETIDX(SWITCH_PERF_EV_SETIDX_MARKS);
                 args.baseIndex = R_SetIndexData(&context.state->prim, indices, args.triCount);
                 R_DrawIndexedPrimitive(&context.state->prim, &args);
                 indices = 0;
@@ -417,6 +422,7 @@ uint32_t __cdecl R_TessMarkMeshList(const GfxDrawSurfListArgs *listArgs, GfxCmdB
                 if (args.triCount)
                 {
                     R_SetupPassPerPrimArgs(context);
+                    R_NOTE_SETIDX(SWITCH_PERF_EV_SETIDX_MARKS);
                     args.baseIndex = R_SetIndexData(&context.state->prim, indices, args.triCount);
                     R_DrawIndexedPrimitive(&context.state->prim, &args);
                     args.triCount = 0;
@@ -433,6 +439,7 @@ uint32_t __cdecl R_TessMarkMeshList(const GfxDrawSurfListArgs *listArgs, GfxCmdB
     if (args.triCount)
     {
         R_SetupPassPerPrimArgs(context);
+        R_NOTE_SETIDX(SWITCH_PERF_EV_SETIDX_MARKS);
         args.baseIndex = R_SetIndexData(&context.state->prim, indices, args.triCount);
         R_DrawIndexedPrimitive(&context.state->prim, &args);
     }
@@ -654,6 +661,19 @@ uint32_t __cdecl R_TessXModelSkinnedDrawSurfList(
     iassert(prepassContext.state == NULL || commonSource == prepassContext.source);
     data = commonSource->input.data;
     info = listArgs->info;
+    {
+        // TEMP diagnostic (P5/B3): report the offending XModel skinned record
+        // before the consumer dereferences its null xsurf.
+        static int s_xnull = 0;
+        const GfxDrawSurf *dbgList = &info->drawSurfs[listArgs->firstDrawSurfIndex];
+        const GfxModelSkinnedSurface *dbgSurf =
+            (const GfxModelSkinnedSurface *)((const char *)data + 4 * dbgList->fields.objectId);
+        if ((!dbgSurf->xsurf || dbgSurf->skinnedCachedOffset < -3) && s_xnull < 24)
+        {
+            ++s_xnull;
+            
+        }
+    }
     baseTechType = info->baseTechType;
     drawSurfCount = info->drawSurfCount - listArgs->firstDrawSurfIndex;
     drawSurfList = &info->drawSurfs[listArgs->firstDrawSurfIndex];
@@ -844,6 +864,7 @@ void __cdecl R_DrawXModelSkinnedUncached(GfxCmdBufContext context, XSurface *xsu
     args.triCount = XSurfaceGetNumTris(xsurf);
     args.vertexCount = XSurfaceGetNumVerts(xsurf);
     g_frameStatsCur.geoIndexCount += 3 * args.triCount;
+    R_NOTE_SETIDX(SWITCH_PERF_EV_SETIDX_XMODEL);
     args.baseIndex = R_SetIndexData(&context.state->prim, (uint8_t *)xsurf->triIndices, args.triCount);
     R_CheckVertexDataOverflow(32 * args.vertexCount);
     vertexOffset = R_SetVertexData(context.state, skinnedVert, args.vertexCount, 32);
@@ -1067,7 +1088,12 @@ void __cdecl R_DrawStaticModelPreTessSurfLit(const uint32_t *primDrawSurfPos, Gf
     R_SetupPassPerObjectArgs(context);
     readCmdBuf.primDrawSurfPos = primDrawSurfPos;
     while (R_ReadStaticModelPreTessDrawSurf(&readCmdBuf, &pretessSurf, &firstIndex, &count))
-        R_DrawStaticModelsPreTessDrawSurfLighting(pretessSurf, firstIndex, count, context);
+    {
+        const uint16_t *staticList = firstIndex == R_PRETESS_STATIC_FLAG
+            ? (const uint16_t *)R_ReadPrimDrawSurfData(&readCmdBuf, (count + 1) >> 1)
+            : nullptr;
+        R_DrawStaticModelsPreTessDrawSurfLighting(pretessSurf, firstIndex, count, context, staticList);
+    }
 }
 
 void __cdecl R_DrawStaticModelPreTessSurf(const uint32_t *primDrawSurfPos, GfxCmdBufContext context)
@@ -1080,7 +1106,12 @@ void __cdecl R_DrawStaticModelPreTessSurf(const uint32_t *primDrawSurfPos, GfxCm
     R_SetupPassPerObjectArgs(context);
     readCmdBuf.primDrawSurfPos = primDrawSurfPos;
     while (R_ReadStaticModelPreTessDrawSurf(&readCmdBuf, &pretessSurf, &firstIndex, &count))
-        R_DrawStaticModelsPreTessDrawSurf(pretessSurf, firstIndex, count, context);
+    {
+        const uint16_t *staticList = firstIndex == R_PRETESS_STATIC_FLAG
+            ? (const uint16_t *)R_ReadPrimDrawSurfData(&readCmdBuf, (count + 1) >> 1)
+            : nullptr;
+        R_DrawStaticModelsPreTessDrawSurf(pretessSurf, firstIndex, count, context, staticList);
+    }
 }
 
 uint32_t __cdecl R_TessStaticModelPreTessList(const GfxDrawSurfListArgs *listArgs, GfxCmdBufContext prepassContext)
@@ -1349,7 +1380,6 @@ uint32_t __cdecl R_TessXModelRigidSkinnedDrawSurfList(
 
 uint32_t __cdecl R_TessTrianglesPreTessList(const GfxDrawSurfListArgs *listArgs, GfxCmdBufContext prepassContext)
 {
-    IDirect3DIndexBuffer9 *ib; // [esp+1Ch] [ebp-44h]
     GfxDepthRangeType depthRangeType; // [esp+2Ch] [ebp-34h]
     GfxCmdBufContext context; // [esp+44h] [ebp-1Ch]
     const GfxDrawSurfListInfo *info; // [esp+4Ch] [ebp-14h]
@@ -1374,9 +1404,9 @@ uint32_t __cdecl R_TessTrianglesPreTessList(const GfxDrawSurfListArgs *listArgs,
     if (depthRangeType != context.state->depthRangeType)
         R_ChangeDepthRange(context.state, depthRangeType);
     data = commonSource->input.data;
-    ib = data->preTessIb;
-    if (context.state->prim.indexBuffer != ib)
-        R_ChangeIndices(&context.state->prim, ib);
+    // The index buffer is bound per batch (R_DrawBspDrawSurfs*PreTess): the
+    // per-frame pretess buffer, or the static world buffer for a batch
+    // recorded with R_PRETESS_STATIC_FLAG.
     primDrawSurfPos = &data->primDrawSurfsBuf[info->drawSurfs[listArgs->firstDrawSurfIndex].fields.objectId];
     R_TrackPrims(context.state, GFX_PRIM_STATS_WORLD);
     if (baseTechType == TECHNIQUE_LIT_BEGIN)
@@ -1549,19 +1579,13 @@ uint32_t __cdecl R_TessBModel(const GfxDrawSurfListArgs *listArgs, GfxCmdBufCont
             g_frameStatsCur.geoIndexCount += 3 * args.triCount;
             R_SetStreamsForBspSurface(&context.state->prim, tris);
             R_SetupPassPerPrimArgs(context);
-            args.baseIndex = R_SetIndexData(
-                &context.state->prim,
-                (uint8_t *)&rgp.world->indices[tris->baseIndex],
-                args.triCount);
+            args.baseIndex = R_SetWorldIndexData(&context.state->prim, tris, args.triCount);
             R_DrawIndexedPrimitive(&context.state->prim, &args);
             if (prepassContext.state)
             {
                 R_SetStreamsForBspSurface(&prepassContext.state->prim, tris);
                 R_SetupPassPerPrimArgs(prepassContext);
-                args.baseIndex = R_SetIndexData(
-                    &prepassContext.state->prim,
-                    (uint8_t *)&rgp.world->indices[tris->baseIndex],
-                    args.triCount);
+                args.baseIndex = R_SetWorldIndexData(&prepassContext.state->prim, tris, args.triCount);
                 R_DrawIndexedPrimitive(&prepassContext.state->prim, &args);
             }
             iassert(g_primStats);
@@ -1578,4 +1602,3 @@ uint32_t __cdecl R_TessBModel(const GfxDrawSurfListArgs *listArgs, GfxCmdBufCont
     g_primStats = 0;
     return drawSurfIndex;
 }
-

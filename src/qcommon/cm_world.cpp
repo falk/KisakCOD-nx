@@ -1,4 +1,9 @@
 #include <universal/q_shared.h>
+#include <port/switch_perf.h>
+#ifdef __SWITCH__
+static thread_local uint32_t s_areaNodes;
+static thread_local uint32_t s_areaTested;
+#endif
 #include "qcommon.h"
 #include "mem_track.h"
 #include <server/sv_world.h>
@@ -10,6 +15,15 @@
 #include "cmd.h"
 
 #include <xanim/xanim.h>
+
+#include "cm_area_walk.h"
+
+// SV_GentityNum (sv_game.cpp) without the out-of-line call, for the
+// per-entity loops below.
+static inline gentity_s *SV_GentityNumInline(uint32_t num)
+{
+    return (gentity_s *)((char *)sv.gentities + (size_t)num * (size_t)sv.gentitySize);
+}
 
 struct worldContents_s // sizeof=0x10
 {                                       // ...
@@ -78,7 +92,7 @@ void CM_ClearWorld()
     cm_world.sectors[1023].tree.u.parent = 0;
     size = cm_world.maxs[0] - cm_world.mins[0];
     size_4 = cm_world.maxs[1] - cm_world.mins[1];
-    cm_world.sectors[SECTOR_HEAD].tree.axis = size_4 >= (double)size;
+    cm_world.sectors[SECTOR_HEAD].tree.axis = size_4 >= size;
     cm_world.sectors[SECTOR_HEAD].tree.dist = (cm_world.maxs[size_4 >= (double)size] + cm_world.mins[size_4 >= (double)size]) * 0.5;
     iassert( !cm_world.sectors[SECTOR_HEAD].tree.child[0] );
     iassert( !cm_world.sectors[SECTOR_HEAD].tree.child[1] );
@@ -86,12 +100,10 @@ void CM_ClearWorld()
 
 void __cdecl CM_UnlinkEntity(svEntity_s *ent)
 {
-    gentity_s *i; // eax
     worldSector_s *node; // [esp+0h] [ebp-18h]
     int contents; // [esp+4h] [ebp-14h]
     uint16_t nodeIndex; // [esp+8h] [ebp-10h]
     svEntity_s *scan; // [esp+Ch] [ebp-Ch]
-    svEntity_s *scana; // [esp+Ch] [ebp-Ch]
     int linkcontents; // [esp+10h] [ebp-8h]
     uint16_t parentNodeIndex; // [esp+14h] [ebp-4h]
     uint16_t parentNodeIndexa; // [esp+14h] [ebp-4h]
@@ -146,18 +158,24 @@ void __cdecl CM_UnlinkEntity(svEntity_s *ent)
         LABEL_28:
             contents = cm_world.sectors[node->tree.child[1]].contents.contentsEntities | cm_world.sectors[node->tree.child[0]].contents.contentsEntities;
             linkcontents = cm_world.sectors[node->tree.child[1]].contents.linkcontentsEntities | cm_world.sectors[node->tree.child[0]].contents.linkcontentsEntities;
-            if (node->contents.entities)
-            {
-                scana = &sv.svEntities[node->contents.entities - 1];
-                for (i = SV_GEntityForSvEntity(scana); ; i = SV_GEntityForSvEntity(scana))
-                {
-                    contents |= i->r.contents;
-                    linkcontents |= scana->linkcontents;
-                    if (!scana->nextEntityInWorldSector)
-                        break;
-                    scana = &sv.svEntities[scana->nextEntityInWorldSector - 1];
-                }
-            }
+            // OR of the chain's contents; the batched walk prefetches each
+            // gentity's r.contents (the dependent miss that dominated this
+            // loop, see cm_area_walk.h).
+            CM_WalkEntityChain<16>(
+                node->contents.entities,
+                [](uint32_t entnum) -> uint32_t { return sv.svEntities[entnum - 1].nextEntityInWorldSector; },
+                [](uint32_t entnum) {
+#if defined(__GNUC__)
+                    __builtin_prefetch(&SV_GentityNumInline(entnum - 1)->r.contents);
+#else
+                    (void)entnum;
+#endif
+                },
+                [&](uint32_t entnum) -> bool {
+                    contents |= SV_GentityNumInline(entnum - 1)->r.contents;
+                    linkcontents |= sv.svEntities[entnum - 1].linkcontents;
+                    return true;
+                });
             node->contents.contentsEntities = contents;
             node->contents.linkcontentsEntities = linkcontents;
             parentNodeIndexa = node->tree.u.parent;
@@ -207,14 +225,14 @@ void __cdecl CM_LinkEntity(svEntity_s *ent, float *absmin, float *absmax, uint32
                     node = &cm_world.sectors[nodeIndex];
                     axis = node->tree.axis;
                     dist = node->tree.dist;
-                    if (dist >= (double)absmin[axis])
+                    if (dist >= absmin[axis])
                         break;
                     mins[axis] = dist;
                     if (!node->tree.child[0])
                         goto LABEL_17;
                     nodeIndex = node->tree.child[0];
                 }
-                if (dist <= (double)absmax[axis])
+                if (dist <= absmax[axis])
                     break;
                 maxs[axis] = dist;
                 if (!node->tree.child[1])
@@ -257,10 +275,10 @@ void __cdecl CM_AddEntityToNode(svEntity_s *ent, uint16_t childNodeIndex)
     {
         ;
     }
-#elif KISAK_SP // KISAKTODO: hellish previous array abuse here
+#elif KISAK_SP
     for (entnum = ent - sv.svEntities;
         (uint32_t)*prevEnt - 1 <= entnum;
-        prevEnt = &sv.configstrings[4 * *prevEnt + 2804 + 4 * __ROL4__(*prevEnt, 1)])
+        prevEnt = &sv.svEntities[*prevEnt - 1].nextEntityInWorldSector)
     {
         ;
     }
@@ -293,9 +311,9 @@ void __cdecl CM_SortNode(uint16_t nodeIndex, float *mins, float *maxs)
     while (entnum)
     {
         ent = &sv.svEntities[entnum - 1];
-        if (dist >= (double)ent->linkmin[axis])
+        if (dist >= ent->linkmin[axis])
         {
-            if (dist > (double)ent->linkmax[axis])
+            if (dist > ent->linkmax[axis])
             {
                 childNodeIndex = node->tree.child[1];
                 if (childNodeIndex)
@@ -353,12 +371,27 @@ void __cdecl CM_SortNode(uint16_t nodeIndex, float *mins, float *maxs)
     }
     prevStaticModel = 0;
     modelnum = node->contents.staticModels;
+    // The absmin/absmax loads below were most of CM_SortNode's samples
+    // (one cache miss per static model): prefetch 8 models ahead along the
+    // not-yet-relinked part of the chain (cm_area_walk.h).
+    auto lookahead = CM_MakeChainLookahead<8>(
+        modelnum,
+        [](uint32_t num) -> uint32_t { return cm.staticModelList[num - 1].writable.nextModelInWorldSector; },
+        [](uint32_t num) {
+#if defined(__GNUC__)
+            __builtin_prefetch(&cm.staticModelList[num - 1].absmin[0]);
+            __builtin_prefetch(&cm.staticModelList[num - 1].absmax[2]);
+#else
+            (void)num;
+#endif
+        });
     while (modelnum)
     {
+        lookahead.Advance();
         staticModel = &cm.staticModelList[modelnum - 1];
-        if (dist >= (double)staticModel->absmin[axis])
+        if (dist >= staticModel->absmin[axis])
         {
-            if (dist > (double)staticModel->absmax[axis])
+            if (dist > staticModel->absmax[axis])
             {
                 childNodeIndexa = node->tree.child[1];
                 if (childNodeIndexa)
@@ -427,7 +460,7 @@ uint16_t __cdecl CM_AllocWorldSector(float *mins, float *maxs)
         return 0;
     size[0] = *maxs - *mins;
     size[1] = maxs[1] - mins[1];
-    axis = size[1] >= (double)size[0];
+    axis = size[1] >= size[0];
     if (size[size[1] >= (double)size[0]] <= 512.0)
         return 0;
     node = &cm_world.sectors[cm_world.freeHead];
@@ -465,6 +498,7 @@ uint32_t CM_LinkAllStaticModels()
     uint32_t result; // eax
     cStaticModel_s *staticModel; // [esp+0h] [ebp-8h]
     uint32_t i; // [esp+4h] [ebp-4h]
+    uint32_t nullModels = 0;
 
     i = 0;
     for (staticModel = cm.staticModelList; ; ++staticModel)
@@ -472,11 +506,26 @@ uint32_t CM_LinkAllStaticModels()
         result = i;
         if (i >= cm.numStaticModels)
             break;
-        iassert( staticModel->xmodel );
-        if (XModelGetContents(staticModel->xmodel))
+        // The loadobj path (CM_CreateStaticModel) never counts a static model
+        // whose XModel could not be created, so a model with no geometry is a
+        // real engine state; the original fastfile data always resolved every
+        // slot, so a null here means a retail alias this decoder has not yet
+        // recorded. Skip it loudly instead of dereferencing null (the old
+        // iassert does not abort on Switch, so XModelGetContents(0) faulted
+        // the whole map load).
+        if (!staticModel->xmodel)
+        {
+            ++nullModels;
+        }
+        else if (XModelGetContents(staticModel->xmodel))
+        {
             CM_LinkStaticModel(staticModel);
+        }
         ++i;
     }
+    if (nullModels)
+        Com_Printf(0, "CM_LinkAllStaticModels: skipped %u null model(s) of %u\n",
+                   nullModels, cm.numStaticModels);
     return result;
 }
 
@@ -504,14 +553,14 @@ void __cdecl CM_LinkStaticModel(cStaticModel_s *staticModel)
             node = &cm_world.sectors[nodeIndex];
             axis = node->tree.axis;
             dist = node->tree.dist;
-            if (dist >= (double)staticModel->absmin[axis])
+            if (dist >= staticModel->absmin[axis])
                 break;
             mins[axis] = dist;
             if (!node->tree.child[0])
                 goto LABEL_11;
             nodeIndex = node->tree.child[0];
         }
-        if (dist <= (double)staticModel->absmax[axis])
+        if (dist <= staticModel->absmax[axis])
             break;
         maxs[axis] = dist;
         if (!node->tree.child[1])
@@ -534,7 +583,19 @@ int __cdecl CM_AreaEntities(const float *mins, const float *maxs, int *entityLis
     ap.count = 0;
     ap.maxcount = maxcount;
     ap.contentmask = contentmask;
+#ifdef __SWITCH__
+    s_areaNodes = s_areaTested = 0;
+#endif
     CM_AreaEntities_r(1u, &ap);
+#ifdef __SWITCH__
+    if (SwitchPerf_Enabled())
+    {
+        SwitchPerf_AddEvent(SWITCH_PERF_EV_AREA_CALLS, 1);
+        SwitchPerf_AddEvent(SWITCH_PERF_EV_AREA_NODES, s_areaNodes);
+        SwitchPerf_AddEvent(SWITCH_PERF_EV_AREA_TESTED, s_areaTested);
+        SwitchPerf_AddEvent(SWITCH_PERF_EV_AREA_HITS, ap.count);
+    }
+#endif
 
     return ap.count;
 }
@@ -543,36 +604,58 @@ void __cdecl CM_AreaEntities_r(uint32_t nodeIndex, areaParms_t *ap)
 {
     worldSector_s *node; // [esp+0h] [ebp-14h]
     uint32_t nextNodeIndex; // [esp+4h] [ebp-10h]
-    gentity_s *gcheck; // [esp+8h] [ebp-Ch]
-    uint32_t entnum; // [esp+Ch] [ebp-8h]
-    svEntity_s *svEnt;
+    // Per call rather than per candidate: the box corners as vectors, the
+    // gentity array base and stride (SV_GEntityForSvEntity inlined).
+    const CmAreaQueryBox box = CM_MakeAreaQueryBox(ap->mins, ap->maxs);
+    char *const gentities = (char *)sv.gentities;
+    const size_t gentitySize = (size_t)sv.gentitySize;
+    auto gentityFor = [&](uint32_t entnum) {
+        return (gentity_s *)(gentities + (size_t)(entnum - 1) * gentitySize);
+    };
 
     for (node = &cm_world.sectors[nodeIndex]; (node->contents.contentsEntities & ap->contentmask) != 0; node = &cm_world.sectors[nodeIndex])
     {
-        for (entnum = node->contents.entities; entnum; entnum = svEnt->nextEntityInWorldSector)
-        {
-            svEnt = &sv.svEntities[entnum - 1];
-            gcheck = SV_GEntityForSvEntity(svEnt);
-
-            if ((ap->contentmask & gcheck->r.contents) != 0
-                && ap->maxs[0] >= gcheck->r.absmin[0]
-                && ap->mins[0] <= gcheck->r.absmax[0]
-                && ap->maxs[1] >= gcheck->r.absmin[1]
-                && ap->mins[1] <= gcheck->r.absmax[1]
-                && ap->maxs[2] >= gcheck->r.absmin[2]
-                && ap->mins[2] <= gcheck->r.absmax[2]
-                )
-            {
-                if (ap->count >= ap->maxcount)
+#ifdef __SWITCH__
+        uint32_t tested = 0;
+#endif
+        // Chain order and the MAXCOUNT early return are unchanged; the walk
+        // only runs ahead to prefetch (cm_area_walk.h).
+        const bool completed = CM_WalkEntityChain<16>(
+            node->contents.entities,
+            [](uint32_t entnum) -> uint32_t { return sv.svEntities[entnum - 1].nextEntityInWorldSector; },
+            [&](uint32_t entnum) {
+#if defined(__GNUC__)
+                const gentity_s *g = gentityFor(entnum);
+                __builtin_prefetch(&g->r.contents);
+                __builtin_prefetch(&g->r.absmax[2]);
+#else
+                (void)entnum;
+#endif
+            },
+            [&](uint32_t entnum) -> bool {
+#ifdef __SWITCH__
+                ++tested;
+#endif
+                const gentity_s *gcheck = gentityFor(entnum);
+                if ((ap->contentmask & gcheck->r.contents) != 0 && CM_AreaBoxOverlaps(box, gcheck->r.absmin, gcheck->r.absmax))
                 {
-                    Com_DPrintf(CON_CHANNEL_SYSTEM, "CM_AreaEntities: MAXCOUNT\n");
-                    return;
-                }
+                    if (ap->count >= ap->maxcount)
+                    {
+                        Com_DPrintf(CON_CHANNEL_SYSTEM, "CM_AreaEntities: MAXCOUNT\n");
+                        return false;
+                    }
 
-                ap->list[ap->count] = svEnt - sv.svEntities;
-                ap->count++;
-            }
-        }
+                    ap->list[ap->count] = (int)(entnum - 1); // svEnt - sv.svEntities
+                    ap->count++;
+                }
+                return true;
+            });
+#ifdef __SWITCH__
+        ++s_areaNodes;
+        s_areaTested += tested;
+#endif
+        if (!completed)
+            return;
         if (node->tree.dist >= ap->maxs[node->tree.axis])
         {
             if (node->tree.dist <= ap->mins[node->tree.axis])
@@ -661,7 +744,7 @@ void __cdecl CM_PointTraceStaticModels_r(
         t2 = p2[node->tree.axis] - node->tree.dist;
         if (t1 * t2 < 0.0)
         {
-            if (p1[3] >= (double)trace->fraction)
+            if (p1[3] >= trace->fraction)
                 return;
             iassert( t1 - t2 );
             frac = t1 / (t1 - t2);
@@ -859,7 +942,7 @@ void __cdecl CM_ClipMoveToEntities_r(
             v13 = p2[node->tree.axis] - node->tree.dist;
         else
             v13 = p[node->tree.axis] - node->tree.dist;
-        if (offset > (double)v13)
+        if (offset > v13)
         {
             v12 = t1 - t2;
             if (v12 < 0.0)
@@ -868,7 +951,7 @@ void __cdecl CM_ClipMoveToEntities_r(
                 v11 = p[node->tree.axis] - node->tree.dist;
             if (v11 > -offset)
             {
-                if (p[3] >= (double)trace->fraction)
+                if (p[3] >= trace->fraction)
                     return;
                 diff = t2 - t1;
                 if (diff == 0.0)
@@ -992,7 +1075,7 @@ int __cdecl CM_ClipSightTraceToEntities_r(
                 offset = clip->outerSize[node->tree.axis];
                 v14 = t2 - t1;
                 v13 = v14 < 0.0 ? p2[node->tree.axis] - node->tree.dist : p[node->tree.axis] - node->tree.dist;
-                if (offset > (double)v13)
+                if (offset > v13)
                     break;
                 nodeIndex = node->tree.child[0];
             }
@@ -1105,7 +1188,7 @@ void __cdecl CM_PointTraceToEntities_r(
         t2 = p2[node->tree.axis] - node->tree.dist;
         if (t1 * t2 < 0.0)
         {
-            if (p[3] >= (double)trace->fraction)
+            if (p[3] >= trace->fraction)
                 return;
             frac = t1 / (t1 - t2);
 

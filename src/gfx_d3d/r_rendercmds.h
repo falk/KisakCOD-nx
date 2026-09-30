@@ -443,7 +443,7 @@ struct __declspec(align(8)) GfxCmdBufInput // sizeof=0x430
     // padding byte
 };
 
-const struct GfxViewInfo // sizeof=0x67B0
+struct GfxViewInfo // sizeof=0x67B0
 {                                       // ...
     GfxViewParms viewParms;
     GfxSceneDef sceneDef;
@@ -463,7 +463,7 @@ const struct GfxViewInfo // sizeof=0x67B0
     int localClientNum;
     int isRenderingFullScreen;
     bool needsFloatZ;
-    // padding byte
+    bool needsResolvedPostSun; // an emissive-list technique samples RESOLVED_POST_SUN (r_scene.cpp)
     // padding byte
     // padding byte
     GfxLight shadowableLights[255];
@@ -511,7 +511,7 @@ const struct GfxViewInfo // sizeof=0x67B0
     // padding byte
     GfxCmdBufInput input;
 };
-const struct __declspec(align(16)) GfxBackEndData // sizeof=0x11E780
+struct __declspec(align(16)) GfxBackEndData // sizeof=0x11E780
 {                                       // ...
     uint8_t surfsBuffer[0x20000];
     FxCodeMeshData codeMeshes[2048];
@@ -542,7 +542,11 @@ const struct __declspec(align(16)) GfxBackEndData // sizeof=0x11E780
     FxMarkMeshData markMeshes[1536];
     GfxMeshData markMesh;
     GfxVertexBufferState *skinnedCacheVb;
-    IDirect3DQuery9 *endFence;
+    IDirect3DQuery9 *endFence; // unused: endFrame (deko9 native frame pacing)
+    // The frame that rendered this back-end data (RB_EndSceneRendering);
+    // R_EndFencePending holds the worker commands that refill it until that
+    // frame's fence passed. 0: never rendered.
+    uint64_t endFrame;
     uint8_t *tempSkinBuf;
     volatile long tempSkinPos;
     IDirect3DIndexBuffer9 *preTessIb;
@@ -597,6 +601,7 @@ void __cdecl R_ClearClientCmdList2D();
 void __cdecl R_BeginSharedCmdList();
 void __cdecl R_AddCmdEndOfList();
 GfxCmdHeader *__cdecl R_GetCommandBuffer(GfxRenderCommand renderCmd, int bytes);
+void __cdecl R_AddCmdSetMaterialColor(const float *color);
 #ifdef KISAK_RADIANT
 // Editor line-batching bridge (cod3src\src\gfx_d3d\r_rendercmds.cpp). See the
 // implementation at the end of r_rendercmds.cpp for the §11 signature notes.
@@ -671,6 +676,10 @@ void __cdecl R_AddCmdDrawStretchPic(
     const float *color,
     Material *material);
 bool __cdecl Material_HasAnyFogableTechnique(const Material *material);
+// Whether a vertex alpha of 0 is a no-op for a material's technique's blend
+// mode (r_view2d_alpha_skip.h has the predicate and the reasoning). False
+// (never skip) for a missing/opaque/unrecognised technique.
+bool __cdecl Material_2DZeroAlphaIsNoOp(const Material *material, MaterialTechniqueType techType);
 const MaterialTechnique *__cdecl Material_GetTechnique(const Material *material, MaterialTechniqueType techType);
 MaterialTechniqueSet *__cdecl Material_GetTechniqueSet(const Material *material);
 void __cdecl R_AddCmdDrawStretchPicFlipST(

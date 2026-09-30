@@ -1,6 +1,7 @@
 #include <universal/q_shared.h>
 #include "fx_system.h"
 #include <universal/profile.h>
+#include <universal/spin_pause.h>
 
 
 void __cdecl FX_SortEffects(FxSystem *system)
@@ -47,7 +48,9 @@ void __cdecl FX_SortEffects(FxSystem *system)
         v3[v8] = v10;
         system->allEffectHandles[v8] = v5;
     }
-    system->iteratorCount = 0;
+    // Release the exclusive iterator lock after the sorted handles are
+    // written (AArch64 does not order the plain volatile store after them).
+    __atomic_store_n(&system->iteratorCount, 0, __ATOMIC_RELEASE);
 }
 
 void __cdecl FX_WaitBeginIteratingOverEffects_Exclusive(FxSystem *system)
@@ -57,10 +60,11 @@ void __cdecl FX_WaitBeginIteratingOverEffects_Exclusive(FxSystem *system)
     if (system->isArchiving)
         MyAssertHandler("c:\\trees\\cod3\\src\\effectscore\\fx_system.h", 512, 0, "%s", "!system->isArchiving");
     Destination = &system->iteratorCount;
+    uint32_t spin = 0;
     do
     {
         while (*Destination)
-            ;
+            Sys_SpinPause(spin++);
     } while (InterlockedCompareExchange(Destination, -1, 0));
 }
 

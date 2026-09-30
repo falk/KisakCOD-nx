@@ -1,4 +1,11 @@
+#include "r_dynres.h"
+#include <deko9/deko9_native.h>
+#include "rb_gpupass.h"
+#include "rb_ab_tour.h"
+#include "rb_halfres_particles.h"
+#include <time.h>
 #include <universal/q_shared.h>
+#include <port/switch_perf.h>
 #include "rb_backend.h"
 #include <qcommon/mem_track.h>
 
@@ -34,10 +41,134 @@
 #include "r_staticmodelcache.h"
 #include "rb_uploadshaders.h"
 #include <universal/timing.h>
+#include <universal/retail_tsc.h>
+#include <database/db_retail_frame_evidence.h>
 
 #include <setjmp.h>
 #ifdef KISAK_SP
 #include <client/cl_scrn.h>
+#endif
+
+// See rb_gpupass.h.
+bool g_rbInView2DCmdList = false;
+#ifdef __SWITCH__
+#include <zlib/zlib.h>
+
+namespace
+{
+void RB_WritePngU32(FILE *file, uint32_t value)
+{
+    const uint8_t bytes[4] = {
+        static_cast<uint8_t>(value >> 24), static_cast<uint8_t>(value >> 16),
+        static_cast<uint8_t>(value >> 8), static_cast<uint8_t>(value)
+    };
+    fwrite(bytes, 1, sizeof(bytes), file);
+}
+
+bool RB_WritePngChunk(FILE *file, const char type[4], const uint8_t *data, uint32_t size)
+{
+    RB_WritePngU32(file, size);
+    if (fwrite(type, 1, 4, file) != 4)
+        return false;
+    if (size && fwrite(data, 1, size, file) != size)
+        return false;
+    uLong crc = crc32(0, reinterpret_cast<const Bytef *>(type), 4);
+    if (size)
+        crc = crc32(crc, data, size);
+    RB_WritePngU32(file, static_cast<uint32_t>(crc));
+    return !ferror(file);
+}
+
+// Encode the D3D9 A8R8G8B8/X8R8G8B8 readback entirely in memory. The only
+// filesystem write is the final compressed PNG; no raw BMP staging file is
+// created. PNG filter type 0 keeps this diagnostic path small and auditable.
+bool RB_WriteBackbufferPng(const char *filename, const D3DLOCKED_RECT &locked,
+                           uint32_t width, uint32_t height)
+{
+    const uint64_t rowBytes64 = 1ull + 3ull * width;
+    const uint64_t rawBytes64 = rowBytes64 * height;
+    if (!width || !height || rowBytes64 > UINT32_MAX || rawBytes64 > UINT32_MAX)
+        return false;
+    const uint32_t rowBytes = static_cast<uint32_t>(rowBytes64);
+    const uint32_t rawBytes = static_cast<uint32_t>(rawBytes64);
+    uint8_t *raw = static_cast<uint8_t *>(malloc(rawBytes));
+    if (!raw)
+        return false;
+    for (uint32_t y = 0; y < height; ++y)
+    {
+        uint8_t *dst = raw + y * rowBytes;
+        const uint8_t *src = static_cast<const uint8_t *>(locked.pBits) + y * locked.Pitch;
+        *dst++ = 0; // PNG filter: None
+        for (uint32_t x = 0; x < width; ++x)
+        {
+            *dst++ = src[4 * x + 2]; // R
+            *dst++ = src[4 * x + 1]; // G
+            *dst++ = src[4 * x + 0]; // B
+        }
+    }
+
+    uLongf compressedBytes = rawBytes + rawBytes / 1000u + 64u;
+    uint8_t *compressed = static_cast<uint8_t *>(malloc(compressedBytes));
+    const int zResult = compressed
+        ? compress2(compressed, &compressedBytes, raw, rawBytes, Z_BEST_SPEED)
+        : Z_MEM_ERROR;
+    free(raw);
+    if (zResult != Z_OK || compressedBytes > UINT32_MAX)
+    {
+        free(compressed);
+        return false;
+    }
+
+    FILE *file = fopen(filename, "wb");
+    if (!file)
+    {
+        free(compressed);
+        return false;
+    }
+    static const uint8_t signature[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    uint8_t ihdr[13] = {
+        static_cast<uint8_t>(width >> 24), static_cast<uint8_t>(width >> 16),
+        static_cast<uint8_t>(width >> 8), static_cast<uint8_t>(width),
+        static_cast<uint8_t>(height >> 24), static_cast<uint8_t>(height >> 16),
+        static_cast<uint8_t>(height >> 8), static_cast<uint8_t>(height),
+        8, 2, 0, 0, 0 // 8-bit RGB, deflate, filter method 0, no interlace
+    };
+    const bool ok = fwrite(signature, 1, sizeof(signature), file) == sizeof(signature) &&
+                    RB_WritePngChunk(file, "IHDR", ihdr, sizeof(ihdr)) &&
+                    RB_WritePngChunk(file, "IDAT", compressed,
+                                     static_cast<uint32_t>(compressedBytes)) &&
+                    RB_WritePngChunk(file, "IEND", nullptr, 0) &&
+                    fclose(file) == 0;
+    free(compressed);
+    if (!ok)
+        remove(filename);
+    return ok;
+}
+
+// the `screenshot` console command on Switch (R_ScreenshotCommand in
+// switch_screenshot.cpp) requests one capture here; RB_SwapBuffers honours
+// it on the next present through the same real backbuffer readback the
+// capture ring uses, and reports the outcome back for the console message.
+char s_requestedScreenshot[256] = "";
+bool s_requestedScreenshotDone = false;
+bool s_requestedScreenshotOk = false;
+} // namespace
+
+void RB_RequestScreenshot(const char *ospath)
+{
+    snprintf(s_requestedScreenshot, sizeof(s_requestedScreenshot), "%s", ospath);
+    s_requestedScreenshotDone = false;
+    s_requestedScreenshotOk = false;
+}
+
+bool RB_PollRequestedScreenshot(bool *ok)
+{
+    if (!s_requestedScreenshotDone)
+        return false;
+    *ok = s_requestedScreenshotOk;
+    s_requestedScreenshotDone = false;
+    return true;
+}
 #endif
 
 void(__cdecl *const RB_RenderCommandTable[RC_COUNT])(GfxRenderCommandExecState *) =
@@ -96,7 +227,10 @@ void __cdecl R_FinishGpuFence()
 {
     PROF_SCOPED("R_SyncGpu");
 
-    while (!RB_IsGpuFenceFinished());
+    while (!RB_IsGpuFenceFinished())
+    {
+        Deko9_WaitFrame(dx.device, dx.gpuSyncFrame, 1000000); // see RB_AdaptiveGpuSyncFinal
+    }
 }
 
 void __cdecl R_AcquireGpuFenceLock()
@@ -123,7 +257,19 @@ void __cdecl R_InsertGpuFence()
     {
         if (r_logFile && r_logFile->current.integer)
             RB_LogPrint("dx.flushGpuQuery->Issue( (1 << 0) )\n");
-        hr = dx.flushGpuQuery->Issue(1);
+        // deko9 native frame pacing: retail issued an event query at the end
+        // of the frame being recorded (F) and the next sync waited for F.
+        // With Deko9_FramesInFlight() (N) frames allowed on the GPU the sync
+        // waits for F - (N - 1): the frame the swap wait before presenting
+        // F + 1 needs anyway, so the adaptive sync never forces the GPU queue
+        // below N frames. Always a presented frame (never F itself).
+        {
+            const uint64_t frame = Deko9_FrameRecording(dx.device);
+            const uint64_t n = Deko9_FramesInFlight();
+            const uint64_t lag = n > 1 ? n - 1 : 1;
+            dx.gpuSyncFrame = frame > lag ? frame - lag : 0;
+        }
+        hr = 0;
         if (hr < 0)
         {
             do
@@ -231,6 +377,23 @@ void __cdecl RB_DrawStretchPic(
 {
     uint16_t vertCount; // [esp+24h] [ebp-4h]
 
+    if (w < 0.0f)
+    {
+        x += w;
+        w = -w;
+        float tmp = s0;
+        s0 = s1;
+        s1 = tmp;
+    }
+    if (h < 0.0f)
+    {
+        y += h;
+        h = -h;
+        float tmp = t0;
+        t0 = t1;
+        t1 = tmp;
+    }
+
     iassert(gfxCmdBufSourceState.viewMode == VIEW_MODE_2D);
 
     RB_SetTessTechnique(material, TECHNIQUE_UNLIT);
@@ -289,6 +452,23 @@ void __cdecl RB_DrawStretchPicFlipST(
     float v11; // [esp+1Ch] [ebp-Ch]
     float v12; // [esp+20h] [ebp-8h]
     uint16_t vertCount; // [esp+24h] [ebp-4h]
+
+    if (w < 0.0f)
+    {
+        x += w;
+        w = -w;
+        float tmp = s0;
+        s0 = s1;
+        s1 = tmp;
+    }
+    if (h < 0.0f)
+    {
+        y += h;
+        h = -h;
+        float tmp = t0;
+        t0 = t1;
+        t1 = tmp;
+    }
 
     iassert( gfxCmdBufSourceState.viewMode == VIEW_MODE_2D );
     RB_SetTessTechnique(material, TECHNIQUE_UNLIT);
@@ -355,10 +535,13 @@ void __cdecl RB_SplitScreenFilter(const Material *material, const GfxViewInfo *v
     if (tess.indexCount)
         RB_EndTessSurface();
     R_Set2D(&gfxCmdBufSourceState);
-    x = (float)viewInfo->displayViewport.x;
-    y = (float)viewInfo->displayViewport.y;
-    w = (float)viewInfo->displayViewport.width;
-    h = (float)viewInfo->displayViewport.height;
+    // The view's rectangle in the scene target: with r_dynres that is the
+    // scene viewport (the display one is in back-buffer pixels).
+    const GfxViewport &viewport = R_DynResEnabled() ? viewInfo->sceneViewport : viewInfo->displayViewport;
+    x = (float)viewport.x;
+    y = (float)viewport.y;
+    w = (float)viewport.width;
+    h = (float)viewport.height;
     RB_SplitScreenTexCoords(x, y, w, h, &s0, &t0, &s1, &t1);
     RB_DrawStretchPic(material, 0.0, 0.0, w, h, s0, t0, s1, t1, 0xFFFFFFFF, GFX_PRIM_STATS_CODE);
     RB_EndTessSurface();
@@ -442,10 +625,60 @@ void __cdecl R_Resolve(GfxCmdBufContext context, GfxImage *image)
     } while (alwaysfails);
 }
 
+namespace
+{
+// r_view2dAlphaDiag: rate-limited per-material report of large 2D stretch-pic
+// draws (>= 40% of the display area) with their vertex alpha, to find
+// full-screen 2D overlays that queue a draw every frame while fully
+// transparent (typically material=white and gasmask_overlay full-screen
+// quads).
+struct View2DAlphaDiagEntry
+{
+    const void *material = nullptr;
+    int lastMs = -1000000;
+};
+View2DAlphaDiagEntry s_view2dAlphaDiagEntries[8];
+
+void RB_View2DAlphaDiagReport(const Material *material, float w, float h, GfxColor color)
+{
+    if (!r_view2dAlphaDiag || !r_view2dAlphaDiag->current.enabled)
+        return;
+    const float area = w * h;
+    const float displayArea = (float)vidConfig.displayWidth * (float)vidConfig.displayHeight;
+    if (displayArea <= 0.0f || area < 0.4f * displayArea)
+        return;
+
+    const int now = Sys_Milliseconds();
+    View2DAlphaDiagEntry *oldest = &s_view2dAlphaDiagEntries[0];
+    View2DAlphaDiagEntry *slot = nullptr;
+    for (View2DAlphaDiagEntry &e : s_view2dAlphaDiagEntries)
+    {
+        if (e.material == material)
+        {
+            slot = &e;
+            break;
+        }
+        if (e.lastMs < oldest->lastMs)
+            oldest = &e;
+    }
+    if (!slot)
+        slot = oldest;
+    if (slot->material == material && now - slot->lastMs < 1000)
+        return;
+    slot->material = material;
+    slot->lastMs = now;
+
+    Com_Printf(CON_CHANNEL_GFX, "VIEW2D_ALPHA mat=%s pass=%s alpha=%u w=%.0f h=%.0f\n",
+               Material_GetName(const_cast<Material *>(material)),
+               g_rbInView2DCmdList ? "view2d" : "hud2d", (unsigned)color.array[3], w, h);
+}
+} // namespace
+
 void __cdecl RB_StretchPicCmd(GfxRenderCommandExecState *execState)
 {
     GfxCmdStretchPic *cmd = (GfxCmdStretchPic *)execState->cmd;
 
+    RB_View2DAlphaDiagReport(cmd->material, cmd->w, cmd->h, cmd->color);
     RB_DrawStretchPic(cmd->material, cmd->x, cmd->y, cmd->w, cmd->h, cmd->s0, cmd->t0, cmd->s1, cmd->t1, cmd->color, GFX_PRIM_STATS_HUD);
     execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
 }
@@ -454,6 +687,7 @@ void __cdecl RB_StretchPicCmdFlipST(GfxRenderCommandExecState *execState)
 {
     GfxCmdStretchPic *cmd = (GfxCmdStretchPic *)execState->cmd;
 
+    RB_View2DAlphaDiagReport(cmd->material, cmd->w, cmd->h, cmd->color);
     RB_DrawStretchPicFlipST(cmd->material, cmd->x, cmd->y, cmd->w, cmd->h, cmd->s0, cmd->t0, cmd->s1, cmd->t1, cmd->color, GFX_PRIM_STATS_HUD);
     execState->cmd = (char *)execState->cmd + cmd->header.byteCount;
 }
@@ -723,17 +957,29 @@ void __cdecl R_DrawSurfs(GfxCmdBufContext context, GfxCmdBufState *prepassState,
     prepassContext.source = prepassState != 0 ? context.source : 0;
     prepassContext.state = prepassState;
     iassert(dx.d3d9 && dx.device);
+    // Hold the deko9 device lock across the whole list: every device call
+    // below re-enters it inline instead of taking a mutex per call.
+    // (Device settings from dvars: RB_ApplyDeko9FrameSettings, once per frame.)
+    Deko9Batch deko9Batch(context.state->prim.device);
     drawSurfCount = info->drawSurfCount;
     listArgs.context = context;
     listArgs.firstDrawSurfIndex = 0;
     listArgs.info = info;
+    // r_halfResParticles: soft-particle runs of the emissive list draw off
+    // screen and are composited before the next full-res run
+    // (rb_halfres_particles.h).
+    const bool hrpList = RB_HrpListActive(info);
     while (listArgs.firstDrawSurfIndex != drawSurfCount)
     {
+        if (hrpList)
+            RB_HrpBeforeMaterial(context, prepassContext, info, listArgs.firstDrawSurfIndex);
         processedDrawSurfCount = R_RenderDrawSurfListMaterial(&listArgs, prepassContext);
         listArgs.firstDrawSurfIndex += processedDrawSurfCount;
     }
     g_viewStats->drawSurfCount += info->drawSurfCount;
     R_TessEnd(context, prepassContext);
+    if (hrpList)
+        RB_HrpEndList(context);
     context.state->origMaterial = 0;
 }
 
@@ -755,6 +1001,8 @@ uint32_t(__cdecl *const rb_tessTable[13])(const GfxDrawSurfListArgs *, GfxCmdBuf
   &R_TessParticleCloudList
 }; // idb
 
+
+
 uint32_t __cdecl R_RenderDrawSurfListMaterial(const GfxDrawSurfListArgs *listArgs, GfxCmdBufContext prepassContext)
 {
     //GfxCmdBufSourceState *passPrepassContext; // [esp+4h] [ebp-28h]
@@ -770,8 +1018,21 @@ uint32_t __cdecl R_RenderDrawSurfListMaterial(const GfxDrawSurfListArgs *listArg
     drawSurfCount = listArgs->info->drawSurfCount - listArgs->firstDrawSurfIndex;
     drawSurfList = &listArgs->info->drawSurfs[listArgs->firstDrawSurfIndex];
     drawSurf.packed = drawSurfList->packed;
-    if (!R_SetupMaterial(listArgs->context, &prepassContext, listArgs->info, drawSurf))
+    // Emissive A/B material skip (rb_ab_tour.h r_deko9SkipEmissive). One
+    // load and a branch when off.
+    if (g_emissiveSkipOn && RB_EmissiveListActive(listArgs->info) &&
+        RB_EmissiveSkipMaterial(rgp.sortedMaterials[drawSurf.fields.materialSortedIndex]))
+    {
+        ++g_emissiveSkipped;
         return R_SkipDrawSurfListMaterial(drawSurfList, drawSurfCount);
+    }
+    if (!R_SetupMaterial(listArgs->context, &prepassContext, listArgs->info, drawSurf))
+    {
+        RetailKillhouseFrameEvidenceNoteDraw(
+            (uint32_t)listArgs->info->baseTechType, (uint32_t)drawSurf.fields.surfType,
+            0u, 0u, 1u, listArgs->info->viewOrigin[3] != 0.0f ? 1u : 0u);
+        return R_SkipDrawSurfListMaterial(drawSurfList, drawSurfCount);
+    }
     isPixelCostEnabled = pixelCostMode != GFX_PIXEL_COST_MODE_OFF;
     if (pixelCostMode)
         R_PixelCost_BeginSurface(listArgs->context);
@@ -800,6 +1061,12 @@ uint32_t __cdecl R_RenderDrawSurfListMaterial(const GfxDrawSurfListArgs *listArg
         iassert(drawSurf.fields.surfType < ARRAY_COUNT(rb_tessTable));
         subListCount = rb_tessTable[drawSurf.fields.surfType](listArgs, passPrepassContext);
     }
+    // measure the executed sublist through the same dispatch that
+    // issued it; a dropped list is reported as skipped above instead.
+    RetailKillhouseFrameEvidenceNoteDraw(
+        (uint32_t)listArgs->info->baseTechType, (uint32_t)drawSurf.fields.surfType,
+        subListCount, (uint32_t)listArgs->context.state->technique->passCount, 0u,
+        listArgs->info->viewOrigin[3] != 0.0f ? 1u : 0u);
     if (isPixelCostEnabled)
         R_PixelCost_EndSurface(listArgs->context);
     if (!subListCount || subListCount > drawSurfCount)
@@ -1665,7 +1932,6 @@ void __cdecl DrawText2D(
     int count; // [esp+1B8h] [ebp-38h]
     int passIdx; // [esp+1BCh] [ebp-34h]
     GfxColor dropShadowColor; // [esp+1C0h] [ebp-30h]
-    const Material *material; // [esp+1C4h] [ebp-2Ch]
     bool drawRandomCharAtEnd; // [esp+1CBh] [ebp-25h] BYREF
     int randSeed; // [esp+1CCh] [ebp-24h] BYREF
     float startX; // [esp+1D0h] [ebp-20h]
@@ -1686,8 +1952,36 @@ void __cdecl DrawText2D(
     drawRandomCharAtEnd = 0;
     monospaceWidth = GetMonospaceWidth(font, renderFlags);
     glowMaterial = 0;
-    material = Material_FromHandle(font->material);
+    if (font && !font->material)
+    {
+        const char *matName = "fonts/gamefonts_pc";
+        const char *glowName = "fonts/gamefonts_pc_glow";
+        if (font->fontName && (strstr(font->fontName, "dev") || strstr(font->fontName, "Dev")))
+        {
+            matName = "fonts/devfonts";
+            glowName = "fonts/devfonts_glow";
+        }
+        font->material = Material_RegisterHandle(matName, 3);
+        if (!font->material)
+            font->material = Material_RegisterHandle("white", 3);
+        if (!font->material)
+            font->material = rgp.defaultMaterial;
+
+        font->glowMaterial = Material_RegisterHandle(glowName, 3);
+        if (!font->glowMaterial)
+            font->glowMaterial = font->material;
+    }
+    const Material *fontMaterial = (font && font->material) ? Material_FromHandle(font->material) : rgp.defaultMaterial;
+    if (!fontMaterial)
+        fontMaterial = rgp.defaultMaterial;
+    // The font materials are fixed for the whole string, so whether they
+    // have a fogable technique is too: asked once here instead of once per
+    // glyph, each a strstr on the technique set name. `const` makes the
+    // compiler hold the invariant.
+    const Material *const material = fontMaterial;
     iassert( material );
+    const bool materialFogable = Material_HasAnyFogableTechnique(material);
+    bool glowMaterialFogable = false;
     if ((renderFlags & 0x40) != 0 && (!fxMaterial || !fxMaterial->techniqueSet))
         MyAssertHandler(
             ".\\rb_backend.cpp",
@@ -1719,8 +2013,11 @@ void __cdecl DrawText2D(
         passCount = 1;
         if ((renderFlags & 0x10) != 0)
         {
-            glowMaterial = Material_FromHandle(font->glowMaterial);
+            glowMaterial = (font && font->glowMaterial) ? Material_FromHandle(font->glowMaterial) : material;
+            if (!glowMaterial)
+                glowMaterial = material;
             iassert( glowMaterial );
+            glowMaterialFogable = Material_HasAnyFogableTechnique(glowMaterial);
             ++passCount;
         }
         if ((renderFlags & 0x40) != 0)
@@ -1896,7 +2193,7 @@ void __cdecl DrawText2D(
                                             v32 = (0.75 + 1.0) * (xScale * (double)glyph->pixelWidth);
                                             v33 = (0.125 + 1.0) * (yScale * (double)glyph->pixelHeight);
                                             v34.packed = finalColor.packed;
-                                            if (Material_HasAnyFogableTechnique(glowMaterial))
+                                            if (glowMaterialFogable)
                                                 R_WarnOncePerFrame(R_WARN_FOGABLE_2DTEXT, glowMaterial->info.name);
                                             else
                                                 RB_DrawStretchPicRotate(
@@ -1948,7 +2245,7 @@ void __cdecl DrawText2D(
                                         v41 = yRot;
                                         w = xScale * (double)glyph->pixelWidth;
                                         v43 = yScale * (double)glyph->pixelHeight;
-                                        if (Material_HasAnyFogableTechnique(material))
+                                        if (materialFogable)
                                             R_WarnOncePerFrame(R_WARN_FOGABLE_2DTEXT, material->info.name);
                                         else
                                             RB_DrawStretchPicRotate(
@@ -1992,7 +2289,7 @@ void __cdecl DrawText2D(
                                     v37 = xScale * (double)glyph->pixelWidth;
                                     v38 = yScale * (double)glyph->pixelHeight;
                                     v39.packed = finalColor.packed;
-                                    if (Material_HasAnyFogableTechnique(material))
+                                    if (materialFogable)
                                         R_WarnOncePerFrame(R_WARN_FOGABLE_2DTEXT, material->info.name);
                                     else
                                         RB_DrawStretchPicRotate(
@@ -2600,10 +2897,44 @@ void __cdecl RB_ResetStatTracking()
     g_viewStats = (GfxViewStats *)&g_frameStatsCur;
 }
 
+// deko9 device settings from dvars, once per frame before any draw (was
+// re-applied per draw-surface list in R_DrawSurfs). Each setter only acts on
+// a change; the fallbacks for an unregistered dvar match the device defaults.
+static void RB_ApplyDeko9FrameSettings()
+{
+    IDirect3DDevice9 *device = dx.device;
+    if (!device)
+        return;
+    // Whichever thread renders this frame (the back end with r_smp_backend 1,
+    // main inline, the render thread for loading screens) is the only one
+    // that may submit until ownership moves again (deko9_native.h).
+    Deko9_ClaimSubmitThread(device);
+    Deko9_SetVerify(device, r_deko9Verify && r_deko9Verify->current.enabled);
+    Deko9_SetEarlyZ(device, !r_deko9EarlyZ || r_deko9EarlyZ->current.enabled);
+    Deko9_SetPerDraw(device, ((!r_deko9HazardCache || r_deko9HazardCache->current.enabled) ? DEKO9_PERDRAW_HAZARD : 0u) |
+                                 ((!r_deko9ConstFast || r_deko9ConstFast->current.enabled) ? DEKO9_PERDRAW_CONSTS : 0u) |
+                                 ((!r_deko9TexIncremental || r_deko9TexIncremental->current.enabled)
+                                      ? DEKO9_PERDRAW_TEXTURES
+                                      : 0u) |
+                                 ((!r_deko9StaticHazard || r_deko9StaticHazard->current.enabled)
+                                      ? DEKO9_PERDRAW_STATICTEX
+                                      : 0u));
+    // These take effect at the next Present, so a frame is recorded whole.
+    Deko9_SetGpuPasses(device, r_deko9GpuPasses && r_deko9GpuPasses->current.enabled);
+    Deko9_SetBarrierMode(device, r_deko9LightBarriers ? (uint32_t)r_deko9LightBarriers->current.integer : 0);
+    Deko9_SetZcullStats(device, r_deko9ZcullStats && r_deko9ZcullStats->current.enabled);
+    Deko9_SetShadowFilter(device, r_shadowFilter ? (uint32_t)r_shadowFilter->current.integer : 0);
+    Deko9_SetCensus(device, r_deko9Census && r_deko9Census->current.enabled);
+    Deko9_SetFaultTrace(device, r_deko9FaultTrace ? (uint32_t)r_deko9FaultTrace->current.integer : 0u);
+    Deko9_SetGpuMap(device, r_deko9GpuMap ? (uint32_t)r_deko9GpuMap->current.integer : 0u);
+    RB_AbTourBackendFrame();
+}
+
 void __cdecl RB_BeginFrame(const GfxBackEndData *data)
 {
     int hr; // [esp+0h] [ebp-4h]
 
+    RB_ApplyDeko9FrameSettings();
     backEndData = (GfxBackEndData*)data;
     if ((data->drawType & 1) != 0)
     {
@@ -2632,11 +2963,13 @@ void __cdecl RB_BeginFrame(const GfxBackEndData *data)
             }
         } while (alwaysfails);
 
+        RB_DynResBeginFrame(data);
         RB_UploadShaderStep();
         RB_ResetStatTracking();
         R_Cinematic_UpdateFrame();
         tess.indexCount = 0;
         tess.vertexCount = 0;
+        R_ResetDynamicVbIbRings();
     }
 }
 
@@ -2669,7 +3002,176 @@ GfxIndexBufferState *RB_SwapBuffers()
 
     {
         PROF_SCOPED("Present");
-        hr = dx.windows[dx.targetWindowIndex].swapChain->Present(0, 0, 0, 0, 0);
+#ifdef __SWITCH__
+        char pbuf[128];
+        std::snprintf(pbuf, sizeof(pbuf), "RB_SwapBuffers: targetWin=%d, winCount=%d, sc=%p\n",
+                      dx.targetWindowIndex, dx.windowCount,
+                      (dx.targetWindowIndex >= 0 && dx.targetWindowIndex < dx.windowCount) ? dx.windows[dx.targetWindowIndex].swapChain : nullptr);
+
+        // Rolling screenshot ring buffer for the external screenshot server:
+        // captures one frame every kScreenshotInterval presented frames into a fixed set of
+        // kScreenshotRingSize files, cycling filenames so the SD card only ever holds the
+        // most recent ring-full of frames instead of growing without bound.
+        static int s_dumpFrame = 0;
+        ++s_dumpFrame;
+        const int kScreenshotInterval = 15;
+        const int kScreenshotRingSize = 10;
+        // The periodic ring below is gated behind r_captureRing, default off:
+        // one 3.6MB write per kScreenshotInterval frames for a run's whole
+        // duration can write hundreds of MB even though only
+        // kScreenshotRingSize files ever exist on disk at once.
+        const bool requestedShot = s_requestedScreenshot[0] != '\0';
+        const bool ringShot =
+            r_captureRing && r_captureRing->current.enabled && (s_dumpFrame % kScreenshotInterval) == 0;
+        if (requestedShot || ringShot)
+        {
+            int slot = (s_dumpFrame / kScreenshotInterval) % kScreenshotRingSize;
+            IDirect3DSurface9 *backBuffer = nullptr;
+            HRESULT bbHr = dx.windows[dx.targetWindowIndex].swapChain->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &backBuffer);
+            if (SUCCEEDED(bbHr) && backBuffer)
+            {
+                D3DSURFACE_DESC desc;
+                backBuffer->GetDesc(&desc);
+                IDirect3DSurface9 *sysSurface = nullptr;
+                HRESULT ssHr = dx.device->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format, D3DPOOL_SYSTEMMEM, &sysSurface, nullptr);
+                if (SUCCEEDED(ssHr) && sysSurface)
+                {
+                    HRESULT rtdHr = dx.device->GetRenderTargetData(backBuffer, sysSurface);
+                    if (SUCCEEDED(rtdHr))
+                    {
+                        D3DLOCKED_RECT locked;
+                        if (SUCCEEDED(sysSurface->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
+                        {
+                            snprintf(pbuf, sizeof(pbuf),
+                                     "RB_SwapBuffers: capture desc=%ux%u fmt=%u pitch=%d (expected>=%u)\n",
+                                     desc.Width, desc.Height, (unsigned)desc.Format, locked.Pitch, desc.Width * 4);
+                            // Decisive bind/present-coherence probe: sample the captured
+                            // backbuffer pixels directly (center + corners) and compare
+                            // against the currently-bound render target's content.
+                            {
+                                auto pxAt = [&](uint32_t x, uint32_t y) -> uint32_t {
+                                    if (x >= desc.Width || y >= desc.Height)
+                                        return 0xdeadbeef;
+                                    const uint8_t *row = (const uint8_t *)locked.pBits + y * locked.Pitch;
+                                    uint32_t v = 0;
+                                    memcpy(&v, row + x * 4, 4);
+                                    return v;
+                                };
+                                uint32_t c = pxAt(desc.Width / 2, desc.Height / 2);
+                                uint32_t tl = pxAt(0, 0);
+                                uint32_t tr = pxAt(desc.Width - 1, 0);
+                                uint32_t bl = pxAt(0, desc.Height - 1);
+                                uint32_t br = pxAt(desc.Width - 1, desc.Height - 1);
+                                snprintf(pbuf, sizeof(pbuf),
+                                         "RB_SwapBuffers: bb0 px center=0x%08x tl=0x%08x tr=0x%08x bl=0x%08x br=0x%08x bb=%p\n",
+                                         c, tl, tr, bl, br, (void *)backBuffer);
+                            }
+                            IDirect3DSurface9 *boundRT = nullptr;
+                            if (SUCCEEDED(dx.device->GetRenderTarget(0, &boundRT)) && boundRT)
+                            {
+                                snprintf(pbuf, sizeof(pbuf),
+                                         "RB_SwapBuffers: boundRT=%p bb0=%p same=%d\n",
+                                         (void *)boundRT, (void *)backBuffer, boundRT == backBuffer);
+                                IDirect3DSurface9 *rtSys = nullptr;
+                                if (SUCCEEDED(dx.device->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format, D3DPOOL_SYSTEMMEM, &rtSys, nullptr)) && rtSys)
+                                {
+                                    if (SUCCEEDED(dx.device->GetRenderTargetData(boundRT, rtSys)))
+                                    {
+                                        D3DLOCKED_RECT rtLocked;
+                                        if (SUCCEEDED(rtSys->LockRect(&rtLocked, nullptr, D3DLOCK_READONLY)))
+                                        {
+                                            auto rtPxAt = [&](uint32_t x, uint32_t y) -> uint32_t {
+                                                if (x >= desc.Width || y >= desc.Height)
+                                                    return 0xdeadbeef;
+                                                const uint8_t *row = (const uint8_t *)rtLocked.pBits + y * rtLocked.Pitch;
+                                                uint32_t v = 0;
+                                                memcpy(&v, row + x * 4, 4);
+                                                return v;
+                                            };
+                                            uint32_t c = rtPxAt(desc.Width / 2, desc.Height / 2);
+                                            uint32_t tl = rtPxAt(0, 0);
+                                            uint32_t br = rtPxAt(desc.Width - 1, desc.Height - 1);
+                                            snprintf(pbuf, sizeof(pbuf),
+                                                     "RB_SwapBuffers: boundRT px center=0x%08x tl=0x%08x br=0x%08x\n",
+                                                     c, tl, br);
+                                            rtSys->UnlockRect();
+                                        }
+                                    }
+                                    else
+                                    {
+                                    }
+                                    rtSys->Release();
+                                }
+                                boundRT->Release();
+                            }
+                            char filename[256];
+                            if (requestedShot)
+                                snprintf(filename, sizeof(filename), "%s", s_requestedScreenshot);
+                            else
+                                snprintf(filename, sizeof(filename), "sdmc:/switch/kisakcod/screenshot_%02d.png", slot);
+                            const bool wrote = RB_WriteBackbufferPng(filename, locked, desc.Width, desc.Height);
+                            if (requestedShot)
+                            {
+                                s_requestedScreenshot[0] = '\0';
+                                s_requestedScreenshotOk = wrote;
+                                s_requestedScreenshotDone = true;
+                            }
+                            if (wrote)
+                            {
+                                snprintf(pbuf, sizeof(pbuf), "RB_SwapBuffers: dumped guest backbuffer to %s (frame=%d, format=%u, %ux%u)\n",
+                                         filename, s_dumpFrame, (unsigned)desc.Format, desc.Width, desc.Height);
+                            }
+                            sysSurface->UnlockRect();
+                        }
+                    }
+                    sysSurface->Release();
+                }
+                backBuffer->Release();
+            }
+        }
+
+#endif
+        {
+#ifdef __SWITCH__
+            SWITCH_PERF_SCOPE(SWITCH_PERF_EXEC_PRESENT);
+#endif
+            Deko9_SetUpscaleSharpness(dx.device, r_fsrSharpness ? r_fsrSharpness->current.value : 0.2f);
+            Deko9_SetUpscaleMode(dx.device, r_fsrMode ? (uint32_t)r_fsrMode->current.integer : 0u);
+            hr = dx.windows[dx.targetWindowIndex].swapChain->Present(0, 0, 0, 0, 0);
+        }
+#ifdef __SWITCH__
+        std::snprintf(pbuf, sizeof(pbuf), "RB_SwapBuffers: swapChain->Present returned hr=0x%08x\n", (unsigned int)hr);
+#endif
+        // r_renderResolution below the display: the ring shot above is the
+        // render-size back buffer; also dump what reached the screen (the
+        // upscaled front buffer) as screenshot_NN_fsr.png.
+        if (ringShot && SUCCEEDED(hr))
+        {
+            D3DDISPLAYMODE mode{};
+            if (SUCCEEDED(dx.device->GetDisplayMode(0, &mode)) &&
+                ((int)mode.Width != vidConfig.displayWidth || (int)mode.Height != vidConfig.displayHeight))
+            {
+                IDirect3DSurface9 *front = nullptr;
+                if (SUCCEEDED(dx.device->CreateOffscreenPlainSurface(mode.Width, mode.Height, D3DFMT_A8R8G8B8,
+                                                                     D3DPOOL_SYSTEMMEM, &front, nullptr)) &&
+                    front)
+                {
+                    D3DLOCKED_RECT locked;
+                    if (SUCCEEDED(dx.device->GetFrontBufferData(0, front)) &&
+                        SUCCEEDED(front->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
+                    {
+                        char filename[256];
+                        snprintf(filename, sizeof(filename), "sdmc:/switch/kisakcod/screenshot_%02d_fsr.png",
+                                 (s_dumpFrame / kScreenshotInterval) % kScreenshotRingSize);
+                        if (RB_WriteBackbufferPng(filename, locked, mode.Width, mode.Height))
+                            Com_Printf(CON_CHANNEL_GFX, "RB_SwapBuffers: dumped upscaled front buffer to %s (%ux%u)\n",
+                                       filename, mode.Width, mode.Height);
+                        front->UnlockRect();
+                    }
+                    front->Release();
+                }
+            }
+        }
     }
 
 #ifdef KISAK_RADIANT
@@ -2696,7 +3198,8 @@ GfxIndexBufferState *RB_SwapBuffers()
         Com_Error(ERR_FATAL, "Direct3DDevice9::Present failed: %s\n", R_ErrorDescription(hr));
     }
 
-    R_HW_InsertFence(&dx.swapFence);
+    // Retail issued dx.swapFence here and waited on it before the next
+    // present (RB_BackendTimeout); the wait is now the native frame ring's.
     result = gfxBuf.dynamicIndexBuffer;
     gfxBuf.dynamicIndexBuffer->used = 0;
     return result;
@@ -2761,6 +3264,9 @@ void __cdecl RB_Draw3D()
     if (backEndData->viewInfoCount)
     {
         PROF_SCOPED("ExecuteRenderCmds");
+        // one 3D world frame executed; the 2D menu/command path below
+        // (viewInfoCount == 0) is not a rendered walk frame.
+        RetailKillhouseFrameEvidenceNoteFrame();
         RB_Draw3DInternal(&data->viewInfo[data->viewInfoIndex]);
     }
 }
@@ -2774,9 +3280,20 @@ int RB_AdaptiveGpuSyncFinal()
     LODWORD(v0) = RB_IsGpuFenceFinished();
     if (v0)
     {
-        if (dx.gpuSyncDelay > 0x4E20)
+        // Retail (0x5fed80) decays the delay by a fixed 20,000 CPU TSC ticks
+        // plus 1/128 per frame.  The port's counter is not a CPU TSC (19.2 MHz
+        // on the Switch, where the literal would be ~1 ms instead of ~8 us),
+        // so the floor is converted to the same duration (retail_tsc.h).
+        static uint64_t decayTicks;
+        static double decayTicksFor;
+        if (decayTicksFor != msecPerRawTimerTick)
         {
-            v0 = 127 * ((dx.gpuSyncDelay - 20000) / 0x80);
+            decayTicks = RetailTsc_ToRawTicks(20000.0, msecPerRawTimerTick);
+            decayTicksFor = msecPerRawTimerTick;
+        }
+        if (dx.gpuSyncDelay > decayTicks)
+        {
+            v0 = 127 * ((dx.gpuSyncDelay - decayTicks) / 0x80);
             dx.gpuSyncDelay = v0;
         }
         else
@@ -2786,13 +3303,41 @@ int RB_AdaptiveGpuSyncFinal()
     }
     else
     {
+        // Diagnostic: how much of the frame is the adaptive fence busy-wait.
+        struct timespec wt0, wt1;
+        clock_gettime(CLOCK_MONOTONIC, &wt0);
         startTime = __rdtsc();
         while (!RB_IsGpuFenceFinished())
         {
-            if ((__rdtsc() - startTime) < 0)
+            // Retail spins on GetData until the GPU signals. deko9 sleeps
+            // on the sync frame's fence instead (up to 1 ms per call, so the
+            // retail timeout below still runs); GetData stays the verdict.
+            Deko9_WaitFrame(dx.device, dx.gpuSyncFrame, 1000000);
+            // Retail gives up after a 32-bit tick wrap; the uint64 form
+            // could never be negative, so the spin had no timeout.
+            if ((int32_t)((uint32_t)__rdtsc() - (uint32_t)startTime) < 0)
             {
                 RB_AbandonGpuFence();
                 break;
+            }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &wt1);
+        {
+            static uint64_t s_waits = 0, s_sumUs = 0, s_maxUs = 0, s_windowUs = 0;
+            // Signed ns first (tv_nsec wraps; see R_SwitchWaitForGpuIdle).
+            uint64_t us = (uint64_t)(((int64_t)(wt1.tv_sec - wt0.tv_sec) * 1000000000ll
+                                      + (int64_t)(wt1.tv_nsec - wt0.tv_nsec)) / 1000ll);
+            s_waits++;
+            s_sumUs += us;
+            s_windowUs += us;
+            if (us > s_maxUs) s_maxUs = us;
+            if (s_windowUs >= 1000000ull)
+            {
+                Com_Printf(0, "SWITCH_FENCEWAIT waits=%llu avg_us=%llu max_us=%llu\n",
+                           (unsigned long long)s_waits,
+                           (unsigned long long)(s_sumUs / (s_waits ? s_waits : 1)),
+                           (unsigned long long)s_maxUs);
+                s_waits = 0; s_sumUs = 0; s_maxUs = 0; s_windowUs = 0;
             }
         }
         LODWORD(v0) = __rdtsc() - startTime;
@@ -2845,9 +3390,12 @@ void __cdecl RB_CallExecuteRenderCommands()
         memcpy(&gfxCmdBufState, &gfxCmdBufState, sizeof(gfxCmdBufState));
         memset((uint8_t *)gfxCmdBufState.vertexShaderConstState, 0, sizeof(gfxCmdBufState.vertexShaderConstState));
         memset((uint8_t *)gfxCmdBufState.pixelShaderConstState, 0, sizeof(gfxCmdBufState.pixelShaderConstState));
+        gfxCmdBufState.renderTargetId = R_RENDERTARGET_NONE;
         R_SetRenderTargetSize(&gfxCmdBufSourceState, R_RENDERTARGET_FRAME_BUFFER);
         R_SetRenderTarget(gfxCmdBufContext, R_RENDERTARGET_FRAME_BUFFER);
         RB_InitSceneViewport();
+        RB_GPU_PASS(Hud2D);
+        g_rbInView2DCmdList = false; // shared/HUD list, not a view's own 2D list
         if (backEndData->cmds)
             RB_ExecuteRenderCommandsLoop(backEndData->cmds);
         if (r_drawPrimHistogram->current.enabled)
@@ -2876,25 +3424,33 @@ void __cdecl RB_CallExecuteRenderCommands()
                 tess.indexCount);
         iassert( dx.device );
         iassert( dx.inScene );
-        do
         {
-            if (r_logFile && r_logFile->current.integer)
-                RB_LogPrint("dx.device->EndScene()\n");
-            //hr = ((int(__thiscall *)(IDirect3DDevice9 *, IDirect3DDevice9 *))dx.device->EndScene)(dx.device, dx.device);
-            hr = dx.device->EndScene();
-            if (hr < 0)
+#ifdef __SWITCH__
+            SWITCH_PERF_SCOPE(SWITCH_PERF_EXEC_ENDSCENE);
+#endif
+            do
             {
-                do
+                if (r_logFile && r_logFile->current.integer)
+                    RB_LogPrint("dx.device->EndScene()\n");
+                //hr = ((int(__thiscall *)(IDirect3DDevice9 *, IDirect3DDevice9 *))dx.device->EndScene)(dx.device, dx.device);
+                hr = dx.device->EndScene();
+                if (hr < 0)
                 {
-                    ++g_disableRendering;
-                    v0 = R_ErrorDescription(hr);
-                    Com_Error(ERR_FATAL, ".\\rb_backend.cpp (%i) dx.device->EndScene() failed: %s\n", 3107, v0);
-                } while (alwaysfails);
-            }
-        } while (alwaysfails);
+                    do
+                    {
+                        ++g_disableRendering;
+                        v0 = R_ErrorDescription(hr);
+                        Com_Error(ERR_FATAL, ".\\rb_backend.cpp (%i) dx.device->EndScene() failed: %s\n", 3107, v0);
+                    } while (alwaysfails);
+                }
+            } while (alwaysfails);
+        }
         dx.inScene = 0;
         if (!r_glob.isRenderingRemoteUpdate)
         {
+#ifdef __SWITCH__
+            SWITCH_PERF_SCOPE(SWITCH_PERF_EXEC_FENCE);
+#endif
             if (dx.gpuSync)
             {
                 R_AcquireGpuFenceLock();
@@ -2929,6 +3485,11 @@ void __cdecl  RB_RenderThread(uint32_t threadContext)
     uint32_t start; // [esp+38h] [ebp-4h]
 
     iassert(threadContext == THREAD_CONTEXT_BACKEND);
+#ifdef __SWITCH__
+    // This thread's SWITCH_PERF scopes go to the `backend` line (never into
+    // the main thread's plain accumulators, which they would race).
+    SwitchPerf_MarkBackendThread();
+#endif
 
     while (r_glob.haveThreadOwnership)
         NET_Sleep(1);
@@ -3021,13 +3582,17 @@ int __cdecl RB_BackendTimeout()
     BOOL v1; // [esp+0h] [ebp-Ch]
     _BYTE v2[4]; // [esp+8h] [ebp-4h] BYREF
 
-    if (dx.swapFence)
-    {
-        //v1 = dx.swapFence->GetData(dx.swapFence, v2, 4u, 1u) == 1;
-        v1 = dx.swapFence->GetData(v2, 4, 1) == 1;
-    }
-    else
-        v1 = 0;
+    // deko9 native frame pacing (was: the swap event query issued after the
+    // last Present). Before presenting the frame just recorded (F), frame
+    // F - N must have passed; the back end helps with worker commands while
+    // it waits. Presenting F then queues it behind F - 1, so the GPU keeps up
+    // to N frames while the next one is recorded.
+    (void)v2;
+    if (!dx.device)
+        return 1;
+    const uint64_t frame = Deko9_FrameRecording(dx.device);
+    const uint64_t n = Deko9_FramesInFlight();
+    v1 = frame > n && !Deko9_FrameDone(dx.device, frame - n);
     return !v1;
 }
 
@@ -3045,6 +3610,9 @@ void __cdecl RB_RenderCommandFrame(const GfxBackEndData *data)
         allowRendering = 0;
     if (allowRendering)
     {
+#ifdef __SWITCH__
+        SWITCH_PERF_SCOPE(SWITCH_PERF_BACKEND_FRAME);
+#endif
         KISAK_NULLSUB();
         RB_BeginFrame(data);
         RB_Draw3D();
@@ -3055,11 +3623,17 @@ void __cdecl RB_RenderCommandFrame(const GfxBackEndData *data)
     }
     Sys_RenderCompleted();
     {
+#ifdef __SWITCH__
+        SWITCH_PERF_SCOPE(SWITCH_PERF_BACKEND_SWAPWAIT);
+#endif
         PROF_SCOPED("WaitRenderSwap");
         R_ProcessWorkerCmdsWithTimeout(RB_BackendTimeout, 1);
     }
     if (allowRendering)
     {
+#ifdef __SWITCH__
+        SWITCH_PERF_SCOPE(SWITCH_PERF_BACKEND_ENDFRAME);
+#endif
         KISAK_NULLSUB();
         RB_EndFrame(drawType);
     }
@@ -3199,4 +3773,3 @@ void __cdecl RB_RegisterBackendAssets()
 {
     backEnd.debugFont = R_RegisterFont("fonts/smalldevfont", IMAGE_TRACK_DEBUG);
 }
-

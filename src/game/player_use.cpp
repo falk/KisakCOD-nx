@@ -186,9 +186,11 @@ void __cdecl Player_UpdateActivate(gentity_s *ent)
     ent->client->useButtonDone = 1;
 }
 
-int __cdecl compare_use(float *pe1, float *pe2)
+int __cdecl compare_use(const void *pe1, const void *pe2)
 {
-    return (int)(float)(pe1[1] - pe2[1]);
+    const useList_t *use1 = static_cast<const useList_t *>(pe1);
+    const useList_t *use2 = static_cast<const useList_t *>(pe2);
+    return (int)(use1->score - use2->score);
 }
 
 int __cdecl Player_GetUseList(gentity_s *ent, useList_t *useList, int prevHintEntIndex)
@@ -217,7 +219,6 @@ int __cdecl Player_GetUseList(gentity_s *ent, useList_t *useList, int prevHintEn
     unsigned int v31; // r30
     int v32; // r27
     bool v33; // zf
-    float *p_score; // r31
     unsigned int v35; // r28
     const gentity_s *v36; // r3
     double v37; // fp0
@@ -421,14 +422,13 @@ int __cdecl Player_GetUseList(gentity_s *ent, useList_t *useList, int prevHintEn
             ++v13;
         }
     }
-    qsort(useList, v11, 8u, (int(__cdecl *)(const void *, const void *))compare_use);
+    qsort(useList, v11, sizeof(*useList), compare_use);
     v31 = v11 - v6;
     v33 = (int)(v11 - v6) <= 0;
     v32 = 0;
     if (!v33)
     {
         useList_t *use = useList;
-        p_score = &use->score;
         v35 = v31;
         do
         {
@@ -447,16 +447,14 @@ int __cdecl Player_GetUseList(gentity_s *ent, useList_t *useList, int prevHintEn
                 if (!G_TraceCapsuleComplete(viewOrigin, vec3_origin, vec3_origin, traceEnd, client->ps.clientNum, 17))
                 {
                     ++v32;
-                    *p_score = *p_score + (float)10000.0;
+                    use->score = use->score + (float)10000.0;
                 }
             }
             --v35;
             ++use;
-            if (v35)
-                p_score = &use->score;
         } while (v35);
     }
-    qsort(useList, v31, 8u, (int(__cdecl *)(const void *, const void *))compare_use);
+    qsort(useList, v31, sizeof(*useList), compare_use);
     return v31 - v32;
 }
 
@@ -1257,4 +1255,3 @@ void __cdecl Player_UpdateLookAtEntity(gentity_s *ent)
         }
     }
 }
-

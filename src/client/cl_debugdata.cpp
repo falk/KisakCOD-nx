@@ -14,6 +14,11 @@ void CL_RecordServerDebugData()
     cls.debug.fromServer = 0;
 }
 
+bool CL_ServerDebugDataRecordedLastFrame()
+{
+    return cls.debug.prevFromServer != 0;
+}
+
 void __cdecl CL_AddDebugString(
     const float *xyz,
     const float *color,

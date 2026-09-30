@@ -310,7 +310,7 @@ bool __cdecl FX_ParseAtlasEntryCount(const char **parse, FxEditorElemDef *edElem
 
 char __cdecl FX_ParseCurve(const char **parse, int dimCount, float minValue, float maxValue, const FxCurve **shape)
 {
-    long double v6; // st7
+    double v6; // st7
     float v7; // [esp+10h] [ebp-828h]
     float v8; // [esp+14h] [ebp-824h]
     float v9; // [esp+18h] [ebp-820h]
@@ -1090,6 +1090,13 @@ PhysPreset *__cdecl FX_RegisterPhysPreset(const char *name)
 
 const FxEffectDef *__cdecl FX_LoadFailed(const char *name)
 {
+#if UINTPTR_MAX > UINT32_MAX
+    // This fallback clones a packed 32-bit FX blob by raw offsets.  Until
+    // that blob has a native widening path, refusing it is safer than
+    // truncating pointers or silently corrupting the effect definition.
+    Com_Error(ERR_FATAL, "FX_LoadFailed is unsupported on LP64: %s", name);
+    return 0;
+#else
     char v2; // [esp+3h] [ebp-55h]
     _BYTE *v3; // [esp+8h] [ebp-50h]
     const char *v4; // [esp+Ch] [ebp-4Ch]
@@ -1140,6 +1147,7 @@ const FxEffectDef *__cdecl FX_LoadFailed(const char *name)
         *v6 += relocationDistance;
     }
     return (const FxEffectDef *)effectDef;
+#endif
 }
 
 const FxEffectDef *__cdecl FX_Load(const char *name)
@@ -1147,7 +1155,7 @@ const FxEffectDef *__cdecl FX_Load(const char *name)
     const FxEffectDef *v5; // [esp+10h] [ebp-10B54h]
     FxEditorEffectDef edEffectDef; // [esp+14h] [ebp-10B50h] BYREF
 
-    strcpy_s(edEffectDef.name, name);
+    I_strncpyz(edEffectDef.name, name, sizeof(edEffectDef.name));
     if (FX_LoadEditorEffect(name, &edEffectDef)
         && (v5 = FX_Convert(&edEffectDef, &FX_AllocMem)) != 0)
     {

@@ -587,7 +587,7 @@ enum MissileFlightMode : __int32
     MISSILEFLIGHTMODE_DIRECT = 0x1,
 };
 
-enum team_t;
+enum team_t : int;
 #ifdef KISAK_MP
 struct corpse_ent_t // sizeof=0x4
 {                                       // ...
@@ -787,7 +787,9 @@ struct missile_ent_t // sizeof=0x54
     MissileStage stage;
     MissileFlightMode flightMode;
 };
+#if UINTPTR_MAX == UINT32_MAX // serialized-size asserts hold on the 32-bit reference ABI only
 static_assert(sizeof(missile_ent_t) == 0x54);
+#endif
 
 struct gentity_s_tag
 {
@@ -1042,11 +1044,10 @@ void __cdecl CG_TraceCapsule(
     int passEntityNum,
     int contentMask);
 
-#ifdef KISAK_MP
-static const pmoveHandler_t pmoveHandlers[2] = { { CG_TraceCapsule, NULL}, {G_TraceCapsule, G_PlayerEvent} }; // idb
-#elif KISAK_SP
-static const pmoveHandler_t pmoveHandlers[2] = { { CG_TraceCapsule }, { G_TraceCapsule } };
-#endif
+// Defined once in bg_pmove.cpp: a header-level static table was emitted by
+// every includer (-fkeep-static-consts at -O0), dragging CG_/G_TraceCapsule
+// into TUs that never link the game.
+extern const pmoveHandler_t pmoveHandlers[2];
 
 // bg_jump
 extern const dvar_t *jump_height;

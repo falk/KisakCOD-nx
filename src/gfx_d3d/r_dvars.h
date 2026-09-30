@@ -58,6 +58,8 @@ extern const dvar_t *sc_debugReceiverCount;
 extern const dvar_t *r_cacheSModelLighting;
 extern const dvar_t *r_drawEntities;
 extern const dvar_t *r_distortion;
+extern const dvar_t *r_distortionResolveOnDemand;
+extern bool rb_resolvedPostSunValid; // rb_draw3d.cpp
 extern const dvar_t *r_filmUseTweaks;
 extern const dvar_t *r_drawBModels;
 extern const dvar_t *r_drawXModels;
@@ -124,6 +126,13 @@ extern const dvar_t *r_streamFakeLagMsec;
 extern const dvar_t *r_lockPvs;
 extern const dvar_t *r_detail;
 extern const dvar_t *r_lightMap;
+// TEMP diagnostic (wallissue.md): force depth test ALWAYS for the first-BSP-frame
+// diagnostic, to separate "fragments rejected by depth" from "no fragments at all".
+// TEMP diagnostic (wallissue.md): per-surface colour attribution for BSP draws.
+// All r_killhouse* diagnostics are DVAR_NOFLAG: they are set per run from the
+// +exec diagnostic config and must never persist into config.cfg.
+// TEMP diagnostic (wallissue.md): force cull none on every pass. Opt-in, so a
+// culling experiment (and its control run) actually measures culling.
 extern const dvar_t *sm_fastSunShadow;
 extern const dvar_t *r_envMapSpecular;
 extern const dvar_t *sc_wantCount;
@@ -202,6 +211,55 @@ extern const dvar_t *r_envMapSunIntensity;
 extern const dvar_t *r_highLodDist;
 extern const dvar_t *r_forceLod;
 extern const dvar_t *r_logFile;
+extern const dvar_t *r_captureRing;
+extern const dvar_t *r_deko9Verify;
+extern const dvar_t *r_deko9EarlyZ;
+extern const dvar_t *r_deko9HazardCache;
+extern const dvar_t *r_deko9ConstFast;
+extern const dvar_t *r_deko9TexIncremental;
+extern const dvar_t *r_deko9StaticHazard;
+extern const dvar_t *r_deko9Instancing;
+extern const dvar_t *r_deko9StaticPretess;
+extern const dvar_t *r_deko9StaticPretessModels;
+extern const dvar_t *r_renderResolution;
+extern const dvar_t *r_fsrSharpness;
+extern const dvar_t *r_fsrMode;
+extern const dvar_t *r_dynres;
+extern const dvar_t *r_dynresBudgetMs;
+extern const dvar_t *r_dynresMin;
+extern const dvar_t *r_dynresMax;
+extern const dvar_t *r_dynresForceScale;
+extern const dvar_t *r_dynresFakeGpuMs;
+extern const dvar_t *r_dynresFakeWave;
+extern const dvar_t *r_deko9GpuPasses;
+extern const dvar_t *r_deko9RtCompression;
+extern const dvar_t *r_deko9LightBarriers;
+extern const dvar_t *r_deko9NativeFloatZ;
+extern const dvar_t *r_halfResParticles;
+extern const dvar_t *r_halfResParticlesUpsample;
+extern const dvar_t *r_halfResParticlesDepthTol;
+extern const dvar_t *r_halfResParticlesStats;
+extern const dvar_t *r_halfResParticlesOrder;
+extern const dvar_t *r_halfResParticlesDebug;
+extern const dvar_t *r_halfResParticlesHw;
+extern const dvar_t *r_deko9ZcullStats;
+extern const dvar_t *r_shadowFilter;
+extern const dvar_t *r_deko9Census;
+extern const dvar_t *r_deko9FaultTrace;
+extern const dvar_t *r_deko9GpuMap;
+extern const dvar_t *r_deko9DrawCensus;
+extern const dvar_t *r_deko9DrawCensusPasses;
+extern const dvar_t *r_deko9DrawCensusFrames;
+extern const dvar_t *r_deko9DrawCensusGroups;
+extern const dvar_t *r_deko9SkipEmissive;
+extern const dvar_t *r_deko9EmissiveTour;
+extern const dvar_t *r_deko9EmissiveTourSpots;
+extern const dvar_t *r_deko9EmissiveTourGroups;
+extern const dvar_t *r_deko9EmissiveTourTimes;
+extern const dvar_t *r_deko9EmissiveTourShots;
+extern const dvar_t *r_deko9EmissiveTourPaused;
+extern const dvar_t *r_view2dAlphaDiag;
+extern const dvar_t *r_view2dAlphaSkip;
 extern const dvar_t *r_normalMap;
 extern const dvar_t *r_outdoorDownBias;
 extern const dvar_t *r_texFilterDisable;
@@ -212,6 +270,8 @@ extern const dvar_t *r_showVertCounts;
 extern const dvar_t *r_portalBevelsOnly;
 extern const dvar_t *r_showCullSModels;
 extern const dvar_t *r_skipDrawTris;
+extern const dvar_t *r_portDebugChecks;
+extern const dvar_t *r_outdoorDebug;
 extern const dvar_t *sc_debugCasterCount;
 extern const dvar_t *r_dof_farEnd;
 extern const dvar_t *r_znear;
@@ -238,6 +298,9 @@ extern const dvar_t *r_multiGpu;
 extern const dvar_t *r_skinCache;
 extern const dvar_t *r_fastSkin;
 extern const dvar_t *r_smc_enable;
+#ifdef __SWITCH__
+extern const dvar_t *r_smc_admitUnlinked;
+#endif
 extern const dvar_t *r_pretess;
 extern const dvar_t *r_picmip_manual;
 extern const dvar_t *r_picmip;

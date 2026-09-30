@@ -228,7 +228,9 @@ void __cdecl MemFile_deflateInit(uint8_t* next_out, uint32_t avail_out, bool com
         memset((uint8_t*)&stream, 0, sizeof(stream));
         stream.next_out = next_out;
         stream.avail_out = avail_out;
-        if (deflateInit_(&stream, 1, "1.1.4", 52))
+        // sizeof(z_stream) is 112 on LP64 (the retail ILP32 literal 52 made
+        // this fail every time); the vendored zlib is 1.3.1 now.
+        if (deflateInit_(&stream, 1, ZLIB_VERSION, sizeof(z_stream)))
             MyAssertHandler(".\\universal\\memfile.cpp", 224, 0, "%s", "err == Z_OK");
     }
     SetStreamMode(MEM_FILE_MODE_DEFLATE);
@@ -359,7 +361,7 @@ void __cdecl MemFile_inflateInit(uint8_t* next_in, uint32_t len, bool compress)
         memset((uint8_t*)&stream, 0, sizeof(stream));
         stream.next_in = next_in;
         stream.avail_in = len;
-        if (inflateInit_(&stream, "1.1.4", 52))
+        if (inflateInit_(&stream, ZLIB_VERSION, sizeof(z_stream)))
             MyAssertHandler(".\\universal\\memfile.cpp", 387, 0, "%s", "err == Z_OK");
     }
     SetStreamMode(MEM_FILE_MODE_INFLATE);
@@ -965,7 +967,7 @@ uint8_t *MemFile_CopySegments(MemoryFile *memFile, int index, void *buf)
     iassert(!memFile->memoryOverflow);
 
     SegmentAddess = MemFile_GetSegmentAddess(memFile, index);
-    v7 = &memFile->buffer[memFile->bufferSize - (_DWORD)SegmentAddess];
+    v7 = &memFile->buffer[memFile->bufferSize - static_cast<intptr_t>(reinterpret_cast<uintptr_t>(SegmentAddess))];
     if (buf)
         memcpy(buf, SegmentAddess, (size_t)v7);
     return v7;

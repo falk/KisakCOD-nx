@@ -69,12 +69,15 @@ if (KISAK_OPENAL)
     )
 endif()
 
+# The Switch build sets up its own flags, includes and libraries (cmake/switch.cmake).
+if (NOT KISAK_PLATFORM STREQUAL "switch")
 # We need all of the pre/post-build commands
 include(${SCRIPTS_DIR}/pre_build.cmake)
 include(${SCRIPTS_DIR}/post_build.cmake)
 
 # Tracey
 include(${SCRIPTS_DIR}/extern/tracy.cmake)
+endif()
 
 # OpenAL (sound backend, only needed when KISAK_OPENAL is enabled)
 if (KISAK_OPENAL)

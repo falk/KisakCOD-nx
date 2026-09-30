@@ -1,0 +1,7 @@
+build/
+build-lto/
+*.elf
+*.map
+*.nro
+*.nacp
+romfs/

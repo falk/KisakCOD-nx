@@ -15,8 +15,11 @@
 #endif
 
 #include <physics/phys_local.h>
+#include <universal/critical_section.h>
 
+#ifndef __SWITCH__
 #include <win32/win_local.h>
+#endif
 #include <aim_assist/aim_assist.h>
 
 #include <universal/profile.h>
@@ -837,7 +840,6 @@ void __cdecl FX_UpdateEffectPartialForClass(
     uint16_t elemHandleFirstExisting; // [esp+30h] [ebp-4h]
 
     int32_t unk1;
-    int32_t unk2;
 
     if (effect->msecLastUpdate > msecUpdateEnd)
         MyAssertHandler(
@@ -876,13 +878,13 @@ void __cdecl FX_UpdateEffectPartialForClass(
                 {
                     if (!system)
                         MyAssertHandler("c:\\trees\\cod3\\src\\effectscore\\fx_system.h", 334, 0, "%s", "system");
-                    // KISAKTODO this is extremely dubious at best
                     elem = FX_PoolFromHandle_Generic<FxElem, 2048>(system->elems, elemHandle);
                     unk1 = (elem->item.msecBegin + effect->randomSeed + 296 * (uint32_t)elem->item.sequence)
                         % 0x1DF;
-                    unk2 = (int)&effect->def->elemDefs[elem->item.defIndex].lifeSpanMsec;
-                    lifeSpan = *(_DWORD*)unk2
-                        + (((*(_DWORD*)(unk2 + 4) + 1) * LOWORD(fx_randomTable[unk1 + 17])) >> 16);
+                    const FxIntRange &lifeSpanRange =
+                        effect->def->elemDefs[elem->item.defIndex].lifeSpanMsec;
+                    lifeSpan = lifeSpanRange.base
+                        + (((lifeSpanRange.amplitude + 1) * LOWORD(fx_randomTable[unk1 + 17])) >> 16);
                     Com_Printf(
                         CON_CHANNEL_DONT_FILTER,
                         "  elem %i def %i seq %i spawn %i die %i\n",
@@ -923,7 +925,7 @@ FxUpdateResult __cdecl FX_UpdateElement(
 {
     float msec; // [esp+0h] [ebp-140h]
     bool v7; // [esp+10h] [ebp-130h]
-    int32_t physObjId; // [esp+8Ch] [ebp-B4h]
+    uintptr_t physObjId; // [esp+8Ch] [ebp-B4h]
     FxUpdateElem update; // [esp+A8h] [ebp-98h] BYREF
     const FxElemDef *elemDef; // [esp+128h] [ebp-18h]
     FxUpdateResult updateResult; // [esp+12Ch] [ebp-14h] BYREF
@@ -1172,7 +1174,7 @@ void __cdecl FX_IntegrateVelocity(const FxUpdateElem *update, float t0, float t1
             "%s\n\t(elemDef->velIntervalCount) = %i",
             "(elemDef->velIntervalCount >= 1)",
             elemDef->velIntervalCount);
-    if (t0 < 0.0 || t1 <= (double)t0 || t1 > 1.0)
+    if (t0 < 0.0 || t1 <= t0 || t1 > 1.0)
     {
         v5 = va("%g, %g", t0, t1);
         MyAssertHandler(".\\EffectsCore\\fx_update.cpp", 765, 0, "%s\n\t%s", "0.0f <= t0 && t0 < t1 && t1 <= 1.0f", v5);
@@ -1803,10 +1805,10 @@ uint8_t __cdecl FX_ProcessEmitting(
     while (1)
     {
         distLastEmit = distNextEmit;
-        distNextEmit = (double)rand() * 0.000030517578125 * elemDef->emitDistVariance.amplitude
+        distNextEmit = (double)rand() / (RAND_MAX + 1.0) * elemDef->emitDistVariance.amplitude
             + baseDistPerEmit
             + distNextEmit;
-        if (distInUpdate < (double)distNextEmit)
+        if (distInUpdate < distNextEmit)
             break;
         v9 = distNextEmit - 0.0;
         if (v9 < 0.0)
@@ -2114,12 +2116,9 @@ void __cdecl FX_UpdateSpotLight(FxCmd* cmd)
         {
             if (system->activeSpotLightEffectCount != 1)
                 MyAssertHandler(".\\EffectsCore\\fx_update.cpp", 1836, 0, "%s", "system->activeSpotLightEffectCount == 1");
-            for (effect = FX_EffectFromHandle(system, system->activeSpotLightEffectHandle);
-                InterlockedExchangeAdd(&effect->status, 0x20000000) >= 0x20000000;
-                InterlockedExchangeAdd(&effect->status, -536870912))
-            {
-                ;
-            }
+            effect = FX_EffectFromHandle(system, system->activeSpotLightEffectHandle);
+            while (InterlockedExchangeAdd(&effect->status, 0x20000000) >= 0x20000000)
+                InterlockedExchangeAdd(&effect->status, -536870912);
             FX_UpdateSpotLightEffect(system, effect);
             InterlockedExchangeAdd(&effect->status, -536870912);
         }
@@ -2249,17 +2248,31 @@ void __cdecl FX_Update(FxSystem* system, int32_t localClientNum, bool nonBoltedE
     iassert(system);
 
     FX_BeginIteratingOverEffects_Cooperative(system);
+    
     for (activeIndex = system->firstActiveEffect; activeIndex != system->firstNewEffect; ++activeIndex)
     {
         localEffect = FX_EffectFromHandle(system, system->allEffectHandles[activeIndex & 0x3FF]);
         if (FX_ShouldProcessEffect(system, localEffect, nonBoltedEffectsOnly))
         {
-            while (InterlockedExchangeAdd(&localEffect->status, 0x20000000) >= 0x20000000)
-                InterlockedExchangeAdd(&localEffect->status, -536870912);
+            
+            {
+                unsigned long spinIter = 0;
+                for (;;)
+                {
+                    long oldStatus = InterlockedExchangeAdd(&localEffect->status, 0x20000000);
+                    if (oldStatus < 0x20000000L)
+                        break;
+                    InterlockedExchangeAdd(&localEffect->status, -536870912);
+                    ++spinIter;
+                }
+            }
+            
             FX_UpdateEffect(system, localEffect);
             InterlockedExchangeAdd(&localEffect->status, -536870912);
+            
         }
     }
+    
     if (!InterlockedDecrement(&system->iteratorCount) && system->needsGarbageCollection)
         FX_RunGarbageCollection(system);
 }
@@ -2344,6 +2357,7 @@ void __cdecl FX_EndUpdate(int32_t localClientNum)
     iassert(system);
     memcpy(&system->cameraPrev, system, sizeof(system->cameraPrev));
     iassert(system->cameraPrev.isValid);
+    FX_Census(system);
 }
 
 void __cdecl FX_AddNonSpriteDrawSurfs(FxCmd *cmd)
@@ -2538,4 +2552,3 @@ void __cdecl FX_FillUpdateCmd(int32_t localClientNum, FxCmd *cmd)
     cmd->system = FX_GetSystem(localClientNum);
     cmd->localClientNum = localClientNum;
 }
-

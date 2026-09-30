@@ -7,6 +7,11 @@ struct GfxMeshGlobals // sizeof=0x180
     GfxQuadMeshData fullSceneViewMesh[4]; // ...
     GfxMeshData spotShadowClearMeshData[4]; // ...
     GfxMeshData sunShadowClearMeshData[2]; // ...
+    // Second bank of fullSceneViewMesh for the odd SMP frame: the scene
+    // viewport changes size with r_dynres, and the front end must not
+    // rewrite a quad the back end is still drawing (which cost an
+    // R_SyncRenderThread per change). R_SetFullSceneViewMesh picks the bank.
+    GfxQuadMeshData fullSceneViewMeshOdd[4];
 };
 
 char __cdecl R_ReserveMeshIndices(GfxMeshData *mesh, int indexCount, r_double_index_t **indicesOut);

@@ -108,3 +108,18 @@ void __cdecl R_WritePrimDrawSurfData(GfxDelayedCmdBuf *delayedCmdBuf, uint8_t *d
     delayedCmdBuf->primDrawSurfPos += count;
 }
 
+// LP64 fix (PRIM_DRAW_SURF_PTR_WORDS,
+// r_gfx.h): the static-model draw path's one and
+// only raw-pointer slot in the otherwise uint32_t-word prim-draw-surf
+// stream. Writes byte-for-byte via memcpy into PRIM_DRAW_SURF_PTR_WORDS
+// consecutive words so the value round-trips exactly regardless of pointer
+// width, instead of the previous `(uint32_t)(intptr_t)xsurf` truncation.
+void __cdecl R_WritePrimDrawSurfPtr(GfxDelayedCmdBuf *delayedCmdBuf, const void *value)
+{
+    static_assert(sizeof(void *) <= PRIM_DRAW_SURF_PTR_WORDS * sizeof(uint32_t));
+    uint32_t words[PRIM_DRAW_SURF_PTR_WORDS] = {};
+    memcpy(words, &value, sizeof(void *));
+    for (uint32_t i = 0; i < PRIM_DRAW_SURF_PTR_WORDS; ++i)
+        R_WritePrimDrawSurfInt(delayedCmdBuf, words[i]);
+}
+

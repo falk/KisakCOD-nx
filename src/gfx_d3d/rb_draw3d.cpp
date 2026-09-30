@@ -1,4 +1,6 @@
 #include <universal/q_shared.h>
+#include "r_dynres.h"
+#include <deko9/deko9_native.h>
 #include "rb_draw3d.h"
 #include "rb_logfile.h"
 #include "r_dvars.h"
@@ -18,6 +20,10 @@
 #include "r_draw_lit.h"
 #include <universal/profile.h>
 #include "rb_postfx.h"
+#include "rb_gpupass.h"
+#include "rb_ab_tour.h"
+#include "rb_halfres_particles.h"
+#include "rb_floatz_native.h"
 #include "rb_spotshadow.h"
 #include "rb_shade.h"
 #include "r_meshdata.h"
@@ -128,7 +134,9 @@ void __cdecl RB_FullbrightDrawCommands(const GfxViewInfo *viewInfo)
 
 void __cdecl RB_EndSceneRendering(GfxCmdBufContext context, const GfxCmdBufInput *input, const GfxViewInfo *viewInfo)
 {
-    R_HW_InsertFence((IDirect3DQuery9 **)&backEndData->endFence);
+    // deko9 native frame pacing: the end-of-scene fence is this frame's id
+    // (done when the frame's fence passed), not a D3D9 event query.
+    backEndData->endFrame = Deko9_FrameRecording(dx.device);
     R_InitCmdBufSourceState(context.source, input, 0);
     memcpy(context.state, &gfxCmdBufState, sizeof(GfxCmdBufState));
     memset((uint8_t *)context.state->vertexShaderConstState, 0, sizeof(context.state->vertexShaderConstState));
@@ -341,6 +349,11 @@ void __cdecl R_DrawDebugShaderDecalCallback(const void *data, GfxCmdBufContext c
     R_DrawSurfs(context, 0, &((const GfxViewInfo*)data)->decalInfo);
 }
 
+// False only while an emissive pass runs whose post-sun resolve
+// r_distortionResolveOnDemand skipped (R_SetMaterial reports a technique
+// that samples it anyway).
+bool rb_resolvedPostSunValid = true;
+
 void __cdecl RB_StandardDrawCommands(const GfxViewInfo *viewInfo)
 {
     GfxRenderTargetId setupRenderTargetId; // [esp+44h] [ebp-2Ch]
@@ -358,6 +371,7 @@ void __cdecl RB_StandardDrawCommands(const GfxViewInfo *viewInfo)
     isRenderingFullScreen = viewInfo->isRenderingFullScreen;
     if (dynamicShadowType == SHADOW_MAP)
     {
+        RB_GPU_PASS(ShadowMap);
         if (Com_BitCheckAssert(backEndData->shadowableLightHasShadowMap, rgp.world->sunPrimaryLightIndex, 32))
             RB_SunShadowMaps(data, viewInfo);
         RB_SpotShadowMaps(data, viewInfo);
@@ -366,8 +380,16 @@ void __cdecl RB_StandardDrawCommands(const GfxViewInfo *viewInfo)
     whichToClearForScene = 7;
     R_InitContext(data, &cmdBuf);
     iassert( !viewInfo->needsFloatZ || R_HaveFloatZ() );
-    if (viewInfo->needsFloatZ || dynamicShadowType == SHADOW_COOKIE)
+    // r_deko9NativeFloatZ 1 (deko3d renderer): no float-Z geometry pass, the
+    // target is rebuilt from the scene depth buffer before the emissive pass
+    // (rb_floatz_native.h). The scene pass then clears depth itself.
+    const int nativeFloatZ = RB_NativeFloatZMode(viewInfo);
+    const bool legacyFloatZ = viewInfo->needsFloatZ && nativeFloatZ != 1;
+    R_DepthPrepassFloatZFromDepth(nativeFloatZ == 1);
+    if (legacyFloatZ || dynamicShadowType == SHADOW_COOKIE)
     {
+        if (legacyFloatZ)
+            RB_LegacyFloatZBegin();
         if (viewInfo->needsFloatZ)
         {
             setupRenderTargetId = R_RENDERTARGET_FLOAT_Z;
@@ -378,6 +400,7 @@ void __cdecl RB_StandardDrawCommands(const GfxViewInfo *viewInfo)
             setupRenderTargetId = R_RENDERTARGET_DYNAMICSHADOWS;
             whichToClearForSetup = 7;
         }
+        RB_GPU_PASS(FloatZ);
         memcpy(&gfxCmdBufState, &gfxCmdBufState, sizeof(gfxCmdBufState));
         memset(gfxCmdBufState.vertexShaderConstState, 0, sizeof(gfxCmdBufState.vertexShaderConstState));
         memset(gfxCmdBufState.pixelShaderConstState, 0, sizeof(gfxCmdBufState.pixelShaderConstState));
@@ -387,6 +410,8 @@ void __cdecl RB_StandardDrawCommands(const GfxViewInfo *viewInfo)
         memcpy(&gfxCmdBufState, &gfxCmdBufState, sizeof(gfxCmdBufState));
         R_InitContext(data, &cmdBuf);
         R_DepthPrepass(setupRenderTargetId, viewInfo, &cmdBuf);
+        if (legacyFloatZ)
+            RB_LegacyFloatZEnd();
         if (dynamicShadowType == SHADOW_COOKIE)
             RB_DrawShadowCookies(viewInfo);
         if (dx.multiSampleType == D3DMULTISAMPLE_NONE)
@@ -398,6 +423,7 @@ void __cdecl RB_StandardDrawCommands(const GfxViewInfo *viewInfo)
     memcpy(&gfxCmdBufState, &gfxCmdBufState, sizeof(gfxCmdBufState));
     memset(gfxCmdBufState.vertexShaderConstState, 0, sizeof(gfxCmdBufState.vertexShaderConstState));
     memset(gfxCmdBufState.pixelShaderConstState, 0, sizeof(gfxCmdBufState.pixelShaderConstState));
+    RB_GPU_PASS(SceneClear);
     R_SetRenderTargetSize(&gfxCmdBufSourceState, R_RENDERTARGET_SCENE);
     R_SetRenderTarget(gfxCmdBufContext, R_RENDERTARGET_SCENE);
     if (R_GetClearColor(clearColor) || (whichToClearForScene & 0xFE) != 0)
@@ -405,11 +431,14 @@ void __cdecl RB_StandardDrawCommands(const GfxViewInfo *viewInfo)
     memcpy(&gfxCmdBufState, &gfxCmdBufState, sizeof(gfxCmdBufState));
     if (needsDepthPrepass)
     {
+        RB_GPU_PASS(DepthPrepass);
         R_InitContext(data, &cmdBuf);
         R_DepthPrepass(R_RENDERTARGET_SCENE, viewInfo, &cmdBuf);
     }
+    RB_GPU_PASS(Lit);
     R_InitContext(data, &cmdBuf);
     R_DrawLit(viewInfo, &cmdBuf, 0);
+    RB_GPU_PASS(Decal);
     R_InitContext(data, &cmdBuf);
     R_DrawDecal(viewInfo, &cmdBuf, 0);
     KISAK_NULLSUB();
@@ -423,21 +452,43 @@ void __cdecl RB_StandardDrawCommands(const GfxViewInfo *viewInfo)
     R_SetRenderTarget(gfxCmdBufContext, R_RENDERTARGET_SCENE);
     R_BeginView(&gfxCmdBufSourceState, &viewInfo->sceneDef, &viewInfo->viewParms);
     R_SetViewportStruct(&gfxCmdBufSourceState, &viewInfo->sceneViewport);
+    RB_GPU_PASS(Sun);
     RB_DrawSun(viewInfo->localClientNum);
     memcpy(&gfxCmdBufState, &gfxCmdBufState, sizeof(gfxCmdBufState));
     R_InitContext(data, &cmdBuf);
     KISAK_NULLSUB();
+    RB_GPU_PASS(PointLights);
     R_DrawLights(viewInfo, &cmdBuf);
-    if (rg.distortion)
+    {
+        // r_distortionResolveOnDemand: log the first transitions so a run
+        // shows the skip is live (and that distortion views still resolve).
+        static int s_lastNeed = -1, s_logged;
+        const int need = rg.distortion && viewInfo->needsResolvedPostSun;
+        if (need != s_lastNeed && s_logged < 16)
+        {
+            ++s_logged;
+            Com_Printf(CON_CHANNEL_SYSTEM, "R_RESOLVE_POST_SUN need=%d distortion=%d ondemand=%d\n", need,
+                       (int)rg.distortion, r_distortionResolveOnDemand->current.enabled ? 1 : 0);
+        }
+        s_lastNeed = need;
+    }
+    if (rg.distortion && viewInfo->needsResolvedPostSun)
     {
         PROF_SCOPED("RB_ApplyPostEffects");
+        RB_GPU_PASS(Resolve);
         R_SetRenderTargetSize(&gfxCmdBufSourceState, R_RENDERTARGET_SCENE);
         R_SetRenderTarget(gfxCmdBufContext, R_RENDERTARGET_SCENE);
         R_Resolve(gfxCmdBufContext, gfxRenderTargets[R_RENDERTARGET_RESOLVED_POST_SUN].image);
     }
-    R_InitContext(data, &cmdBuf);
-    KISAK_NULLSUB();
-    R_DrawEmissive(viewInfo, &cmdBuf);
+    RB_NativeFloatZBeforeEmissive(viewInfo, nativeFloatZ);
+    {
+        RB_GPU_PASS(Emissive);
+        R_InitContext(data, &cmdBuf);
+        KISAK_NULLSUB();
+        rb_resolvedPostSunValid = !rg.distortion || viewInfo->needsResolvedPostSun;
+        R_DrawEmissive(viewInfo, &cmdBuf);
+        rb_resolvedPostSunValid = true;
+    }
     RB_EndSceneRendering(gfxCmdBufContext, &viewInfo->input, viewInfo);
 }
 
@@ -513,6 +564,8 @@ void __cdecl R_DrawPointLitSurfs(GfxCmdBufSourceState *source, const GfxViewInfo
         args.triCount = 2;
         viewParms = &viewInfo->viewParms;
         info.viewInfo = viewInfo;
+        if (g_drawCensusOn)
+            RB_DrawCensusLight(0, (uint32_t)pointLightCount);
         for (partitionIndex = 0; partitionIndex < pointLightCount; ++partitionIndex)
         {
             pointLightPartition = &pointLightPartitions[partitionIndex];
@@ -595,6 +648,8 @@ void __cdecl R_DrawPointLitSurfs(GfxCmdBufSourceState *source, const GfxViewInfo
             info.x += viewInfo->sceneViewport.x;
             info.y += viewInfo->sceneViewport.y;
             R_SetQuadMeshData(info.clearQuadMesh, x, y, width, height, 0.0, 0.0, 1.0, 1.0, 0xFFFFFFFF);
+            if (g_drawCensusOn)
+                RB_DrawCensusLight((uint32_t)partitionIndex + 1, 0);
             R_DrawCall(
                 R_DrawPointLitSurfsCallback,
                 &info,
@@ -605,6 +660,8 @@ void __cdecl R_DrawPointLitSurfs(GfxCmdBufSourceState *source, const GfxViewInfo
                 cmdBuf,
                 0);
         }
+        if (g_drawCensusOn)
+            RB_DrawCensusLight(0, 0);
     }
 }
 
@@ -678,7 +735,9 @@ void R_DrawEmissive(const GfxViewInfo *viewInfo, GfxCmdBuf *cmdBuf)
     R_InitCmdBufSourceState(&v4, &viewInfo->input, 1);
     R_SetRenderTargetSize(&v4, R_RENDERTARGET_SCENE);
     R_SetViewportStruct(&v4, &viewInfo->sceneViewport);
+    RB_HrpBeginView(viewInfo);
     R_DrawCall(R_DrawEmissiveCallback, viewInfo, &v4, viewInfo, &viewInfo->emissiveInfo, &viewInfo->viewParms, cmdBuf, 0);
+    RB_HrpEndView();
 }
 
 void __cdecl RB_Draw3DCommon()
@@ -733,6 +792,8 @@ GfxCmdBufSourceState *RB_DebugShaderDrawCommandsCommon()
         memset(gfxCmdBufContext.state->vertexShaderConstState, 0, sizeof(gfxCmdBufContext.state->vertexShaderConstState));
         memset(gfxCmdBufContext.state->pixelShaderConstState, 0, sizeof(gfxCmdBufContext.state->pixelShaderConstState));
         R_SetResolvedScene(gfxCmdBufContext);
+        // r_dynres: scene -> back buffer before the view's 2D.
+        RB_DynResResolveView(viewInfo, viewInfoIndex == 0);
         R_BeginView(gfxCmdBufContext.source, &viewInfo->sceneDef, &viewInfo->viewParms);
         R_SetViewportStruct(gfxCmdBufContext.source, &viewInfo->displayViewport);
         if (viewInfo->cmds)
@@ -764,7 +825,12 @@ void RB_StandardDrawCommandsCommon()
             memset(gfxCmdBufState.pixelShaderConstState, 0, sizeof(gfxCmdBufState.pixelShaderConstState));
             R_SetResolvedScene(gfxCmdBufContext);
             R_BeginView(&gfxCmdBufSourceState, &viewInfo->sceneDef, &viewInfo->viewParms);
-            R_SetViewportStruct(&gfxCmdBufSourceState, &viewInfo->displayViewport);
+            // Post effects and sunpost draw into the scene target: with
+            // r_dynres its viewport is the scene one (smaller than the
+            // display); without it the two are the same rectangle.
+            R_SetViewportStruct(&gfxCmdBufSourceState,
+                                R_DynResEnabled() ? &viewInfo->sceneViewport : &viewInfo->displayViewport);
+            RB_GPU_PASS(PostFx);
             if (viewInfo->isRenderingFullScreen)
             {
                 RB_ApplyLatePostEffects(viewInfo);
@@ -775,9 +841,13 @@ void RB_StandardDrawCommandsCommon()
                 if (RB_UsingColorManipulation(viewInfo))
                     RB_ApplyColorManipulationSplitscreen(viewInfo);
             }
-            R_SetRenderTargetSize(&gfxCmdBufSourceState, R_RENDERTARGET_FRAME_BUFFER);
-            R_SetRenderTarget(gfxCmdBufContext, R_RENDERTARGET_FRAME_BUFFER);
+            R_SetRenderTargetSize(&gfxCmdBufSourceState, R_RENDERTARGET_POST);
+            R_SetRenderTarget(gfxCmdBufContext, R_RENDERTARGET_POST);
+            RB_GPU_PASS(SunPost);
             RB_DrawSunPostEffects(viewInfo->localClientNum);
+            // r_dynres: the finished scene -> the back buffer (upscaled), so
+            // the view's 2D and the HUD draw at the output size.
+            RB_DynResResolveView(viewInfo, viewInfoIndex == 0);
             memcpy(&gfxCmdBufState, &gfxCmdBufState, sizeof(gfxCmdBufState));
             R_InitCmdBufSourceState(&gfxCmdBufSourceState, &gfxCmdBufInput, 0);
             gfxCmdBufSourceState.input.data = backEndData;
@@ -788,8 +858,11 @@ void RB_StandardDrawCommandsCommon()
             R_SetRenderTarget(gfxCmdBufContext, R_RENDERTARGET_FRAME_BUFFER);
             R_BeginView(&gfxCmdBufSourceState, &viewInfo->sceneDef, &viewInfo->viewParms);
             R_SetViewportStruct(&gfxCmdBufSourceState, &viewInfo->displayViewport);
+            RB_GPU_PASS(View2D);
+            g_rbInView2DCmdList = true;
             if (viewInfo->cmds)
                 RB_ExecuteRenderCommandsLoop(viewInfo->cmds);
+            g_rbInView2DCmdList = false;
             memcpy(&gfxCmdBufState, &gfxCmdBufState, sizeof(gfxCmdBufState));
         }
         viewInfoa = backEndData->viewInfo;
@@ -822,8 +895,8 @@ void __cdecl RB_ApplyLatePostEffects(const GfxViewInfo *viewInfo)
     PROF_SCOPED("RB_ApplyLatePostEffects");
 
     RB_ProcessPostEffects(viewInfo);
-    R_SetRenderTargetSize(&gfxCmdBufSourceState, R_RENDERTARGET_FRAME_BUFFER);
-    R_SetRenderTarget(gfxCmdBufContext, R_RENDERTARGET_FRAME_BUFFER);
+    R_SetRenderTargetSize(&gfxCmdBufSourceState, R_RENDERTARGET_POST);
+    R_SetRenderTarget(gfxCmdBufContext, R_RENDERTARGET_POST);
     RB_DrawDebugPostEffects();
 }
 

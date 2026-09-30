@@ -1,6 +1,15 @@
 #pragma once
 #include <cstdint>
 
+#if defined(__SWITCH__)
+// switch_pmem.h is a drop-in-compatible replacement with byte-identical
+// PhysicalMemory/PhysicalMemoryPrim/PhysicalMemoryAllocation layouts (the
+// original PMem_FreeIndex decompiled arithmetic depends on that exact
+// layout) and the same PMem_* signatures; its own #ifdef __SWITCH__ guard
+// means only its declarations are visible here.
+#include <platform/switch/switch_pmem.h>
+#else
+
 struct PhysicalMemoryAllocation // sizeof=0x8
 {                                       // ...
     const char *name;                   // ...
@@ -37,3 +46,5 @@ uint8_t *__cdecl PMem_Alloc(
     uint32_t allocType);
 uint32_t __cdecl PMem_GetFreeAmount();
 void __cdecl PMem_DumpMemStats();
+
+#endif

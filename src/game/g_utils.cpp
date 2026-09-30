@@ -618,6 +618,8 @@ int __cdecl G_RumbleIndex(const char *name)
 void __cdecl G_SetClientDemoTime(int time)
 {
     level.framenum = time / 50;
+    // Retail PC (0x43ebd0) also restarts G_RunFrame's stage machine here.
+    level.runFrameStage = 0;
     if (time - 50 > 0)
         level.previousTime = time - 50;
     else
@@ -924,27 +926,18 @@ LABEL_14:
 
 void __cdecl G_ShutdownClientDemo()
 {
-    int v0; // r29
-    int num_entities; // r11
-    XAnimTree_s **p_pAnimTree; // r31
-
-    v0 = 0;
-    num_entities = level.num_entities;
     if (level.num_entities > 0)
     {
-        p_pAnimTree = &g_entities[0].pAnimTree;
-        do
+        for (int entityIndex = 0; entityIndex < level.num_entities; ++entityIndex)
         {
-            if (*p_pAnimTree)
+            XAnimTree_s *&animTree = g_entities[entityIndex].pAnimTree;
+            if (animTree)
             {
-                XAnimClearTree(*p_pAnimTree);
-                Com_XAnimFreeSmallTree(*p_pAnimTree);
-                num_entities = level.num_entities;
-                *p_pAnimTree = 0;
+                XAnimClearTree(animTree);
+                Com_XAnimFreeSmallTree(animTree);
+                animTree = 0;
             }
-            ++v0;
-            p_pAnimTree += 157;
-        } while (v0 < num_entities);
+        }
     }
 }
 
@@ -1677,68 +1670,27 @@ void __cdecl G_InitGentity(gentity_s *e)
 
 void __cdecl G_PrintEntities()
 {
-    int v0; // r30
-    unsigned __int16 *p_model; // r31
-    unsigned int v2; // r11
-    double v3; // fp31
-    double v4; // fp30
-    double v5; // fp29
-    const char *v6; // r24
-    const char *EntityTypeName; // r3
-    double v8; // fp31
-    double v9; // fp30
-    double v10; // fp29
-    const char *v11; // r3
-
-    v0 = 0;
-    if (level.num_entities > 0)
+    for (int entityIndex = 0; entityIndex < level.num_entities; ++entityIndex)
     {
-        p_model = &g_entities[0].model;
-        do
+        const gentity_s &entity = g_entities[entityIndex];
+        if (entity.r.inuse)
         {
-            if (*((_BYTE *)p_model - 112))
+            if (scr_const.script_model == entity.classname && entity.model)
             {
-                v2 = p_model[2];
-                if (scr_const.script_model == v2 && *p_model)
-                {
-                    const char *modelName = G_GetModel(*p_model)->name;
-                    v3 = *((float *)p_model - 12);
-                    v4 = *((float *)p_model - 13);
-                    v5 = *((float *)p_model - 14);
-                    v6 = SL_ConvertToStringSafe(p_model[2]);
-                    EntityTypeName = BG_GetEntityTypeName(*((unsigned __int8 *)p_model - 280));
-                    Com_Printf(
-                        CON_CHANNEL_SERVER,
-                        "%4i: Type: %s, Class: %s, model '%s', origin: %6.1f %6.1f %6.1f\n",
-                        v0,
-                        EntityTypeName,
-                        v6,
-                        modelName,
-                        v5,
-                        v4,
-                        v3);
-                }
-                else
-                {
-                    const char *className = SL_ConvertToStringSafe(v2);
-                    v8 = *((float *)p_model - 12);
-                    v9 = *((float *)p_model - 13);
-                    v10 = *((float *)p_model - 14);
-                    v11 = BG_GetEntityTypeName(*((unsigned __int8 *)p_model - 280));
-                    Com_Printf(
-                        CON_CHANNEL_SERVER,
-                        "%4i: Type: %s, Class: %s, origin: %6.1f %6.1f %6.1f\n",
-                        v0,
-                        v11,
-                        className,
-                        v10,
-                        v9,
-                        v8);
-                }
+                const char *modelName = G_GetModel(entity.model)->name;
+                Com_Printf(CON_CHANNEL_SERVER, "%4i: Type: %s, Class: %s, model '%s', origin: %6.1f %6.1f %6.1f\n",
+                    entityIndex, BG_GetEntityTypeName(entity.s.eType),
+                    SL_ConvertToStringSafe(entity.classname), modelName,
+                    entity.r.currentOrigin[0], entity.r.currentOrigin[1], entity.r.currentOrigin[2]);
             }
-            ++v0;
-            p_model += 314;
-        } while (v0 < level.num_entities);
+            else
+            {
+                Com_Printf(15, "%4i: Type: %s, Class: %s, origin: %6.1f %6.1f %6.1f\n",
+                    entityIndex, BG_GetEntityTypeName(entity.s.eType),
+                    SL_ConvertToStringSafe(entity.classname), entity.r.currentOrigin[0],
+                    entity.r.currentOrigin[1], entity.r.currentOrigin[2]);
+            }
+        }
     }
 }
 
@@ -1773,22 +1725,17 @@ gentity_s *__cdecl G_Spawn()
 void __cdecl G_FreeEntityRefs(gentity_s *ed)
 {
     int number; // r29
-    int num_entities; // r10
-    unsigned __int16 *p_groundEntityNum; // r11
     gclient_s *client; // r31
 
     number = ed->s.number;
     if ((ed->flags & 0x100000) != 0 && level.num_entities > 0)
     {
-        num_entities = level.num_entities;
-        p_groundEntityNum = &g_entities[0].s.groundEntityNum;
-        do
+        for (int entityIndex = 0; entityIndex < level.num_entities; ++entityIndex)
         {
-            if (*((_BYTE *)p_groundEntityNum + 46) && *p_groundEntityNum == number)
-                *p_groundEntityNum = ENTITYNUM_NONE;
-            --num_entities;
-            p_groundEntityNum += 314;
-        } while (num_entities);
+            gentity_s &entity = g_entities[entityIndex];
+            if (entity.r.inuse && entity.s.groundEntityNum == number)
+                entity.s.groundEntityNum = ENTITYNUM_NONE;
+        }
     }
     if ((ed->flags & 0x400000) != 0 && g_entities[0].r.inuse)
     {
@@ -1824,9 +1771,8 @@ void __cdecl G_FreeAllEntityRefs()
         }
     }
     droppedWeaponCue = level.droppedWeaponCue;
-    do
+    for (int cueIndex = 0; cueIndex < 32; ++cueIndex)
         droppedWeaponCue++->setEnt(0);
-    while ((int)droppedWeaponCue < (int)&level.droppedWeaponCue[32]);
     Targ_RemoveAll();
 }
 
@@ -1860,65 +1806,72 @@ void __cdecl G_FreeEntityAfterEvent(gentity_s *ent)
     ent->r.eventType |= 1u;
 }
 
+// Demo-history free-entity list (sv_demo.cpp SV_DemoSaveHistory /
+// SV_InitReadDemo).  The retail record was two 32-bit gentity pointers
+// followed by one 32-bit `nextFree` pointer per chain link, and the loader
+// wrote the links back through ILP32 byte offsets (624..627).  On LP64 the
+// save truncated every pointer (wrong above 4 GiB) and the load read an
+// 8-byte pointer from the 4+4 header.  Keep the record size (4 bytes per
+// slot) but store entity-number tokens: 0 = null, n = &g_entities[n - 1].
+static uint32_t G_FreeEntToken(const gentity_s *ent)
+{
+    if (!ent)
+        return 0;
+    iassert(ent >= g_entities && ent < &g_entities[MAX_GENTITIES]);
+    return (uint32_t)(ent - g_entities) + 1;
+}
+
+static gentity_s *G_FreeEntFromToken(uint32_t token)
+{
+    if (!token)
+        return nullptr;
+    if (token > MAX_GENTITIES)
+        Com_Error(ERR_DROP, "G_LoadFreeEntities: bad entity token %u", token);
+    return &g_entities[token - 1];
+}
+
 int __cdecl G_SaveFreeEntities(unsigned __int8 *buf)
 {
-    gentity_s *firstFreeEnt; // r9
-    int result; // r3
-    unsigned __int8 *v4; // r11
+    int result = 8;
+    uint32_t token;
 
     if (buf)
     {
-        *(unsigned int *)buf = (unsigned int)level.firstFreeEnt;
-        *((unsigned int *)buf + 1) = (unsigned int)level.lastFreeEnt;
+        token = G_FreeEntToken(level.firstFreeEnt);
+        memcpy(buf, &token, 4);
+        token = G_FreeEntToken(level.lastFreeEnt);
+        memcpy(buf + 4, &token, 4);
     }
-    firstFreeEnt = level.firstFreeEnt;
-    result = 8;
-    if (level.firstFreeEnt)
+    for (gentity_s *ent = level.firstFreeEnt; ent; ent = ent->nextFree)
     {
-        v4 = buf + 8;
-        do
+        if (buf)
         {
-            if (buf)
-            {
-                *v4 = (unsigned __int8)firstFreeEnt->nextFree;
-                v4[1] = BYTE1(firstFreeEnt->nextFree);
-                v4[2] = BYTE2(firstFreeEnt->nextFree);
-                v4[3] = HIBYTE(firstFreeEnt->nextFree);
-            }
-            firstFreeEnt = firstFreeEnt->nextFree;
-            result += 4;
-            v4 += 4;
-        } while (firstFreeEnt);
+            token = G_FreeEntToken(ent->nextFree);
+            memcpy(buf + result, &token, 4);
+        }
+        result += 4;
     }
     return result;
 }
 
 void __cdecl G_LoadFreeEntities(unsigned __int8 *buf)
 {
-    _BYTE *v2; // r11
-    bool v3; // cr58
-    unsigned __int8 *v4; // r9
-    unsigned __int8 v5; // r10
+    uint32_t token;
+    int pos = 8;
 
     if (!buf)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\game\\g_utils.cpp", 2608, 0, "%s", "buf");
-    v2 = *(_BYTE **)buf;
-    v3 = *(unsigned int *)buf == 0;
-    level.firstFreeEnt = *(gentity_s **)buf;
-    level.lastFreeEnt = (gentity_s *)*((unsigned int *)buf + 1);
-    if (!v3)
+    memcpy(&token, buf, 4);
+    level.firstFreeEnt = G_FreeEntFromToken(token);
+    memcpy(&token, buf + 4, 4);
+    level.lastFreeEnt = G_FreeEntFromToken(token);
+    for (gentity_s *ent = level.firstFreeEnt; ent; ent = ent->nextFree)
     {
-        v4 = buf + 8;
-        do
-        {
-            v2[624] = *v4;
-            v2[625] = v4[1];
-            v2[626] = v4[2];
-            v5 = v4[3];
-            v4 += 4;
-            v2[627] = v5;
-            v2 = (_BYTE *)*((unsigned int *)v2 + 156);
-        } while (v2);
+        if (pos > 8 + 4 * MAX_GENTITIES)
+            Com_Error(ERR_DROP, "G_LoadFreeEntities: free list cycle");
+        memcpy(&token, buf + pos, 4);
+        pos += 4;
+        ent->nextFree = G_FreeEntFromToken(token);
     }
 }
 
@@ -2619,7 +2572,7 @@ void __cdecl G_EntUnlink(gentity_s *ent)
     tagInfo_s *tagInfo; // r22
     animscripted_s *scripted; // r30
     float *anglesError; // r30
-    long double v5; // fp2
+    double v5; // fp2
     gclient_s *client; // r11
     gentity_s *parent; // r24
     gentity_s *tagChildren; // r30
@@ -3301,4 +3254,3 @@ int __cdecl G_EntAttach(gentity_s *ent, const char *modelName, unsigned int tagN
     //Profile_EndInternal(0);
     return 1;
 }
-

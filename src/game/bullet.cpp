@@ -884,7 +884,7 @@ void __cdecl Bullet_FirePenetrate(BulletFireParams *bp, const WeaponDef *weapDef
 
             Vec3Mad(lastHitPos, 0.01f, revBp.dir, revBp.end);
 
-            Com_Memcpy((char *)&revBr, (char *)&br, 68);
+            Com_Memcpy((char *)&revBr, (char *)&br, sizeof(revBr)); // LP64: was the ILP32 sizeof(BulletTraceResults)
 
             revBr.trace.normal[0] = -revBr.trace.normal[0];
             revBr.trace.normal[1] = -revBr.trace.normal[1];

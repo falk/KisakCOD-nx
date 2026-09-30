@@ -141,14 +141,20 @@ void __cdecl CL_CreateDevGui()
     if (clGuiGlob.inited)
         MyAssertHandler(".\\client\\cl_devgui.cpp", 179, 0, "%s", "!clGuiGlob.inited");
     clGuiGlob.inited = 1;
+    Com_Printf(0, "CL_CreateDevGui: RegisterDevGuiDvars...\n");
     CL_RegisterDevGuiDvars();
+    Com_Printf(0, "CL_CreateDevGui: CreateMapMenuEntries...\n");
     CL_CreateMapMenuEntries();
+    Com_Printf(0, "CL_CreateDevGui: R_CreateDevGui...\n");
     R_CreateDevGui();
     Cbuf_InsertText(0, "exec devgui_main");
 #ifndef KISAK_NO_FASTFILES
+    Com_Printf(0, "CL_CreateDevGui: Com_InitSoundDevGuiGraphs...\n");
     Com_InitSoundDevGuiGraphs();
 #endif
+    Com_Printf(0, "CL_CreateDevGui: CG_InitVisionSetsMenu...\n");
     CG_InitVisionSetsMenu();
+    Com_Printf(0, "CL_CreateDevGui: done!\n");
 }
 
 void __cdecl CL_DestroyDevGui()

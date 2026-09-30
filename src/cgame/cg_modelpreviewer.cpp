@@ -65,7 +65,6 @@ void __cdecl CG_ModPrvUpdateMru(const dvar_s **mruDvars, const char **stringTabl
 {
     const dvar_s **v3; // r31
     int v6; // r30
-    char *v7; // r27
 
     v3 = mruDvars;
     if (!mruDvars)
@@ -73,7 +72,6 @@ void __cdecl CG_ModPrvUpdateMru(const dvar_s **mruDvars, const char **stringTabl
     if (!stringTable)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\cgame\\cg_modelpreviewer.cpp", 346, 0, "%s", "stringTable");
     v6 = 0;
-    v7 = (char *)((char *)stringTable - (char *)v3);
     do
     {
         if (!*v3)
@@ -83,10 +81,10 @@ void __cdecl CG_ModPrvUpdateMru(const dvar_s **mruDvars, const char **stringTabl
                 0,
                 "%s",
                 "mruDvars[dvarIndex]");
-        if (v6 && !*(_BYTE *)(*v3)->current.integer)
+        if (v6 && !(*v3)->current.string[0])
             break;
         ++v6;
-        *(const dvar_s **)((char *)v3 + (unsigned int)v7) = (const dvar_s *)(*v3)->current.integer;
+        stringTable[v6 - 1] = (*v3)->current.string;
         ++v3;
     } while (v6 < 4);
     stringTable[v6] = 0;
@@ -449,7 +447,6 @@ void CG_ModPrvResetGlobals()
     DObj_s **p_obj; // r10
     int v1; // r11
 
-    p_obj = &g_mdlprv.model.clones[0].obj;
     g_mdlprv.system.cachedAllModels = 0;
     g_mdlprv.system.uiModePC = SELECTION_MODE;
     g_mdlprv.system.uiModeGPad = MDLPRVMODE_FOCUSED;
@@ -472,13 +469,14 @@ void CG_ModPrvResetGlobals()
     g_mdlprv.model.lodDist[2] = 30;
     g_mdlprv.model.lodDist[3] = 40;
     g_mdlprv.model.cloneNextIdx = 0;
-    v1 = 10;
-    do
+    // LP64: index the clones.  The decompiled walk stepped a DObj_s ** by 78
+    // (312 = ILP32 sizeof(MdlPrvClone), LP64 360), so from the 2nd clone on it
+    // zeroed unrelated g_mdlprv bytes and left the real obj pointers stale.
+    for (v1 = 0; v1 < 10; ++v1)
     {
-        --v1;
+        p_obj = &g_mdlprv.model.clones[v1].obj;
         *p_obj = 0;
-        p_obj += 78;
-    } while (v1);
+    }
     g_mdlprv.model.ragdoll = 0;
     g_mdlprv.viewer.centerRadius = 100.0;
     g_mdlprv.viewer.horizontal = 0.0;
@@ -717,9 +715,9 @@ int __cdecl CG_ModPrvGetNumTotalBones(DObj_s *dobj)
 int __cdecl CG_ModPrvGetNumSurfaces(DObj_s *obj, int lod)
 {
     int NumModels; // r29
-    char *v5; // r11
+    int8_t *v5; // r11
     int v6; // ctr
-    char v8[80]; // [sp+50h] [-50h] BYREF
+    int8_t v8[80]; // [sp+50h] [-50h] BYREF
 
     if (!obj)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\cgame\\cg_modelpreviewer.cpp", 1238, 0, "%s", "obj");
@@ -1846,12 +1844,12 @@ void __cdecl MdlPrvModelOriginOffset(double dx, double dy, double dz)
 void __cdecl MdlPrvSpin_(unsigned int yprIdx, double deg)
 {
     double v2; // fp29
-    long double v3; // fp2
-    long double v4; // fp2
+    double v3; // fp2
+    double v4; // fp2
     double v5; // fp28
-    long double v6; // fp2
+    double v6; // fp2
     double v7; // fp31
-    long double v8; // fp2
+    double v8; // fp2
     float v9; // [sp+50h] [-D0h] BYREF
     float v10; // [sp+54h] [-CCh]
     float v11; // [sp+58h] [-C8h]
@@ -2090,7 +2088,7 @@ void __cdecl MdlPrvFreeRot(double yaw, double pitch)
     double v3; // fp30
     double v4; // fp1
     double v6; // fp31
-    long double v7; // fp2
+    double v7; // fp2
 
     v3 = (float)((float)(g_mdlprv.viewer.freeModeAngles[1] + yaw) * (float)0.0027777778);
     g_mdlprv.viewer.freeModeAngles[1] = g_mdlprv.viewer.freeModeAngles[1] + (float)yaw;
@@ -2204,17 +2202,18 @@ void MdlPrvCloneClearAll()
     int v0; // r30
     DObj_s **p_obj; // r31
 
+    // LP64: index the clones (the decompiled DObj_s ** walk stepped by 78,
+    // 312 = ILP32 sizeof(MdlPrvClone); LP64 360).
     v0 = 10;
-    p_obj = &g_mdlprv.model.clones[0].obj;
     do
     {
+        p_obj = &g_mdlprv.model.clones[10 - v0].obj;
         if (*p_obj)
         {
             DObjFree(*p_obj);
             *p_obj = 0;
         }
         --v0;
-        p_obj += 78;
     } while (v0);
 }
 
@@ -2250,7 +2249,8 @@ void __cdecl MdlPrvCloneModel(const cg_s *cgGlob)
     DObjClone(g_mdlprv.model.currentObj, (DObj_s*)pClone->objBuf);
     pClone->obj = (DObj_s *)pClone->objBuf;
     DObjSetTree((DObj_s *)pClone->objBuf, 0);
-    memcpy(pClone, &g_mdlprv.model.currentEntity, 0x7Cu);
+    // LP64: 0x7C was the ILP32 sizeof(GfxSceneEntity); LP64 is 152.
+    memcpy(&pClone->ent, &g_mdlprv.model.currentEntity, sizeof(pClone->ent));
     AngleVectors(cgGlob->refdefViewAngles, forward, right, up);
     ++g_mdlprv.model.cloneNextIdx;
     g_mdlprv.model.initialOrigin[1] = g_mdlprv.model.initialOrigin[1] + (forward[0] * 16.0f);
@@ -2934,14 +2934,15 @@ void __cdecl CG_ModPrvSaveDObjs()
     int v0; // r30
     DObj_s **p_obj; // r31
 
+    // LP64: index the clones (the decompiled DObj_s ** walk stepped by 78,
+    // 312 = ILP32 sizeof(MdlPrvClone); LP64 360).
     v0 = 10;
-    p_obj = &g_mdlprv.model.clones[0].obj;
     do
     {
+        p_obj = &g_mdlprv.model.clones[10 - v0].obj;
         if (*p_obj)
             DObjArchive(*p_obj);
         --v0;
-        p_obj += 78;
     } while (v0);
     if (g_mdlprv.model.currentObj)
         DObjArchive(g_mdlprv.model.currentObj);
@@ -2952,14 +2953,15 @@ void __cdecl CG_ModPrvLoadDObjs()
     int v0; // r30
     DObj_s **p_obj; // r31
 
+    // LP64: index the clones (the decompiled DObj_s ** walk stepped by 78,
+    // 312 = ILP32 sizeof(MdlPrvClone); LP64 360).
     v0 = 10;
-    p_obj = &g_mdlprv.model.clones[0].obj;
     do
     {
+        p_obj = &g_mdlprv.model.clones[10 - v0].obj;
         if (*p_obj)
             DObjUnarchive(*p_obj);
         --v0;
-        p_obj += 78;
     } while (v0);
     if (g_mdlprv.model.currentObj)
         DObjUnarchive(g_mdlprv.model.currentObj);
@@ -3064,8 +3066,8 @@ void __cdecl CG_ModPrvLoadModel(const cg_s *cgameGlob, const char *modelFilename
     double v47; // fp29
     double v48; // fp31
     double v49; // fp30
-    long double v50; // fp2
-    long double v51; // fp2
+    double v50; // fp2
+    double v51; // fp2
     double v52; // fp13
     int NumSurfaces; // r3
     int v54; // r30
@@ -3437,7 +3439,6 @@ void CG_ModPrvEnumerateModels_FastFile()
         g_mdlprv.system.modelNames = (const char **)Hunk_UserAlloc(v0, 4 * (g_mdlprv.system.modelCount + 2), 4);
         *g_mdlprv.system.modelNames = (const char *)v0;
         ++g_mdlprv.system.modelNames;
-        v1[2] = (int)"CG_ModPrvEnumerateModels";
         v1[1] = 3;
         v1[0] = 0;
         DB_EnumXAssets(
@@ -3475,7 +3476,6 @@ void CG_ModPrvEnumerateAnimations_FastFile()
         v0 = Hunk_UserCreate(0x20000, "CG_ModPrvEnumerateAnimations", 0, 0, 0);
         g_mdlprv.system.animNames = (const char **)Hunk_UserAlloc(v0, 4 * (g_mdlprv.system.animCount + 2), 4);
         *g_mdlprv.system.animNames = (const char *)v0;
-        v1[2] = (int)"CG_ModPrvEnumerateAnimations";
         ++g_mdlprv.system.animNames;
         v1[1] = 2;
         v1[0] = 0;
@@ -3531,4 +3531,3 @@ void __cdecl CG_ModelPreviewerCreateDevGui(int localClientNum)
     CG_ModPrvResetGlobals();
     Cbuf_InsertText(localClientNum, "exec devgui_modelpreviewer\n");
 }
-

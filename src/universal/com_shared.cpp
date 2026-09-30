@@ -157,13 +157,13 @@ int __cdecl Com_HashKey(const char *string, int maxlen)
 
 int __cdecl Com_RealTime(qtime_s *qtime)
 {
-    __int64 t; // [esp+0h] [ebp-10h] BYREF
+    time_t t; // widened from the MSVC __int64 spelling
     tm *tms; // [esp+Ch] [ebp-4h]
 
-    t = _time64(0);
+    t = time(nullptr);
     if (!qtime)
-        return t;
-    tms = _localtime64(&t);
+        return static_cast<int>(t);
+    tms = localtime(&t);
     if (tms)
     {
         qtime->tm_sec = tms->tm_sec;
@@ -291,54 +291,16 @@ void __cdecl Com_Memcpy(void *dest_p, const void *src_p, const size_t count)
 
 void __cdecl Com_Memset(void *dest_p, const int val, const size_t count)
 {
-    uint32_t *dest = (uint32_t *)dest_p;
-
-    uint32_t *v3; // edx
-    int v4; // eax
-    int v5; // eax
-    int v6; // ecx
-    char *v7; // ebx
-
-    if (count >= 8)
-    {
-        _copyDWord(dest, val | (val << 8) | ((val | (val << 8)) << 16), count / 4);
-        if ((count & 3) != 0)
-        {
-            v7 = (char *)dest + (count & 0xFFFFFFFC);
-            if ((count & 3u) < 2)
-            {
-                if ((count & 3) != 0)
-                    *v7 = val;
-            }
-            else
-            {
-                *(_WORD *)v7 = val | ((_WORD)val << 8);
-                if ((count & 3) != 2)
-                    v7[2] = val;
-            }
-        }
-    }
-    else
-    {
-        v3 = dest;
-        v4 = val;
-        BYTE1(v4) = val;
-        v5 = (uint16_t)v4 + (v4 << 16);
-        v6 = count;
-        if (count >= 4)
-        {
-            *dest = v5;
-            v3 = dest + 1;
-            v6 = count - 4;
-        }
-        if (v6 >= 2)
-        {
-            *(_WORD *)v3 = v5;
-            v3 = (uint32_t *)((char *)v3 + 2);
-            v6 -= 2;
-        }
-        if (v6)
-            *(_BYTE *)v3 = v5;
-    }
+    // Was a hand-rolled fill: _copyDWord (a scalar 4-byte-store loop, a
+    // top-ranked hot path in a PGO profile) building
+    // a repeated byte pattern from `val`, plus a byte/word tail fixup below
+    // 8/4 bytes. Every caller in the SP game build passes a literal byte
+    // value (0, 1, 0xDD, 176, 255 -- grepped across src/), so the pattern
+    // build (`val | (val<<8) | ...`) and libc memset's implicit
+    // `(unsigned char)val` truncation agree for all of them; newlib's
+    // aarch64 memset is already vectorised, unlike _copyDWord. Host-verified
+    // byte-for-byte against the original algorithm for count 0..N and val
+    // 0..255: switch_msg_bits_test.cpp.
+    memset(dest_p, val, count);
 }
 

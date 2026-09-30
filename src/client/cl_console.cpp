@@ -4,7 +4,10 @@
 
 #include <qcommon/cmd.h>
 #include <stringed/stringed_hooks.h>
+#include <universal/critical_section.h>
+#ifndef __SWITCH__
 #include <win32/win_local.h>
+#endif
 #include <gfx_d3d/r_rendercmds.h>
 #include <qcommon/threads.h>
 #include <universal/com_files.h>
@@ -217,14 +220,13 @@ void __cdecl Con_TimeNudged(int32_t localClientNum, int32_t serverTimeNudge)
 {
     int serverTime = CL_GetLocalClientGlobals(localClientNum)->serverTime;
     Con_NudgeMessageWindowTimes(&con.consoleWindow, serverTimeNudge, serverTime);
-
-    for (uint gameWindowIndex = 0; gameWindowIndex < 4; ++gameWindowIndex)
-    {
-        Con_NudgeMessageWindowTimes(&con.messageBuffer[localClientNum].gamemsgWindows[gameWindowIndex], serverTimeNudge, serverTime);
-    }
-
-    Con_NudgeMessageWindowTimes((MessageWindow *)&con.color[4630 * localClientNum - 1122], serverTimeNudge, serverTime);
-    Con_NudgeMessageWindowTimes((MessageWindow *)&con.color[4630 * localClientNum - 53], serverTimeNudge, serverTime);
+    for (gameWindowIndex = 0; gameWindowIndex < 4; ++gameWindowIndex)
+        Con_NudgeMessageWindowTimes(
+            &con.messageBuffer[localClientNum].gamemsgWindows[gameWindowIndex],
+            serverTimeNudge,
+            serverTime);
+    Con_NudgeMessageWindowTimes(&con.messageBuffer[localClientNum].miniconWindow, serverTimeNudge, serverTime);
+    Con_NudgeMessageWindowTimes(&con.messageBuffer[localClientNum].errorWindow, serverTimeNudge, serverTime);
 }
 #endif
 
@@ -1425,6 +1427,14 @@ uint32_t __cdecl CL_AddDeathMessageIcon(
     iassert(iconWidth > 0);
     iassert(iconHeight > 0);
     iassert(IsValidMaterialHandle(iconShader));
+
+#if UINTPTR_MAX > UINT32_MAX
+    // The retail HUD icon command has a fixed four-byte material token.  No
+    // compact material-ID registry exists for this command, so never truncate
+    // a native pointer into the wire record on LP64.
+    Com_Error(ERR_FATAL, "CL_AddDeathMessageIcon: 32-bit material token is unsupported on LP64");
+    return deathMsgLen;
+#endif
     iassert(deathMsgLen + 1 <= deathMsgMaxLen);
 
     deathMsg[deathMsgLen] = 94;
@@ -1452,9 +1462,11 @@ uint32_t __cdecl CL_AddDeathMessageIcon(
     deathMsg[deathMsgLenc] = v8;
     deathMsgLend = deathMsgLenc + 1;
 
-    iassert(deathMsgLend + sizeof(iconShader) <= deathMsgMaxLen);
+    iassert(deathMsgLend + sizeof(uint32_t) <= deathMsgMaxLen);
 
+#if UINTPTR_MAX == UINT32_MAX
     *(uint32_t *)&deathMsg[deathMsgLend] = (uint32_t)iconShader;
+#endif
     deathMsgLene = deathMsgLend + 4;
 
     iassert(deathMsgLene - deathMsgLen == CONTXTCMD_LEN_HUDICON + 1);
@@ -1477,6 +1489,14 @@ uint32_t __cdecl CL_AddDeathMessageIcon(
     iassert(iconHeight > 0);
     iassert(IsValidMaterialHandle(iconShader));
 
+#if UINTPTR_MAX > UINT32_MAX
+    // The retail HUD icon command has a fixed four-byte material token.  No
+    // compact material-ID registry exists for this command, so never truncate
+    // a native pointer into the wire record on LP64.
+    Com_Error(ERR_FATAL, "CL_AddDeathMessageIcon: 32-bit material token is unsupported on LP64");
+    return deathMsgLen;
+#endif
+
     char encodedWidth = CL_DeathMessageIconDimension(iconWidth);
     char encodedHeight = CL_DeathMessageIconDimension(iconHeight);
 
@@ -1489,7 +1509,9 @@ uint32_t __cdecl CL_AddDeathMessageIcon(
     deathMsg[deathMsgLen++] = (char)(horzFlipIcon + 1);
     deathMsg[deathMsgLen++] = encodedWidth;
     deathMsg[deathMsgLen++] = encodedHeight;
+#if UINTPTR_MAX == UINT32_MAX
     *(uint32_t*)&deathMsg[deathMsgLen] = (uint32_t)iconShader;
+#endif
     deathMsgLen += 4;
 
     iassert(deathMsgLen - startLen == CONTXTCMD_LEN_HUDICON + 1);
@@ -2701,7 +2723,7 @@ void __cdecl ConDrawInput_AutoCompleteArg(const char **stringList, int32_t strin
         }
         if (matchCount)
         {
-            qsort(matches, matchCount, 4u, (int(__cdecl *)(const void *, const void *))ConDrawInput_CompareStrings);
+            qsort(matches, matchCount, sizeof(matches[0]), (int(__cdecl *)(const void *, const void *))ConDrawInput_CompareStrings); // LP64: char* elements
             consoleFont = cls.consoleFont;
             ArgChar = ConDrawInput_TextFieldFirstArgChar();
             x = (double)R_TextWidth(g_consoleField.buffer, ArgChar, consoleFont) + conDrawInputGlob.leftX - 6.0;

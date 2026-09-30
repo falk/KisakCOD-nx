@@ -12,3 +12,7 @@ void __cdecl XAnimSaveAnimInfo(XAnimInfo *info, MemoryFile *memFile);
 void __cdecl XAnimLoadAnimTree(DObj_s *obj, MemoryFile *memFile);
 void __cdecl XAnimSaveAnimTree_r(const XAnimTree_s *tree, MemoryFile *memFile, int infoIndex);
 void __cdecl XAnimSaveAnimTree(const DObj_s *obj, MemoryFile *memFile);
+// Records written/read by the last call, for the savegame load's per-entity
+// anim-tree comparison (g_save.cpp prints them while com_diagMarkers is on).
+extern int xanimSaveDiagInfos;
+extern int xanimLoadDiagInfos;

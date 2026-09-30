@@ -12,6 +12,12 @@
 #endif
 #include <cgame/cg_local.h>
 
+#ifdef KISAK_MP
+const pmoveHandler_t pmoveHandlers[2] = { { CG_TraceCapsule, NULL}, {G_TraceCapsule, G_PlayerEvent} }; // idb
+#elif KISAK_SP
+const pmoveHandler_t pmoveHandlers[2] = { { CG_TraceCapsule }, { G_TraceCapsule } };
+#endif
+
 #ifdef KISAK_SP
 char __cdecl BG_CheckProneView(
     uint8_t handler,
@@ -466,7 +472,7 @@ void __cdecl PM_FootstepEvent(pmove_t *pm, pml_t *pml, char iOldBobCycle, char i
                 maxs[2] = pm->maxs[2];
                 maxs[0] = maxs[0] - 6.0;
                 maxs[1] = maxs[1] - 6.0;
-                if ((float)8.0 > (double)maxs[2])
+                if ((float)8.0 > maxs[2])
                     maxs[2] = mins[2];
 
                 iassert(maxs[0] >= mins[0]);
@@ -538,11 +544,11 @@ bool __cdecl PM_ShouldMakeFootsteps(pmove_t *pm)
     if ((ps->pm_flags & PMF_BACKWARDS_RUN) != 0)
     {
         if (!bWalking)
-            return player_footstepsThreshhold->current.value <= (double)pm->xyspeed;
+            return player_footstepsThreshhold->current.value <= pm->xyspeed;
     }
     else if (!bWalking)
     {
-        return player_footstepsThreshhold->current.value <= (double)pm->xyspeed;
+        return player_footstepsThreshhold->current.value <= pm->xyspeed;
     }
 
     return false;
@@ -606,9 +612,9 @@ void __cdecl PM_UpdateLean(
         }
         else
         {
-            if (fLeanMax > (double)leanofs)
+            if (fLeanMax > leanofs)
                 leanofs = msec / 350.0 * fLeanMax + leanofs;
-            if (fLeanMax < (double)leanofs)
+            if (fLeanMax < leanofs)
                 leanofs = fLeanMax;
         }
     }
@@ -649,7 +655,7 @@ void __cdecl PM_UpdateLean(
         capsuleTrace(&trace, start, tmins, tmaxs, end, ps->clientNum, MASK_PLAYERSOLID);
         fLean = UnGetLeanFraction(trace.fraction);
         v5 = I_fabs(ps->leanf);
-        if (fLean < (double)v5)
+        if (fLean < v5)
         {
             if (ps->leanf < 0.0)
                 v4 = -1.0;
@@ -746,7 +752,7 @@ void __cdecl PM_UpdateViewAngles_Clamp(playerState_s *ps, usercmd_s *cmd)
         temp = (v8 - v4) * 360.0;
         if (!i)
         {
-            if (maxPitch >= (double)temp)
+            if (maxPitch >= temp)
             {
                 if (temp < -minPitch)
                 {
@@ -790,9 +796,9 @@ void __cdecl PM_UpdateViewAngles_RangeLimited(playerState_s *ps, float oldYaw)
             {
                 delta = AngleDelta(ps->viewAngleClampBase[i], ps->viewangles[i]);
             }
-            if (ps->viewAngleClampRange[i] < (double)delta || delta < -ps->viewAngleClampRange[i])
+            if (ps->viewAngleClampRange[i] < delta || delta < -ps->viewAngleClampRange[i])
             {
-                if (ps->viewAngleClampRange[i] >= (double)delta)
+                if (ps->viewAngleClampRange[i] >= delta)
                     v2 = delta + ps->viewAngleClampRange[i];
                 else
                     v2 = delta - ps->viewAngleClampRange[i];
@@ -825,9 +831,9 @@ void __cdecl PM_UpdateViewAngles_LadderClamp(playerState_s *ps)
 
     ladderFacing = vectoyaw(ps->vLadderVec) + 180.0;
     delta = AngleDelta(ladderFacing, ps->viewangles[1]);
-    if (bg_ladder_yawcap->current.value < (double)delta || delta < -bg_ladder_yawcap->current.value)
+    if (bg_ladder_yawcap->current.value < delta || delta < -bg_ladder_yawcap->current.value)
     {
-        if (bg_ladder_yawcap->current.value >= (double)delta)
+        if (bg_ladder_yawcap->current.value >= delta)
             v1 = delta + bg_ladder_yawcap->current.value;
         else
             v1 = delta - bg_ladder_yawcap->current.value;
@@ -888,10 +894,10 @@ void __cdecl PM_UpdateViewAngles_Prone(
     delta = AngleDelta(ps->proneDirection, newViewYaw);
     v19 = bg_prone_yawcap->current.value - 5.0;
     v17 = 1;
-    if (delta <= (double)v19)
+    if (delta <= v19)
     {
         v18 = -(bg_prone_yawcap->current.value - 5.0);
-        if (delta >= (double)v18)
+        if (delta >= v18)
             v17 = 0;
     }
     v16 = (cmd->forwardmove || cmd->rightmove) && delta != 0.0;
@@ -899,7 +905,7 @@ void __cdecl PM_UpdateViewAngles_Prone(
     {
         maxDeltaYaw = msec * 55.0 * EQUAL_EPSILON;
         v15 = I_fabs(delta);
-        if (maxDeltaYaw <= (double)v15)
+        if (maxDeltaYaw <= v15)
         {
             if (delta <= 0.0)
                 v5 = ps->proneDirection + maxDeltaYaw;
@@ -1325,9 +1331,9 @@ void __cdecl PM_UpdateViewAngles_ProneYawClamp(
     float deltaYaw1a; // [esp+1Ch] [ebp-4h]
     float deltaa; // [esp+2Ch] [ebp+Ch]
 
-    if (bg_prone_yawcap->current.value < (double)delta || delta < -bg_prone_yawcap->current.value)
+    if (bg_prone_yawcap->current.value < delta || delta < -bg_prone_yawcap->current.value)
     {
-        if (bg_prone_yawcap->current.value >= (double)delta)
+        if (bg_prone_yawcap->current.value >= delta)
             v5 = delta + bg_prone_yawcap->current.value;
         else
             v5 = delta - bg_prone_yawcap->current.value;
@@ -1518,7 +1524,7 @@ void __cdecl PM_UpdatePronePitch(pmove_t *pm, pml_t *pml)
         {
             v14 = I_fabs(delta);
             v13 = pml->frametime * 70.0;
-            if (v14 <= (double)v13)
+            if (v14 <= v13)
             {
                 ps->proneDirectionPitch = ps->proneDirectionPitch + delta;
             }
@@ -1549,7 +1555,7 @@ void __cdecl PM_UpdatePronePitch(pmove_t *pm, pml_t *pml)
         {
             v9 = I_fabs(deltaa);
             v8 = pml->frametime * 70.0;
-            if (v9 <= (double)v8)
+            if (v9 <= v8)
             {
                 ps->proneTorsoPitch = ps->proneTorsoPitch + deltaa;
             }
@@ -1725,7 +1731,7 @@ void __cdecl PmoveSingle(pmove_t *pm)
             v9 = I_fabs(forwardmove);
             v17 = (float)pm->oldcmd.forwardmove;
             v8 = I_fabs(v17);
-            if (v8 < (double)v9)
+            if (v8 < v9)
                 goto LABEL_90;
         }
         if (pm->cmd.rightmove == pm->oldcmd.rightmove
@@ -1733,7 +1739,7 @@ void __cdecl PmoveSingle(pmove_t *pm)
                 v7 = I_fabs(rightmove),
                 v15 = (float)pm->oldcmd.rightmove,
                 v6 = I_fabs(v15),
-                v6 >= (double)v7))
+                v6 >= v7))
         {
             if ((ps->pm_flags & PMF_SIGHT_AIMING) == 0
                 && (ps->weaponstate <= WEAPON_DROPPING_QUICK || ps->weaponstate == WEAPON_RELOADING))
@@ -2058,7 +2064,7 @@ void __cdecl PM_UpdateSprint(pmove_t *pm, const pml_t *pml)
         && PM_CanStand(ps, pm))
     {
         int32_t sprintLeft = PM_GetSprintLeft(ps, pm->cmd.serverTime); // [esp+8h] [ebp-Ch]
-        if (player_sprintMinTime->current.value * 1000.0 < (double)sprintLeft)
+        if (player_sprintMinTime->current.value * 1000.0 < sprintLeft)
             PM_StartSprint(ps, pm, pml, sprintLeft);
     }
 }
@@ -2239,7 +2245,7 @@ void __cdecl PM_Friction(playerState_s *ps, pml_t *pml)
         }
         else if (pml->walking && (pml->groundTrace.surfaceFlags & SURF_SLICK) == 0 && (ps->pm_flags & PMF_TIME_KNOCKBACK) == 0)
         {
-            if (stopspeed->current.value <= (double)speed)
+            if (stopspeed->current.value <= speed)
                 value = speed;
             else
                 value = stopspeed->current.value;
@@ -2312,7 +2318,7 @@ void __cdecl PM_Accelerate(playerState_s *ps, const pml_t *pml, const float *wis
             return;
         }
 
-        if (stopspeed->current.value <= (double)wishspeed)
+        if (stopspeed->current.value <= wishspeed)
             value = wishspeed;
         else
             value = stopspeed->current.value;
@@ -2338,7 +2344,7 @@ double __cdecl PM_PlayerInertia(const playerState_s *ps, float accelspeed, const
     if (ps->pm_type == PM_NOCLIP)
         return accelspeed;
 
-    if (accelspeed <= (double)inertiaMax->current.value)
+    if (accelspeed <= inertiaMax->current.value)
         return accelspeed;
 
     float v4 = ps->oldVelocity[1] * ps->oldVelocity[1] + ps->oldVelocity[0] * ps->oldVelocity[0]; // [esp+8h] [ebp-8h]
@@ -2375,7 +2381,7 @@ bool __cdecl PM_DoPlayerInertia(const playerState_s *ps, float accelspeed, const
     scaledDotAngle = velocity_4 * oldVelocity_4 + velocity * oldVelocity;
     v4 = inertiaAngle->current.value * v5;
 
-    if (scaledDotAngle >= (double)v4)
+    if (scaledDotAngle >= v4)
         return false;
 
     if (inertiaDebug->current.enabled)
@@ -2411,7 +2417,7 @@ double __cdecl PM_MoveScale(playerState_s *ps, float fmove, float rmove, float u
     max = v11;
     v10 = I_fabs(rmove);
 
-    if (v11 < (double)v10)
+    if (v11 < v10)
     {
         v9 = I_fabs(rmove);
         max = v9;
@@ -2419,7 +2425,7 @@ double __cdecl PM_MoveScale(playerState_s *ps, float fmove, float rmove, float u
 
     v8 = I_fabs(umove);
 
-    if (max < (double)v8)
+    if (max < v8)
     {
         v7 = I_fabs(umove);
         max = v7;
@@ -2895,7 +2901,7 @@ void __cdecl PM_NoclipMove(pmove_t *pm, pml_t *pml)
     {
         drop = 0.0;
         curFriction = friction->current.value * 1.5;
-        if (stopspeed->current.value <= (double)speed)
+        if (stopspeed->current.value <= speed)
             value = speed;
         else
             value = stopspeed->current.value;
@@ -2978,7 +2984,7 @@ void __cdecl PM_UFOMove(pmove_t *pm, pml_t *pml)
         drop = 0.0;
         curFriction = friction->current.value * 1.5;
 
-        if (stopspeed->current.value <= (double)speed)
+        if (stopspeed->current.value <= speed)
             value = speed;
         else
             value = stopspeed->current.value;
@@ -3051,6 +3057,23 @@ void __cdecl PM_GroundTrace(pmove_t *pm, pml_t *pml)
     point[2] = v2;
     PM_playerTrace(pm, &trace, start, pm->mins, pm->maxs, point, ps->clientNum, pm->tracemask);
     memcpy(&pml->groundTrace, &trace, sizeof(pml->groundTrace));
+#ifdef __SWITCH__
+    {
+        // GROUND_TRACE diag (user report: slides, cannot jump): the walk
+        // proof already had to special-case groundEntityNum == ENTITYNUM_NONE
+        // on the authored floor, which is the symptom of this trace never
+        // producing a walkable hit.  Printed only while jump is held.
+        extern const dvar_t *com_diagMarkers;
+        if ((pm->cmd.buttons & 0x400) != 0 && com_diagMarkers && com_diagMarkers->current.enabled)
+            Com_Printf(0, "GROUND_TRACE origin=(%g %g %g) mins=(%g %g %g) maxs=(%g %g %g) mask=0x%x "
+                       "frac=%g startsolid=%d allsolid=%d walkable=%d normal=(%g %g %g) hitid=%d vel=(%g %g %g) ground=%d\n",
+                       ps->origin[0], ps->origin[1], ps->origin[2],
+                       pm->mins[0], pm->mins[1], pm->mins[2], pm->maxs[0], pm->maxs[1], pm->maxs[2],
+                       pm->tracemask, trace.fraction, trace.startsolid, trace.allsolid, trace.walkable,
+                       trace.normal[0], trace.normal[1], trace.normal[2], Trace_GetEntityHitId(&trace),
+                       ps->velocity[0], ps->velocity[1], ps->velocity[2], ps->groundEntityNum);
+    }
+#endif
 
     if (!trace.allsolid || PM_CorrectAllSolid(pm, pml, &trace))
     {
@@ -4166,7 +4189,7 @@ void __cdecl PM_Footsteps(pmove_t *pm, pml_t *pml)
 
                 iassert(!sprinting || !walking);
 
-                if (player_moveThreshhold->current.value > (double)pm->xyspeed || ps->pm_type == PM_NORMAL_LINKED)
+                if (player_moveThreshhold->current.value > pm->xyspeed || ps->pm_type == PM_NORMAL_LINKED)
                 {
                     PM_Footsteps_NotMoving(pm, iStance);
                 }
@@ -4326,7 +4349,7 @@ int32_t __cdecl PM_Footsteps_TurnAnim(clientInfo_t *ci)
         Com_DPrintf(CON_CHANNEL_PLAYERWEAP, "turn anim end time is %i, time is %i\n", ci->turnAnimEndTime, bgs->time);
     if (ci->legs.yawing)
     {
-        if (ci->torso.yawAngle >= (double)ci->legs.yawAngle)
+        if (ci->torso.yawAngle >= ci->legs.yawAngle)
             turnAdjust = 15;
         else
             turnAdjust = 14;
@@ -4487,7 +4510,7 @@ void __cdecl PM_SetStrafeCondition(pmove_t *pm)
     moveVec[1] = (float)pm->cmd.forwardmove;
     Vec2Normalize(moveVec);
 
-    if (player_strafeAnimCosAngle->current.value >= (double)moveVec[1]
+    if (player_strafeAnimCosAngle->current.value >= moveVec[1]
         && moveVec[1] >= -player_strafeAnimCosAngle->current.value)
     {
         if (pm->cmd.rightmove <= 0)
@@ -4545,7 +4568,7 @@ void __cdecl PM_FoliageSounds(pmove_t *pm)
     ps = pm->ps;
     iassert(ps);
 
-    if (bg_foliagesnd_minspeed->current.value <= (double)pm->xyspeed)
+    if (bg_foliagesnd_minspeed->current.value <= pm->xyspeed)
     {
         iassert(bg_foliagesnd_maxspeed->current.value - bg_foliagesnd_minspeed->current.value > 0.0);
 
@@ -4738,7 +4761,7 @@ void __cdecl PM_CheckLadderMove(pmove_t *pm, pml_t *pml)
                 maxs[2] = pm->maxs[2];
                 maxs[0] = maxs[0] - 6.0;
                 maxs[1] = maxs[1] - 6.0;
-                if ((float)8.0 > (double)maxs[2])
+                if ((float)8.0 > maxs[2])
                     maxs[2] = mins[2];
 
                 iassert(maxs[0] >= mins[0]);
@@ -4907,7 +4930,7 @@ void __cdecl PM_LadderMove(pmove_t *pm, pml_t *pml)
                 fSpeedDrop = fSideSpeed * pml->frametime * 16.0;
                 v6 = I_fabs(fSideSpeed);
                 v5 = I_fabs(fSpeedDrop);
-                if (v5 < (double)v6)
+                if (v5 < v6)
                 {
                     v4 = I_fabs(fSpeedDrop);
                     if (v4 < 1.0)
@@ -4942,7 +4965,7 @@ void __cdecl PM_LadderMove(pmove_t *pm, pml_t *pml)
                 v11 = ps->velocity[0] * ps->velocity[0] + ps->velocity[1] * ps->velocity[1];
                 v2 = ps->velocity[2] * ps->velocity[2];
 
-                if (v2 >= (double)v11)
+                if (v2 >= v11)
                 {
                     fSideSpeed = -50.0;
                     v8 = ps->velocity;

@@ -202,7 +202,18 @@ void __cdecl TRACK_com_math()
 
 float __cdecl random()
 {
-    return (rand() / 32768.0);
+    // Retail divided by 32768.0, which is uniform [0,1) only when RAND_MAX
+    // is 32767 (Win32). glibc/newlib use 2^31-1, so this returned up to
+    // ~65535 and broke every caller (recoil, sound volume/pitch, drops,
+    // view jitter, ...). Scale by the real RAND_MAX (+1 keeps the retail
+    // [0,1) contract: the max draw maps to just under 1, never 1).
+    float r = (float)(rand() / (RAND_MAX + 1.0));
+    // Narrowing the top draws to float can round up to exactly 1.0 (retail
+    // never returned 1.0, and callers like the sound start-offset multiply
+    // assume strictly-inside). Clamp the same way G_GoodRandomFloat does.
+    if (r >= 1.0f)
+        r = 0.99999988f;
+    return r;
 }
 
 float __cdecl crandom()
@@ -3570,13 +3581,6 @@ void ProjectPointOntoVector(const float *point, const float *start, const float 
     vProj[0] = start[0] + t * dir[0];
     vProj[1] = start[1] + t * dir[1];
     vProj[2] = start[2] + t * dir[2];
-}
-
-float Q_fabs(float f) 
-{
-    int tmp = *(int *)&f;
-    tmp &= 0x7FFFFFFF;
-    return *(float *)&tmp;
 }
 
 void vectosignedangles(const float *vec, float *angles)

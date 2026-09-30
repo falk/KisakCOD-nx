@@ -33,6 +33,9 @@ void __cdecl Scr_ReadGameEntry(MemoryFile *memFile);
 void __cdecl Scr_SaveShutdown(bool savegame);
 void __cdecl Scr_LoadPre(int sys, MemoryFile *memFile);
 void __cdecl Scr_LoadShutdown();
+// G_LoadMainState copies com_diagMarkers into this before the script half of a
+// savegame load, so the script TU can report without a dvar dependency.
+extern bool scrLoadDiagEnabled;
 void __cdecl DoSaveEntryInternal(unsigned int type, VariableUnion *u, MemoryFile *memFile);
 void __cdecl Scr_SaveSource(MemoryFile *memFile);
 void __cdecl SaveMemory_SaveWriteImmediate(const void *buffer, unsigned int len, SaveImmediate *save);

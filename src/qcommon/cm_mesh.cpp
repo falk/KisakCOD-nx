@@ -2,6 +2,7 @@
 #include "qcommon.h"
 #include <EffectsCore/fx_system.h>
 #include <xanim/xanim.h>
+#include "cm_cull.h"
 
 void __cdecl CM_TraceThroughAabbTree(const traceWork_t *tw, const CollisionAabbTree *aabbTree, trace_t *trace)
 {
@@ -13,7 +14,7 @@ void __cdecl CM_TraceThroughAabbTree(const traceWork_t *tw, const CollisionAabbT
     {
         oldFraction = trace->fraction;
         CM_TraceThroughAabbTree_r(tw, aabbTree, trace);
-        if (oldFraction > (double)trace->fraction)
+        if (oldFraction > trace->fraction)
         {
             trace->surfaceFlags = materialInfo->surfaceFlags;
             trace->contents = materialInfo->contentFlags;
@@ -22,7 +23,19 @@ void __cdecl CM_TraceThroughAabbTree(const traceWork_t *tw, const CollisionAabbT
     }
 }
 
+// CM_TraceThroughAabbTree_r for a node that already passed CM_CullBox. Each
+// child is culled here before the recursive call: most visited nodes are
+// culled, so this skips a large share of the recursive calls. Same culls,
+// same order, same side effects as the retail recursion.
+static void CM_TraceThroughAabbTreeUnculled_r(const traceWork_t *tw, const CollisionAabbTree *aabbTree, trace_t *trace);
+
 void __cdecl CM_TraceThroughAabbTree_r(const traceWork_t *tw, const CollisionAabbTree *aabbTree, trace_t *trace)
+{
+    if (!CM_CullBoxInline(tw, aabbTree->origin, aabbTree->halfSize))
+        CM_TraceThroughAabbTreeUnculled_r(tw, aabbTree, trace);
+}
+
+static void CM_TraceThroughAabbTreeUnculled_r(const traceWork_t *tw, const CollisionAabbTree *aabbTree, trace_t *trace)
 {
     int borderIndex; // [esp+50h] [ebp-1Ch]
     int childIndex; // [esp+54h] [ebp-18h]
@@ -33,41 +46,39 @@ void __cdecl CM_TraceThroughAabbTree_r(const traceWork_t *tw, const CollisionAab
     int triIndexa; // [esp+64h] [ebp-8h]
     const CollisionPartition *partition; // [esp+68h] [ebp-4h]
 
-    if (!CM_CullBox(tw, aabbTree->origin, aabbTree->halfSize))
+    if (aabbTree->childCount)
     {
-        if (aabbTree->childCount)
+        childIndex = 0;
+        child = &cm.aabbTrees[aabbTree->u.firstChildIndex];
+        while (childIndex < aabbTree->childCount)
         {
-            childIndex = 0;
-            child = &cm.aabbTrees[aabbTree->u.firstChildIndex];
-            while (childIndex < aabbTree->childCount)
-            {
-                CM_TraceThroughAabbTree_r(tw, child, trace);
-                ++childIndex;
-                ++child;
-            }
+            if (!CM_CullBoxInline(tw, child->origin, child->halfSize))
+                CM_TraceThroughAabbTreeUnculled_r(tw, child, trace);
+            ++childIndex;
+            ++child;
         }
-        else
+    }
+    else
+    {
+        partitionIndex = aabbTree->u.firstChildIndex;
+        checkStamp = tw->threadInfo.checkcount.global;
+        if (tw->threadInfo.checkcount.partitions[partitionIndex] != checkStamp)
         {
-            partitionIndex = aabbTree->u.firstChildIndex;
-            checkStamp = tw->threadInfo.checkcount.global;
-            if (tw->threadInfo.checkcount.partitions[partitionIndex] != checkStamp)
+            tw->threadInfo.checkcount.partitions[partitionIndex] = checkStamp;
+            partition = &cm.partitions[partitionIndex];
+            if (tw->isPoint)
             {
-                tw->threadInfo.checkcount.partitions[partitionIndex] = checkStamp;
-                partition = &cm.partitions[partitionIndex];
-                if (tw->isPoint)
+                for (triIndex = partition->firstTri; triIndex < partition->firstTri + partition->triCount; ++triIndex)
+                    CM_TracePointThroughTriangle(tw, &cm.triIndices[3 * triIndex], trace);
+            }
+            else
+            {
+                for (triIndexa = partition->firstTri; triIndexa < partition->firstTri + partition->triCount; ++triIndexa)
+                    CM_TraceCapsuleThroughTriangle(tw, triIndexa, &cm.triIndices[3 * triIndexa], trace);
+                if ((tw->delta[0] != 0.0 || tw->delta[1] != 0.0) && tw->offsetZ != 0.0)
                 {
-                    for (triIndex = partition->firstTri; triIndex < partition->firstTri + partition->triCount; ++triIndex)
-                        CM_TracePointThroughTriangle(tw, &cm.triIndices[3 * triIndex], trace);
-                }
-                else
-                {
-                    for (triIndexa = partition->firstTri; triIndexa < partition->firstTri + partition->triCount; ++triIndexa)
-                        CM_TraceCapsuleThroughTriangle(tw, triIndexa, &cm.triIndices[3 * triIndexa], trace);
-                    if ((tw->delta[0] != 0.0 || tw->delta[1] != 0.0) && tw->offsetZ != 0.0)
-                    {
-                        for (borderIndex = 0; borderIndex < partition->borderCount; ++borderIndex)
-                            CM_TraceCapsuleThroughBorder(tw, &partition->borders[borderIndex], trace);
-                    }
+                    for (borderIndex = 0; borderIndex < partition->borderCount; ++borderIndex)
+                        CM_TraceCapsuleThroughBorder(tw, &partition->borders[borderIndex], trace);
                 }
             }
         }
@@ -76,54 +87,7 @@ void __cdecl CM_TraceThroughAabbTree_r(const traceWork_t *tw, const CollisionAab
 
 bool __cdecl CM_CullBox(const traceWork_t *tw, const float *origin, const float *halfSize)
 {
-    float v4; // [esp+0h] [ebp-78h]
-    float v5; // [esp+4h] [ebp-74h]
-    float v6; // [esp+8h] [ebp-70h]
-    float v7; // [esp+Ch] [ebp-6Ch]
-    float v8; // [esp+10h] [ebp-68h]
-    float v9; // [esp+14h] [ebp-64h]
-    float v10; // [esp+18h] [ebp-60h]
-    float v11; // [esp+1Ch] [ebp-5Ch]
-    float v12; // [esp+20h] [ebp-58h]
-    float v13; // [esp+24h] [ebp-54h]
-    float v14; // [esp+28h] [ebp-50h]
-    float v15; // [esp+2Ch] [ebp-4Ch]
-    float v16; // [esp+34h] [ebp-44h]
-    float v17; // [esp+3Ch] [ebp-3Ch]
-    float v18; // [esp+44h] [ebp-34h]
-    float centerDelta[3]; // [esp+60h] [ebp-18h] BYREF
-    float halfBoxSize[3]; // [esp+6Ch] [ebp-Ch] BYREF
-
-    Vec3Sub(tw->midpoint, origin, centerDelta);
-    Vec3Add(halfSize, tw->size, halfBoxSize);
-    v15 = I_fabs(centerDelta[0]);
-    v14 = halfBoxSize[0] + tw->halfDeltaAbs[0];
-    if (v15 > (double)v14)
-        return 1;
-    v13 = I_fabs(centerDelta[1]);
-    v12 = halfBoxSize[1] + tw->halfDeltaAbs[1];
-    if (v13 > (double)v12)
-        return 1;
-    v11 = I_fabs(centerDelta[2]);
-    v10 = halfBoxSize[2] + tw->halfDeltaAbs[2];
-    if (v11 > (double)v10)
-        return 1;
-    if (tw->axialCullOnly)
-        return 0;
-    v18 = centerDelta[2] * tw->halfDelta[1] - centerDelta[1] * tw->halfDelta[2];
-    v9 = I_fabs(v18);
-    v8 = halfBoxSize[1] * tw->halfDeltaAbs[2] + halfBoxSize[2] * tw->halfDeltaAbs[1];
-    if (v9 > (double)v8)
-        return 1;
-    v17 = centerDelta[0] * tw->halfDelta[2] - centerDelta[2] * tw->halfDelta[0];
-    v7 = I_fabs(v17);
-    v6 = halfBoxSize[2] * tw->halfDeltaAbs[0] + halfBoxSize[0] * tw->halfDeltaAbs[2];
-    if (v7 > (double)v6)
-        return 1;
-    v16 = centerDelta[1] * tw->halfDelta[0] - centerDelta[0] * tw->halfDelta[1];
-    v5 = I_fabs(v16);
-    v4 = halfBoxSize[0] * tw->halfDeltaAbs[1] + halfBoxSize[1] * tw->halfDeltaAbs[0];
-    return v5 > (double)v4;
+    return CM_CullBoxInline(tw, origin, halfSize);
 }
 
 void __cdecl CM_TracePointThroughTriangle(const traceWork_t *tw, const uint16_t *indices, trace_t *trace)
@@ -152,7 +116,7 @@ void __cdecl CM_TracePointThroughTriangle(const traceWork_t *tw, const uint16_t 
         {
             Vec3Cross(tw->delta, v0_start, tracePlaneScaledNormal);
             v = Vec3Dot(tracePlaneScaledNormal, v0_v1);
-            if (v <= 0.0 && projTriAreaScaledByTraceLenX2 <= (double)v)
+            if (v <= 0.0 && projTriAreaScaledByTraceLenX2 <= v)
             {
                 negativeU = Vec3Dot(tracePlaneScaledNormal, v0_v2);
                 if (negativeU >= 0.0 && projTriAreaScaledByTraceLenX2 <= v - negativeU)
@@ -241,7 +205,7 @@ void __cdecl CM_TraceCapsuleThroughTriangle(
         if (hitDist >= 0.0)
         {
             hitFrac = -((hitDist - 0.125f) / projTriAreaScaledByTraceLenX2) * areaX2;
-            if (trace->fraction <= (double)hitFrac)
+            if (trace->fraction <= hitFrac)
                 return;
             startSolid = 0;
         }
@@ -409,7 +373,7 @@ SphereEdgeTraceResult __cdecl CM_TraceSphereThroughEdge(
     if (fracLeave < 0.0)
         return SPHERE_MISSES_EDGE;
     fracEnter = t - f;
-    if (trace->fraction <= (double)fracEnter)
+    if (trace->fraction <= fracEnter)
         return SPHERE_MISSES_EDGE;
     if (fracEnter >= 0.0)
     {
@@ -417,7 +381,7 @@ SphereEdgeTraceResult __cdecl CM_TraceSphereThroughEdge(
         scaledProjectionDista = -Vec3Dot(hitDelta, v0_v1);
         if (scaledProjectionDista > 0.0)
         {
-            if (edgeLenSq > (double)scaledProjectionDista)
+            if (edgeLenSq > scaledProjectionDista)
             {
                 v8 = scaledProjectionDista / edgeLenSq;
                 Vec3Mad(hitDelta, v8, v0_v1, scaledNormal);
@@ -506,7 +470,7 @@ bool __cdecl Vec3IsNormalizedEpsilon(const float *v, float epsilon)
     v5 = Vec3LengthSq(v) - 1.0;
     v4 = epsilon * 2.0;
     v3 = I_fabs(v5);
-    return v3 < (double)v4;
+    return v3 < v4;
 }
 
 void __cdecl CM_TraceSphereThroughVertex(
@@ -662,7 +626,7 @@ void __cdecl CM_TraceCapsuleThroughBorder(const traceWork_t *tw, CollisionBorder
     v21 = border->distEq[1] * tw->extents.start[1] + border->distEq[0] * tw->extents.start[0];
     traceStartDist = v21 - border->distEq[2];
     t = (radius - traceStartDist) / traceDeltaDot;
-    if (trace->fraction <= (double)t || -radius > t * tw->deltaLen)
+    if (trace->fraction <= t || -radius > t * tw->deltaLen)
         return;
     Vec3Mad(tw->extents.start, t, tw->delta, endpos);
     s = border->distEq[1] * endpos[0] - border->distEq[0] * endpos[1] - border->start;
@@ -688,7 +652,7 @@ void __cdecl CM_TraceCapsuleThroughBorder(const traceWork_t *tw, CollisionBorder
             iassert( tw->offsetZ >= 0 );
             v26 = edgePoint_8 - tw->extents.start[2];
             v20 = I_fabs(v26);
-            if (tw->offsetZ >= (double)v20)
+            if (tw->offsetZ >= v20)
             {
                 v25 = border->distEq[1];
                 trace->normal[0] = border->distEq[0];
@@ -703,7 +667,7 @@ void __cdecl CM_TraceCapsuleThroughBorder(const traceWork_t *tw, CollisionBorder
                 trace->walkable = 0;
                 trace->fraction = 0.0;
                 v19 = tw->radius * tw->radius;
-                if (offsetLenSq < (double)v19)
+                if (offsetLenSq < v19)
                     trace->startsolid = 1;
             }
             return;
@@ -721,7 +685,7 @@ void __cdecl CM_TraceCapsuleThroughBorder(const traceWork_t *tw, CollisionBorder
                 tw->deltaLenSq);
         v18 = sqrt(discriminant);
         t = (-deltaDotOffset - v18) / tw->deltaLenSq;
-        if (trace->fraction <= (double)t || t <= 0.0)
+        if (trace->fraction <= t || t <= 0.0)
             return;
         Vec3Mad(tw->extents.start, t, tw->delta, endpos);
         s = 0.0;
@@ -733,7 +697,7 @@ void __cdecl CM_TraceCapsuleThroughBorder(const traceWork_t *tw, CollisionBorder
             MyAssertHandler(".\\qcommon\\cm_mesh.cpp", 1278, 0, "%s\n\t%s", "tw->offsetZ == tw->size[2] - tw->radius", v7);
         }
         iassert( tw->offsetZ >= 0 );
-        if (tw->offsetZ >= (double)edgeZ)
+        if (tw->offsetZ >= edgeZ)
         {
             if (edgeZ >= -tw->offsetZ)
             {
@@ -761,7 +725,7 @@ void __cdecl CM_TraceCapsuleThroughBorder(const traceWork_t *tw, CollisionBorder
             else
             {
                 v13 = -tw->offsetZ - tw->radius;
-                if (edgeZ > (double)v13)
+                if (edgeZ > v13)
                 {
                     offsetZb = -tw->offsetZ;
                     CM_TraceSphereThroughBorder(tw, border, offsetZb, trace);
@@ -771,12 +735,12 @@ void __cdecl CM_TraceCapsuleThroughBorder(const traceWork_t *tw, CollisionBorder
         else
         {
             v14 = tw->offsetZ + tw->radius;
-            if (edgeZ < (double)v14)
+            if (edgeZ < v14)
                 CM_TraceSphereThroughBorder(tw, border, tw->offsetZ, trace);
         }
         return;
     }
-    if (border->length >= (double)s)
+    if (border->length >= s)
     {
         if (t < 0.0)
             t = 0.0;
@@ -802,7 +766,7 @@ void __cdecl CM_TraceCapsuleThroughBorder(const traceWork_t *tw, CollisionBorder
         iassert( tw->offsetZ >= 0 );
         v24 = tw->extents.start[2] - edgePoint_8a;
         v17 = I_fabs(v24);
-        if (tw->offsetZ >= (double)v17)
+        if (tw->offsetZ >= v17)
         {
             v23 = border->distEq[1];
             trace->normal[0] = border->distEq[0];
@@ -817,7 +781,7 @@ void __cdecl CM_TraceCapsuleThroughBorder(const traceWork_t *tw, CollisionBorder
             trace->walkable = 0;
             trace->fraction = 0.0;
             v16 = tw->radius * tw->radius;
-            if (offsetLenSq < (double)v16)
+            if (offsetLenSq < v16)
                 trace->startsolid = 1;
         }
         return;
@@ -835,7 +799,7 @@ void __cdecl CM_TraceCapsuleThroughBorder(const traceWork_t *tw, CollisionBorder
                 tw->deltaLenSq);
         v15 = sqrt(discriminanta);
         t = (-deltaDotOffseta - v15) / tw->deltaLenSq;
-        if (trace->fraction > (double)t && t > 0.0)
+        if (trace->fraction > t && t > 0.0)
         {
             Vec3Mad(tw->extents.start, t, tw->delta, endpos);
             s = border->length;
@@ -919,7 +883,7 @@ void __cdecl CM_PositionTestInAabbTree_r(const traceWork_t *tw, CollisionAabbTre
     CollisionAabbTree *child; // [esp+10h] [ebp-Ch]
     int checkStamp; // [esp+14h] [ebp-8h]
 
-    if (!CM_CullBox(tw, aabbTree->origin, aabbTree->halfSize))
+    if (!CM_CullBoxInline(tw, aabbTree->origin, aabbTree->halfSize))
     {
         if (aabbTree->childCount)
         {
@@ -968,7 +932,7 @@ void __cdecl CM_PositionTestCapsuleInTriangle(const traceWork_t *tw, const uint1
     {
         distSq = CM_DistanceSquaredFromPointToTriangle(tw->extents.start, indices);
         v3 = tw->radius * tw->radius;
-        if (distSq < (double)v3)
+        if (distSq < v3)
         {
             trace->fraction = 0.0;
             trace->startsolid = 1;
@@ -1110,7 +1074,7 @@ void __cdecl CM_ClosestPointOnTri(
             return;
         }
         denom = a00 - a01 * 2.0 + a11;
-        if (denom <= (double)numer)
+        if (denom <= numer)
         {
             Vec3MadMad(v0, 1.0, e0, 0.0, e1, ptOnTri);
             return;
@@ -1211,7 +1175,7 @@ bool __cdecl CM_DoesCapsuleIntersectTriangle(
     float pt[3]; // [esp+13Ch] [ebp-2Ch] BYREF
     double cutoffDistSq; // [esp+148h] [ebp-20h]
     double scaleSq; // [esp+150h] [ebp-18h]
-    long double scaledDist[2]; // [esp+158h] [ebp-10h]
+    double scaledDist[2]; // [esp+158h] [ebp-10h]
 
     v0 = cm.verts[*indices];
     v1 = cm.verts[indices[1]];
@@ -1306,14 +1270,14 @@ bool __cdecl CM_DoesCapsuleIntersectTriangle(
     }
     Vec3Sub(end, start, delta);
     distSqToEdge = CM_DistanceSquaredBetweenSegments(start, delta, v0, v1_v0);
-    if (radiusSq > (double)distSqToEdge)
+    if (radiusSq > distSqToEdge)
         return 1;
     distSqToEdge = CM_DistanceSquaredBetweenSegments(start, delta, v0, v2_v0);
-    if (radiusSq > (double)distSqToEdge)
+    if (radiusSq > distSqToEdge)
         return 1;
     Vec3Sub(v2, v1, v2_v1);
     distSqToEdge = CM_DistanceSquaredBetweenSegments(start, delta, v1, v2_v1);
-    return radiusSq > (double)distSqToEdge;
+    return radiusSq > distSqToEdge;
 }
 
 double __cdecl CM_DistanceSquaredBetweenSegments(

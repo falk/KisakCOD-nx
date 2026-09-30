@@ -92,6 +92,9 @@ void __cdecl R_SetShadowableLight(
     const GfxMatrix *lookupMatrix; // [esp+48h] [ebp-8h]
     LightHasShadowMap hasShadowMap; // [esp+4Ch] [ebp-4h]
 
+    // A bring-up diagnostic that formatted viewInfo->shadowableLights
+    // on every lit draw was removed: it dereferenced the same possibly-bad
+    // viewInfo the real path guards, so it could fault before the guard.
     if (shadowableLightIndex >= 0xFF)
         MyAssertHandler(
             ".\\r_draw_shadowablelight.cpp",
@@ -100,11 +103,24 @@ void __cdecl R_SetShadowableLight(
             "shadowableLightIndex doesn't index GFX_MAX_PRIMARY_LIGHTS\n\t%i not in [0, %i)",
             shadowableLightIndex,
             255);
+    if (!viewInfo || shadowableLightIndex >= viewInfo->shadowableLightCount)
+    {
+        static unsigned s_lightDbg = 0;
+        if (s_lightDbg < 24u)
+        {
+            ++s_lightDbg;
+            
+        }
+    }
     if (source->shadowableLightIndex != shadowableLightIndex)
     {
         source->shadowableLightIndex = shadowableLightIndex;
         if (shadowableLightIndex)
         {
+            // Directional and disabled primary-light slots deliberately
+            // carry no attenuation definition.  Only omni/spot lights need
+            // a LightDef below; their absence remains a loud failure rather
+            // than a fallback bind.
             if (shadowableLightIndex >= viewInfo->shadowableLightCount)
                 MyAssertHandler(
                     ".\\r_draw_shadowablelight.cpp",
@@ -124,6 +140,15 @@ void __cdecl R_SetShadowableLight(
             else
             {
                 def = viewInfo->shadowableLights[shadowableLightIndex].def;
+                if (!def)
+                {
+                    static int s_nullDef = 0;
+                    if (s_nullDef < 16)
+                    {
+                        ++s_nullDef;
+                        
+                    }
+                }
                 falloffShift = (double)def->lmapLookupStart * 0.001953125;
                 falloffScale = (double)def->attenuation.image->width * 0.001953125;
                 R_UpdateCodeConstant(source, CONST_SRC_CODE_LIGHT_FALLOFF_PLACEMENT, falloffScale, 0.0, falloffShift, 0.0);
@@ -175,7 +200,18 @@ void __cdecl R_SetDrawSurfsShadowableLight(GfxCmdBufSourceState *source, const G
         if (shadowableLightIndex)
             R_SetShadowableLight(source, shadowableLightIndex, info->viewInfo);
         else
+        {
+            if (!light->def || (light->type != 1 && !light->def->attenuation.image))
+            {
+                static int s_partDefNull = 0;
+                if (s_partDefNull < 16)
+                {
+                    ++s_partDefNull;
+                    
+                }
+            }
             R_SetLightProperties(source, light, light->def, LIGHT_HAS_NO_SHADOWMAP, 0.0);
+        }
     }
 }
 
@@ -200,4 +236,3 @@ uint32_t __cdecl R_GetShadowableLightIndex(
 
     return comWorld.primaryLightCount;
 }
-

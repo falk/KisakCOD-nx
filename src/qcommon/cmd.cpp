@@ -9,7 +9,11 @@
 #include "threads.h"
 
 #include <database/database.h>
+#ifndef __SWITCH__
 #include <win32/win_local.h>
+#else
+#include <universal/critical_section.h>
+#endif
 #include <universal/com_files.h>
 #include <script/scr_debugger.h>
 #include <server/sv_game.h>
@@ -271,7 +275,7 @@ void Cmd_Dumpraw_f(void)
 {
     auto DumpFileType = [](XAssetType type) -> void
     {
-		auto rawDir = std::format("{}\\raw\\", (char*)fs_basepath->current.integer);
+		auto rawDir = std::format("{}\\raw\\", fs_basepath->current.string);
 
         XAssetHeader files[10000]{ 0 };
 		int read = DB_GetAllXAssetOfType_FastFile(type, files, 10000);
@@ -390,7 +394,7 @@ void Cmd_Dumpraw_f(void)
 		}
     }; 
 
-    auto zoneDir = std::format("{}\\zone\\english\\", (char *)fs_basepath->current.integer);
+    auto zoneDir = std::format("{}\\zone\\english\\", fs_basepath->current.string);
 
 
     // just dump from common ff's
@@ -1389,6 +1393,23 @@ void Cmd_RegisterNotification(const char *commandString, const char *notifyStrin
     uint32_t commandID = SL_GetLowercaseString(commandString, 0);
     uint32_t notifyID  = SL_GetString(notifyString, 0);
 
+    // keyHint() registers `notifyOnCommand("did_action_<action>", <binding>)`
+    // here and blocks waiting for that notify. On retail PC/console the
+    // player's fire/ads/... inputs are executed as console commands, so the
+    // notification fires; the Switch pad drives usercmd buttons instead (see
+    // src/platform/switch/switch_input.c's menu-only key table), so unless
+    // something executes the command a GSC thread waiting on it parks
+    // forever. Log the registrations so a stuck hint's command is visible.
+    {
+        static uint32_t s_regNotifyLog = 0;
+        if (s_regNotifyLog < 64)
+        {
+            ++s_regNotifyLog;
+            Com_Printf(0, "KISAK_CMDREG command=%s notify=%s n=%u\n", commandString, notifyString,
+                       s_regNotifyLog);
+        }
+    }
+
     // Already registered? Drop the extra refs and bail.
     for (int i = 0; i < cmd_notifyCount; ++i)
     {
@@ -1431,8 +1452,92 @@ void Cmd_CheckNotify()
     for (int i = 0; i < cmd_notifyCount; ++i)
     {
         if (cmd_notify[i].command == commandID)
+        {
+            // Killhouse hip-fire objective (see Cmd_RegisterNotification): the
+            // missing half of the evidence -- which console commands actually
+            // execute on the Switch pad, and which hint notification each one
+            // delivers. `+attack` here is what frees rifle_hip_shooting()'s
+            // blocking keyHint("pc_hip_attack").
+            {
+                static uint32_t s_checkNotifyLog = 0;
+                if (s_checkNotifyLog < 64)
+                {
+                    ++s_checkNotifyLog;
+                    Com_Printf(0, "KISAK_CMDNOTIFY arg0=%s notify=%s n=%u\n", Cmd_Argv(0),
+                               SL_ConvertToString(cmd_notify[i].notify), s_checkNotifyLog);
+                }
+            }
             G_AddCommandNotify(cmd_notify[i].notify);
+        }
     }
+}
+
+int Cmd_CollectNotificationsForCommand(const char *commandString, uint16_t *notifies, int maxNotifies)
+{
+    if (cmd_notifyCount == 0 || !commandString || !*commandString || !notifies || maxNotifies <= 0)
+        return 0;
+
+    uint32_t commandID = SL_FindLowercaseString(commandString);
+    if (!commandID)
+        return 0;
+
+    int count = 0;
+    for (int i = 0; i < cmd_notifyCount; ++i)
+    {
+        if (cmd_notify[i].command == commandID)
+        {
+            if (count < maxNotifies)
+                notifies[count] = cmd_notify[i].notify;
+            ++count;
+        }
+    }
+    return count;
+}
+
+// The Switch pad drives usercmd buttons, not console commands, so
+// notifyOnCommand() registrations -- which the mission scripts use to gate
+// objectives on "the player used this action" (killhouse_code.gsc keyHint()
+// waits on did_action_<action>, blocking, with no timeout) -- never fire from a
+// pad press. This is the pad's equivalent of Cmd_CheckNotify() running: the
+// caller names the retail binding the button stands for, and every script
+// notification registered against that command is delivered without executing
+// the command itself (the gameplay effect already happened through the usercmd
+// bits the same seam sets).
+void Cmd_NotifyScriptCommand(const char *commandString)
+{
+    if (cmd_notifyCount == 0 || !commandString || !*commandString)
+        return;
+    if (cl_paused->current.integer)
+        return;
+
+    uint16_t notifies[CMD_NOTIFY_MAX];
+    const int count = Cmd_CollectNotificationsForCommand(commandString, notifies, CMD_NOTIFY_MAX);
+    if (count == 0)
+        return;
+
+    // G_AddCommandNotify() takes the notify's parameters from the in-flight
+    // command (cmd_args.argc[nesting] and Cmd_Argv(i)). A command execution
+    // always has a valid frame there; a pad edge does not -- between commands
+    // cmd_args.nesting is -1, which is what tripped the cmd.h:160 assert on
+    // hardware. Lend it a one-argument frame
+    // whose argv[0] is the binding name -- exactly what executing that command
+    // would have delivered -- without going through the tokenizer, whose arg
+    // pool bookkeeping belongs to Cmd_ExecuteSingleCommand.
+    const int savedNesting = cmd_args.nesting;
+    const int savedArgc0 = cmd_args.argc[0];
+    const char **savedArgv0 = cmd_args.argv[0];
+    const char *borrowedArgv[1];
+    borrowedArgv[0] = commandString;
+    cmd_args.nesting = 0;
+    cmd_args.argc[0] = 1;
+    cmd_args.argv[0] = borrowedArgv;
+
+    for (int i = 0; i < count && i < CMD_NOTIFY_MAX; ++i)
+        G_AddCommandNotify(notifies[i]);
+
+    cmd_args.argv[0] = savedArgv0;
+    cmd_args.argc[0] = savedArgc0;
+    cmd_args.nesting = savedNesting;
 }
 
 void Cmd_LoadNotifications(MemoryFile *memFile)
