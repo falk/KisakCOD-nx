@@ -39,7 +39,7 @@ if [ ! -s "$log" ]; then
     echo "FAIL:DEKO9_SELFTEST_RUN emulator run produced no log (rc=$rc)"
     exit 1
 fi
-grep -aE 'DEKO9_SELFTEST|DEKO9 gpupass|DEKO9 fsr frames' "$log" | sed 's/.*OutputDebugString: //'
+grep -aE 'DEKO9_SELFTEST|DEKO9 gpupass|DEKO9 fsr frames|DEKO9 taau frames' "$log" | sed 's/.*OutputDebugString: //'
 grep -aqE 'PASS:DEKO9_SELFTEST$' "$log"
 # Per-pass GPU timing reported for the marked present loop.
 grep -aqE 'DEKO9 gpupass frames=60 total=.* lit=.* hud2d=.* present=' "$log" || {
@@ -60,6 +60,11 @@ for mode in sgsr bilinear_rcas bilinear; do
         exit 1
     }
 done
+# TAAU resolve (Deko9_TaauResolve) timed by the device.
+grep -aqE 'DEKO9 taau frames=60 gpu=[0-9.]+ms .* samples=[1-9]' "$log" || {
+    echo "FAIL:DEKO9_SELFTEST_TAAU_TIMING (no taau timing line with samples)"
+    exit 1
+}
 # Draw census (r_deko9DrawCensus): the hud2d quad row writes 640x360 samples
 # per draw, and the lights line counts the 2 lights in view / 1 drawn light.
 grep -aE 'DEKO9 dcensus label=selftest' "$log" | sed 's/.*OutputDebugString: //'
@@ -84,3 +89,10 @@ grep -aE 'DEKO9 dcensus label=selftest pass=decal ' "$log" |
     exit 1
 }
 echo "PASS:DEKO9_SELFTEST_DRAW_CENSUS"
+# Every draw recorded under r_deko9FaultTrace passed the black box's VA check.
+if grep -aq 'FAIL:DEKO9_DRAW_VA' "$log"; then
+    grep -a 'FAIL:DEKO9_DRAW_VA' "$log" | head -3
+    echo "FAIL:DEKO9_SELFTEST_DRAW_VA (a recorded draw's VA is outside every heap)"
+    exit 1
+fi
+echo "PASS:DEKO9_SELFTEST_DRAW_VA"

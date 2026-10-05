@@ -126,8 +126,20 @@ kisak_host_test(core-gyro-asan
     SOURCES ${H}/switch_gyro_test.cpp LIBS host_asan_ubsan
     COMPILE_OPTIONS -std=c++17 -O1 -Wall -Wextra -Werror LABELS "core"
     ENV "ASAN_OPTIONS=detect_leaks=0")
+kisak_host_test(core-pad-layout-asan
+    SOURCES ${H}/switch_pad_layout_test.cpp LIBS host_asan_ubsan
+    COMPILE_OPTIONS -std=c++17 -O1 -Wall -Wextra -Werror LABELS "core"
+    ENV "ASAN_OPTIONS=detect_leaks=0")
 kisak_host_test(core-rumble-asan
     SOURCES ${H}/switch_rumble_test.cpp LIBS host_asan_ubsan
+    COMPILE_OPTIONS -std=c++17 -O1 -Wall -Wextra -Werror LABELS "core"
+    ENV "ASAN_OPTIONS=detect_leaks=0")
+kisak_host_test(core-rumble-hd-asan
+    SOURCES ${H}/switch_rumble_hd_test.cpp LIBS host_asan_ubsan
+    COMPILE_OPTIONS -std=c++17 -O1 -Wall -Wextra -Werror LABELS "core"
+    ENV "ASAN_OPTIONS=detect_leaks=0")
+kisak_host_test(core-menu-asan
+    SOURCES ${H}/switch_menu_test.cpp LIBS host_asan_ubsan
     COMPILE_OPTIONS -std=c++17 -O1 -Wall -Wextra -Werror LABELS "core"
     ENV "ASAN_OPTIONS=detect_leaks=0")
 kisak_host_test(core-handheld-perfconfig-asan
@@ -209,7 +221,7 @@ kisak_host_test(core-switch-perf-asan
     SOURCES ${H}/switch_perf_test.cpp ${S}/port/switch_perf.cpp
     LIBS host_asan_ubsan
     COMPILE_OPTIONS -std=c++11 -Wall -Wextra -Werror
-    DEFINES KISAK_SP
+    DEFINES KISAK_SP KISAK_PERF_SITES=1
     LABELS "core")
 
 kisak_host_test(core-switch-crash-asan

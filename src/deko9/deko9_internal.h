@@ -48,8 +48,12 @@ extern "C" {
 #include "deko9_gpufault.h"
 #include "deko9_lock.h"
 #include "deko9_shader.h"
+#include "deko9_shader_stats.h"
 #include "deko9_state_map.h"
+#include "deko9_taau.h"
+#include "deko9_variant_plan.h"
 #include "deko9_native.h"
+#include "deko9_rename.h"
 
 struct Deko9Counters; // deko9_native.h
 struct Deko9IndexRange; // deko9_native.h
@@ -93,6 +97,9 @@ public:
     // [addr, addr + size) lies inside one of this heap's live memblocks
     // (the pitch mapping; images are addressed through their views).
     bool Contains(DkGpuAddr addr, uint32_t size) const;
+    // Image memblocks: the pitch range and the generic / compressed aliases
+    // the kernel maps right after it (image descriptors address those).
+    bool ContainsWithAliases(DkGpuAddr addr) const;
     uint64_t BytesInUse() const { return m_inUse; }
     uint64_t BytesReserved() const { return m_reserved; }
     void Destroy();
@@ -174,6 +181,9 @@ struct ImageStore
     GpuAlloc memory;
     uint32_t descriptor = UINT32_MAX; // sampling view, all mips
     bool compressed = false;          // DkImageFlags_HwCompression (render/depth targets)
+    // GPU size at creation: ResizeStore re-lays the image out inside the
+    // memory it was created with, so this size always stays reachable.
+    uint32_t capacityWidth = 0, capacityHeight = 0;
     // S4a (task/deko9-static-hazards): true for a store ever used as a
     // render, depth, copy-source-of-render or blit target -- set at creation
     // from D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL (CreateStore) and
@@ -393,8 +403,12 @@ public:
     uint32_t Size() const { return m_size; }
     DWORD Usage() const { return m_usage; }
     D3DPOOL PoolKind() const { return m_pool; }
+    // The recording thread's stamp at each draw that binds the buffer (the
+    // open list reads it); false (also counted and reported by the device)
+    // when another thread holds the buffer locked.
+    bool StampUse(Device *device, uint64_t seq);
     // Last open-list sequence that read this buffer.
-    uint64_t lastUse = 0;
+    uint64_t LastUse() const { return m_use.LastUse(); }
     // Stable role label (e.g. "dynamicVB", "preTessIB"; Deko9_SetBufferRole,
     // set once at creation from r_buffers.cpp/r_staticmodelcache.cpp) for the
     // r_deko9Census dynamic-buffer table. Null: bucketed by size/usage/pool.
@@ -421,8 +435,10 @@ private:
     uint32_t m_size = 0;
     DWORD m_usage = 0;
     D3DPOOL m_pool = D3DPOOL_DEFAULT;
-    bool m_locked = false;
+    BufferUse m_use; // last reading list + lock holder (crosses threads)
     bool m_window = false;
+    // Moved-from memory kept for reuse once its stamp completed (Lock).
+    RenameSpares<GpuAlloc> m_spares;
 };
 
 class VertexBuffer final : public Object<Deko9Default_IDirect3DVertexBuffer9>
@@ -486,6 +502,7 @@ struct ShaderVariant
     // Pixel shaders with a depth-compare sampler: the r_shadowFilter
     // translation (Deko9_TranslateShader shadowFilter); 0 = retail.
     uint32_t shadowFilter = 0;
+    uint32_t shaderOpt = 0; // r_deko9ShaderOpt bits the translation used
     mutable bool bound = false; // logged on first bind
     DkShader shader;
     GpuAlloc code;
@@ -498,25 +515,47 @@ struct ShaderVariant
 class ShaderBase
 {
 public:
-    bool Init(Device *device, const DWORD *function, Deko9Stage stage, std::string *error);
+    // Creation in two halves so the translation and compile never hold the
+    // device lock: Prepare (any thread, no lock) parses the bytecode, learns
+    // its info and builds the base variant's DKSH; Finish (device lock held)
+    // assigns the id and installs that variant.
+    bool Prepare(Device *device, const DWORD *function, Deko9Stage stage, uint32_t shaderOpt,
+                 std::vector<uint8_t> *baseDksh, std::string *error);
+    bool Finish(Device *device, const std::vector<uint8_t> &baseDksh, uint32_t shaderOpt, std::string *error);
+    // The selectors for this shader's stage under the device's current
+    // r_shadowFilter / r_deko9ShaderOpt (device lock held).
+    VariantSelect Select(const Device *device, uint32_t shadowMask, const InstanceLayout &instance, bool earlyZ) const;
+    // The installed variant for `select`, or null (device lock held).
+    const ShaderVariant *Find(const VariantSelect &select) const;
+    // The DKSH of `select`: a shader-pack hit, else MojoShader + UAM (and
+    // appended to the pack). Reads only immutable shader state and the
+    // process-wide pack, so it runs on any thread without the device lock.
+    bool BuildCode(Device *device, const VariantSelect &select, std::vector<uint8_t> *dksh,
+                   bool *packHit = nullptr) const;
+    // Loads `dksh` as the variant for `select` (device lock held); returns
+    // the existing one if another thread installed it first.
+    const ShaderVariant *Install(Device *device, const VariantSelect &select, const std::vector<uint8_t> &dksh);
     // Returns the compiled variant for the given depth-compare sampler mask
     // (and, for vertex shaders, instance register layout; for pixel shaders,
-    // early fragment tests), translating and compiling (or loading from the
-    // SD cache) on first use.
+    // early fragment tests), building and installing it with the device lock
+    // held when it does not exist yet (*built is then true).
     const ShaderVariant *Variant(Device *device, uint32_t shadowMask, const InstanceLayout &instance = {},
-                                 bool earlyZ = false);
+                                 bool earlyZ = false, bool *built = nullptr);
     void ReleaseMemory(Device *device);
     const Deko9ShaderInfo &Info() const { return m_info; }
     const std::vector<uint8_t> &Bytecode() const { return m_bytecode; }
     uint64_t Hash() const { return m_hash; }
-    uint32_t id;
+    Deko9Stage Stage() const { return m_stage; }
+    uint32_t id = 0;
 
 private:
+    bool Valid(const VariantSelect &select) const;
+
     std::vector<uint8_t> m_bytecode;
     uint64_t m_hash = 0;
     Deko9Stage m_stage = DEKO9_STAGE_VERTEX;
     Deko9ShaderInfo m_info{};
-    std::vector<std::unique_ptr<ShaderVariant>> m_variants;
+    VariantSet<ShaderVariant> m_variants; // device lock held
 };
 
 class VertexShader final : public Object<Deko9Default_IDirect3DVertexShader9>
@@ -601,6 +640,7 @@ struct ProgramUnit
     const ShaderVariant *vs, *ps;
     std::vector<uint32_t> shaderWords; // dkCmdBufBindShaders
     std::vector<uint32_t> attribWords; // dkCmdBufBindVtxAttribState
+    uint64_t bakeNs = 0; // BakeProgram time (device lock held), for the first-bind accounting
 };
 
 struct SamplerKey
@@ -710,6 +750,7 @@ public:
     // Applies the engine's packed sampler state (see ApplyEngineSamplerState)
     // and returns the engine's resulting tracked state.
     uint32_t SetSamplerPacked(uint32_t slot, uint32_t packed, uint32_t oldPacked);
+    void SetEngineLodBias(float bias);
     void ForgetTexture(IDirect3DBaseTexture9 *texture);
     // Vertex/index buffer slots are non-owning too (no COM AddRef/Release
     // per SetStreamSource/SetIndices): a buffer destroyed while bound is
@@ -795,9 +836,31 @@ public:
     }
     void SetHrpRules(uint32_t rules) { m_hrp.rules = rules; }
     uint64_t HrpZcullInvalidates() const { return m_hrp.zcullInvalidates; }
+    void HrpFullBarrier();
+    uint64_t HrpFullBarriers() const { return m_hrp.fullBarriers; }
+    bool ReadHrpConstants(uint32_t depth[8], uint32_t composite[12]) const
+    {
+        if (!m_hrp.depthConstants.cpu || !m_hrp.compositeConstants.cpu)
+            return false;
+        std::memcpy(depth, m_hrp.depthConstants.cpu, 8 * sizeof(uint32_t));
+        std::memcpy(composite, m_hrp.compositeConstants.cpu, 12 * sizeof(uint32_t));
+        return true;
+    }
     bool LoadHrpPrograms(std::string *error);
     // Sampling view of a depth-stencil store (dsSource depth), created once.
     bool EnsureDepthDescriptor(ImageStore *depth);
+    // Deko9_TaauResolve: `color`'s srcRect (with `depth`, same size) ->
+    // dstRect of `dst` through the history; sharpenStops >= 0 adds an RCAS
+    // pass from the new history into `dst`.
+    bool TaauResolve(ImageStore *color, Surface *depth, const int32_t srcRect[4], Surface *dst,
+                     const int32_t dstRect[4], const TaauFrame &frame, std::string *error);
+    // Deko9_TaauMotion: the object motion texture for the next TaauResolve.
+    bool TaauMotion(Surface *depth, const int32_t srcRect[4], const TaauMotionView &view,
+                    const TaauMotionDraw *draws, uint32_t count, std::string *error);
+    // Deko9_TaauOpaque: the transparents' luma change for the next
+    // TaauResolve (before them, then after; `half` sizes the image).
+    bool TaauOpaque(ImageStore *color, const int32_t srcRect[4], bool after, bool half, std::string *error);
+    void ReleaseTaau();
     // After a native full-screen pass: the next D3D draw re-applies targets,
     // viewport, pipeline, textures and vertex input.
     void EndNativePass();
@@ -805,6 +868,12 @@ public:
     // discard (or draw with the alpha test on) use their early-Z variant for
     // draws that test but write neither depth nor stencil
     // (RasterAllowsEarlyZ), outside occlusion queries.
+    // Deko9_SetDrawProbe.
+    void SetDrawProbe(uint32_t flags, uint32_t split)
+    {
+        m_probe.flags = flags;
+        m_probe.split = split;
+    }
     void SetPerDraw(uint32_t flags)
     {
         if (flags == m_perDraw)
@@ -833,11 +902,33 @@ public:
         ForgetBoundShaders();
     }
     uint32_t ShadowFilter() const { return m_shadowFilter; }
+    // r_deko9ShaderOpt (deko9_native.h Deko9_SetShaderOpt): the translation
+    // options every variant is looked up / compiled with; a change drops
+    // the baked program units like SetShadowFilter.
+    void SetShaderOpt(uint32_t mask)
+    {
+        mask &= DEKO9_SHADER_OPT_ALL;
+        if (mask == m_shaderOpt)
+            return;
+        m_shaderOpt = mask;
+        m_programUnits.Clear();
+        m_program = nullptr;
+        m_recorded.attribs = false;
+        m_dirtyAttribs = true;
+        ForgetBoundShaders();
+    }
+    uint32_t ShaderOpt() const { return m_shaderOpt; }
     void SetEarlyZ(bool enable)
     {
         if (enable != m_earlyZ)
             m_earlyZ = enable, m_dirtyEarlyZ = true;
     }
+    bool EarlyZEnabled() const { return m_earlyZ; }
+    // Deko9_PrebakeVariants: builds every variant the passes can select
+    // (deko9_variant_plan.h) off the device lock, on a compile thread when
+    // one can be started, and installs them; returns false only on bad input.
+    bool PrebakeVariants(const Deko9PassVariants *passes, uint32_t count, int cpuId, int priority,
+                         Deko9PrebakeResult *result);
     // Occlusion query BEGIN (+1) / END or release (-1): the early-Z variant
     // would count discarded fragments as passed samples, so it is off while
     // one is open.
@@ -854,6 +945,9 @@ public:
     // 1 = 3D-only hazards use DkBarrier_Primitives + texture-cache invalidate;
     // 2 = 3D-only hazards use DkBarrier_Fragments + texture-cache invalidate.
     void SetBarrierMode(uint32_t mode) { m_barrierMode = mode <= 2 ? mode : 0; }
+    // r_deko9TiledCache: 0 off; 1 = Maxwell tiled caching with 128x128 tiles;
+    // 2 = 64x64 tiles. Applied at the start of the next command list.
+    void SetTiledCache(uint32_t mode) { m_tiledWanted = mode <= 2 ? mode : 0; }
     // ---- zcull (deko9_zcull.cpp; r_deko9ZcullStats) -------------------------
     // Zcull itself is always on (the queue's default); only the stats model
     // is a toggle, applied at the next Present.
@@ -865,9 +959,14 @@ public:
     // r_deko9GpuMap 1: one "DEKO9 gpumap" line per static pool, image (its
     // TIC VA) and image free/resize, applied at once (Deko9_SetGpuMap).
     void SetFaultTrace(uint32_t interval) { m_faultTraceWanted.store(interval, std::memory_order_relaxed); }
+    // 0 = the default chunk; otherwise bytes, clamped to [1 KiB, 4 MiB].
+    void SetCmdChunkBytes(uint32_t bytes);
+    bool FaultTraceCells(uint32_t *crop, uint32_t *top) const;
+    bool LastDrawRecord(Deko9DrawRecordInfo *out);
+    bool FaultTraceCommandWindow(uint32_t draw, char *out, size_t cap, bool *bad);
     void SetGpuMap(uint32_t level) { m_gpuMapWanted.store(level, std::memory_order_relaxed); }
     void ApplyGpuMap(); // under the device lock
-    void BlackBoxDump(const char *reason, uint64_t stalledNs = 0);
+    bool BlackBoxDump(const char *reason, uint64_t stalledNs = 0);
     // Image VA as the GPU sees it (the TIC address: pitch, generic or
     // compressed alias of the memblock).
     uint64_t ImageVa(const ImageStore *store) const;
@@ -967,25 +1066,35 @@ public:
     EventMarker *RecordEventMarker();
     // Native frame pacing (deko9_framepace.h, Deko9_Frame* in deko9_native.h).
     // The frame being recorded (frames presented + 1).
-    uint64_t FrameRecording() const { return m_frameRing.Recording(); }
-    // Every frame up to this one is known done; read without the lock (the
-    // engine's end-fence and GPU-sync polls answer from it first).
-    uint64_t FrameDonePublished() const { return m_frameDonePublished.load(std::memory_order_acquire); }
+    // Any thread, no device lock (published by the recording thread).
+    uint64_t FrameRecording() const { return m_framePub.Recording(); }
     void NoteFrameDone(uint64_t frame)
     {
         m_frameRing.MarkDone(frame);
-        m_frameDonePublished.store(m_frameRing.DoneThrough(), std::memory_order_release);
+        m_framePub.PublishDone(m_frameRing.DoneThrough());
         // Property (b): every resource of a done frame (or earlier) is
         // free; frame-arena chunks are stamped with a frame id, not a list
         // seq, so they retire here rather than in CollectCompleted().
         m_frameArena.RetireThrough(m_frameRing.DoneThrough());
     }
     // Whether frame `frame`'s fence has passed (polls it; 0 is done; a
-    // frame not presented yet is not).
+    // frame not presented yet is not). Recording thread, under the lock:
+    // it advances the ring and retires the frame's lists.
     bool FrameDone(uint64_t frame);
-    // Sleeps (lock released, 50 us slices) until FrameDone(frame) or the
-    // timeout. A frame not presented yet returns false at once. Caller must
-    // not hold the lock (only polls inside a batch).
+    // The same answer from any thread with no device lock, from the
+    // published frame state (FramePublish); a fence seen passed is folded
+    // into the ring by the recording thread later (FoldObservedFrames).
+    bool FrameDoneAnyThread(uint64_t frame);
+    // Recording thread, under the lock: frames other threads saw done.
+    void FoldObservedFrames()
+    {
+        const uint64_t seen = m_framePub.Observed();
+        if (seen > m_frameRing.DoneThrough())
+            NoteFrameDone(seen);
+    }
+    // Sleeps (50 us slices, no device lock) until FrameDoneAnyThread(frame)
+    // or the timeout. A frame not presented yet returns false at once; so
+    // does a caller holding the lock (only polls inside a batch).
     bool WaitFrameFor(uint64_t frame, int64_t timeoutNs);
     // Sleep-polls a copy of a fence without the device lock; returns
     // whether it signalled before `timeoutNs`.
@@ -1077,9 +1186,37 @@ public:
         m_dirtyShaders = true;
     }
     uint32_t NextId() { return ++m_nextId; }
-    // Buffer::Lock moved a buffer to new memory: stream extents and lastUse
-    // stamps are re-derived at the next draw.
+    // A buffer moved to new memory: stream extents and lastUse stamps are
+    // re-derived at the next draw. BufferRenamed is for the recording
+    // thread (under the lock); any thread may call BufferRenamedAnyThread,
+    // which the recording thread picks up before its next input bind.
     void BufferRenamed() { m_dirtyInput = true; }
+    void ReportLockWaiters();
+    void BufferRenamedAnyThread() { m_renameEpoch.fetch_add(1, std::memory_order_relaxed); }
+    void NoteForeignRenames()
+    {
+        const uint64_t epoch = m_renameEpoch.load(std::memory_order_relaxed);
+        if (epoch != m_renameEpochSeen)
+        {
+            m_renameEpochSeen = epoch;
+            m_dirtyInput = true;
+        }
+    }
+    // Published list sequences for threads without the lock: the open
+    // list (lists up to it may reference memory a rename moves away from)
+    // and the newest completed one (it only ever lags the GPU).
+    uint64_t PublishedOpenSeq() const { return m_openSeqPub.load(std::memory_order_acquire); }
+    uint64_t PublishedCompletedSeq() const { return m_completedSeqPub.load(std::memory_order_acquire); }
+    // Counters of the lock-free paths (DEKO9 perf waiters): any thread.
+    struct LockFreeCounters
+    {
+        std::atomic<uint64_t> framePolls{0}, frameWaits{0}, frameWaitNs{0};
+        std::atomic<uint64_t> bufLocks{0}, bufRenames{0}, bufGrows{0}, bufEvicts{0}, arenaAllocs{0};
+        // Draws that bound a buffer another thread held locked (Buffer::StampUse).
+        std::atomic<uint64_t> lockedDraws{0};
+    } m_lockFree;
+    // Buffer::StampUse found the buffer locked by another thread.
+    void NoteLockedDraw(const Buffer &buffer);
 
 private:
     friend class SwapChain;
@@ -1145,6 +1282,9 @@ private:
     uint64_t m_fenceSeq[kFenceRing]{};
     uint64_t m_openSeq = 1;
     uint64_t m_completedSeq = 0;
+    std::atomic<uint64_t> m_openSeqPub{1}, m_completedSeqPub{0}; // stored where the two above change
+    std::atomic<uint64_t> m_renameEpoch{0}; // BufferRenamedAnyThread
+    uint64_t m_renameEpochSeen = 0;         // recording thread
     bool m_listHasWork = false;
     struct CmdChunk
     {
@@ -1152,6 +1292,10 @@ private:
         uint64_t seq;
     };
     std::vector<GpuAlloc> m_freeCmdChunks;
+    // Command-memory chunk size (r_deko9CmdChunkKB, applied at Present): small
+    // chunks put many GPFIFO entry switches into every list.
+    uint32_t m_cmdChunkBytes = kCmdChunk;
+    std::atomic<uint32_t> m_cmdChunkWanted{kCmdChunk};
     std::vector<CmdChunk> m_busyCmdChunks;
     std::vector<GpuAlloc> m_openCmdChunks;
     struct UploadChunk
@@ -1194,8 +1338,8 @@ private:
     struct Upscaler
     {
         bool active = false;
-        float sharpness = 0.2f;
-        uint32_t mode = 0; // deko9::UpscaleMode
+        float sharpness = DEKO9_DEFAULT_UPSCALE_SHARPNESS;
+        uint32_t mode = DEKO9_DEFAULT_UPSCALE_MODE; // deko9::UpscaleMode
         ShaderVariant vs, sgsr, bilinearRcas, bilinear;
         uint32_t backDescriptor = UINT32_MAX; // sampling view of the back buffer
         uint32_t sampler = 0;                 // linear, clamp
@@ -1234,6 +1378,12 @@ private:
     std::atomic<uint64_t> m_gpuFrameA{0}; // count (32) | GPU us (32)
     std::atomic<uint64_t> m_gpuFrameB{0}; // count (32) | width (16) | height (16)
     uint32_t m_gpuFramesPublished = 0;
+    struct ProfileFrame { uint64_t frame, time, busy, list; uint32_t width, height; };
+    ProfileFrame m_profileFrames[8] = {};
+    unsigned m_profileFrameCount = 0;
+    bool m_profileFrameIncomplete = false;
+    uint64_t m_profileBatchSeq = 0;
+    void FlushProfileFrames();
     uint64_t m_resizes = 0;
     // Selftest gather probe (Deko9_GatherProbe), loaded on first use.
     struct GatherProbeState
@@ -1254,8 +1404,40 @@ private:
         GpuAlloc depthConstants, compositeConstants;
         uint64_t depthPasses = 0, composites = 0;
         uint64_t zcullInvalidates = 0;
+        uint64_t fullBarriers = 0;
         uint32_t rules = 3; // DEKO9_HRP_RULES_ALL
     } m_hrp;
+    // TAAU resolve (deko9_taau.cpp), loaded on first use. Two output-sized
+    // history images: each resolve samples one and renders the other.
+    struct TaauState
+    {
+        ShaderVariant ps[kTaauResolveVariants], motionVs, motionPs, opaquePs[2];
+        GpuAlloc constants, timestamps, motionConstants;
+        std::shared_ptr<ImageStore> history[2];
+        // Object motion (scene size), written by TaauMotion and read by the
+        // next resolve only.
+        std::shared_ptr<ImageStore> motion;
+        bool motionReady = false;
+        // Opaque-scene luma (R16F, scene size) before the transparent
+        // passes, then (after them) the change they made; read by the next
+        // resolve only. Allocated for the scene colour's capacity: opaqueUsed
+        // is the part this frame's passes wrote (deko9_taau.h TaauExtent).
+        std::shared_ptr<ImageStore> opaque;
+        TaauExtent opaqueUsed{0, 0};
+        bool opaqueHalf = false;
+        bool opaqueReady = false, reactiveReady = false;
+        uint64_t motionAllocs = 0, opaqueAllocs = 0; // image allocations since the device was created
+        uint32_t next = 0;  // history the next resolve renders
+        bool valid = false; // history[next ^ 1] holds the last resolve
+        uint64_t motionDraws = 0;
+        // Motion draws skipped for a range outside their buffers (per
+        // 60-resolve report window, and since the device was created).
+        uint64_t motionSkips = 0, motionSkipsTotal = 0;
+        std::vector<uint8_t> motionFits; // per draw of the current pass: 1 when it is recorded
+        static constexpr uint32_t kSlots = 8;
+        uint64_t slotSeq[kSlots] = {};
+        uint64_t calls = 0, resets = 0, gpuNs = 0, samples = 0;
+    } m_taau;
 
     // Constant register files, UBOs (whole register file per stage)
     // CPU mirrors with per-register dirty bits (ConstantFile): a draw pushes
@@ -1317,7 +1499,13 @@ private:
     // last draw's commit records it with m_writeClock, and a later draw with
     // the same sampled set (no ApplyShaders) and targets (no m_dirtyTargets)
     // skips evaluation while both still match.
-    uint32_t m_perDraw = DEKO9_PERDRAW_HAZARD | DEKO9_PERDRAW_CONSTS | DEKO9_PERDRAW_TEXTURES;
+    struct DrawProbe
+    {
+        uint32_t flags = DEKO9_DEFAULT_DRAW_PROBE;
+        uint32_t split = DEKO9_DEFAULT_DRAW_SPLIT;
+    } m_probe;
+    void EmitDraw(bool indexed, DkPrimitive prim, uint32_t count, uint32_t first, int32_t baseVertex);
+    uint32_t m_perDraw = DEKO9_DEFAULT_PERDRAW;
     uint64_t m_hazardSerial = 0;
     bool m_drawHazardValid = false;
     bool m_drawHazardReused = false; // this draw skipped evaluation
@@ -1377,8 +1565,9 @@ private:
     // PrepareDraw when the shaders, raster state, targets or these inputs
     // changed; m_psEarlyZ enters the program key.
     bool EarlyZCandidate() const;
-    bool m_earlyZ = true;           // r_deko9EarlyZ
-    uint32_t m_shadowFilter = 0;    // r_shadowFilter
+    bool m_earlyZ = DEKO9_DEFAULT_EARLY_Z;
+    uint32_t m_shadowFilter = DEKO9_DEFAULT_SHADOW_FILTER;
+    uint32_t m_shaderOpt = DEKO9_DEFAULT_SHADER_OPT;
     bool m_dirtyEarlyZ = true;
     bool m_ezCandidate = false;     // the draw qualifies (whether or not enabled)
     bool m_psEarlyZ = false;        // the draw uses the early-Z variant
@@ -1402,7 +1591,7 @@ private:
     // before signalling it again.
     FrameRing<kFramesInFlight> m_frameRing;
     DkFence m_frameFences[kFramesInFlight]{};
-    std::atomic<uint64_t> m_frameDonePublished{0};
+    FramePublish<kFramesInFlight, DkFence> m_framePub;
     // In-list fences of event/occlusion queries (Query::Issue). deko3d keeps
     // a pointer to the DkFence in the list until it is submitted, so each
     // marker has a stable address (owned by the pool) and is recycled only
@@ -1468,6 +1657,8 @@ public:
         // registers written by Set*ShaderConstantF vs actually changed, and
         // the bytes the former [lo, hi) range scheme would have pushed.
         uint64_t constBytes[2], constPushes[2], constRegsSet, constRegsChanged;
+        // Extra GPU draws the probe split mode issued.
+        uint64_t probeExtraDraws;
         // GPU-progress checks (DEKO9 perf sync line): fence polls
         // (dkFenceWait timeout 0) and how many found the list done, checks
         // the cached completed sequence answered without a poll,
@@ -1479,12 +1670,20 @@ public:
         // Native frame waits (Deko9_WaitFrame): calls that slept, time slept.
         uint64_t frameWaits, frameWaitNs;
     } m_timing{};
+    // Shader-pack / translate / compile / bake / first-bind accounting
+    // (DEKO9 perf frames= line; ShaderBase::Variant adds from any thread).
+    ShaderBuildStats m_shaderStats;
+    uint64_t m_lockWaitNsExtra = 0; // lock wait already given to the slow-frame line
     uint64_t m_lockAcquisitionsReported = 0, m_lockEntriesReported = 0;
     uint64_t m_lockContendedReported[2] = {0, 0}, m_lockWaitNsReported[2] = {0, 0};
     uint64_t m_lockHandoffsReported = 0;
+    // DEKO9 perf waiters: values at the previous report.
+    DeviceLock::CallerStats m_callersReported[DeviceLock::kCallerSlots] = {};
+    uint64_t m_otherAcquisitionsReported = 0;
+    uint64_t m_lockFreeReported[8] = {};
     uint64_t m_drawsTotal = 0, m_drawCpuNsTotal = 0; // m_timing folded in at each 60-frame report
     // Verification state (SetVerify / VerifyDraw).
-    bool m_verify = false;
+    bool m_verify = DEKO9_DEFAULT_VERIFY;
     bool m_verifyConstantsSynced = false; // shadows hold everything pushed since the full re-push
     uint64_t m_verifiedDraws = 0, m_verifyMismatches = 0;
     // Per-draw fast paths re-derived by VerifyDraw (cumulative): hazard
@@ -1522,14 +1721,26 @@ public:
     uint64_t m_passNs[32]{};
     uint64_t m_passDropped = 0;
     uint64_t m_passFrames = 0;
-    uint32_t m_barrierMode = 0;
+    uint32_t m_barrierMode = DEKO9_DEFAULT_BARRIER_MODE;
+    // Tiled cache: the mode the GPU state is in, and the one asked for.
+    uint32_t m_tiledWanted = DEKO9_DEFAULT_TILED_CACHE, m_tiledOn = 0;
+    void TiledSync();
+    void CmdBarrier(DkBarrier mode, uint32_t invalidate);
+    void CmdBindTargets(const DkImageView *const colors[], uint32_t count, const DkImageView *depth);
+    // Cheap per-60-frame command-stream counters (perf census line).
+    struct CmdCensus
+    {
+        uint64_t barrier[5]{}; // by DkBarrier
+        uint64_t inval[5]{};   // L2, image, shader, descriptors, zcull
+        uint64_t targetBinds = 0, clears = 0, tiledOps = 0, submits = 0, flushes = 0;
+    } m_cc;
     uint64_t m_lightBarriers = 0; // per 60 frames, reported on the perf line
     // Cumulative: copy/blit writes into an image read (sampled or copied
     // from) since the last barrier, each ordered by a full barrier
     // (write-after-read; Deko9Counters::uploadAfterReadBarriers).
     uint64_t m_writeAfterReadBarriers = 0;
     std::atomic<bool> m_gpuPasses{false};       // read unlocked by Deko9_GpuMarker
-    std::atomic<bool> m_gpuPassesWanted{false}; // applied at Present
+    std::atomic<bool> m_gpuPassesWanted{DEKO9_DEFAULT_GPU_PASSES}; // applied at Present
     // Cumulative per-pass GPU ns and frames since the device started
     // (Deko9_GetGpuPassTotals; never reset by the periodic report).
     uint64_t m_passNsTotal[32]{};
@@ -1538,7 +1749,7 @@ public:
     // ---- zcull (deko9_zcull.cpp) --------------------------------------------
     // Always on (the queue's default; deko3d has no per-command-buffer zcull
     // switch). Only the CPU/hardware stats model below is a toggle.
-    std::atomic<bool> m_zcullStatsWanted{false};
+    std::atomic<bool> m_zcullStatsWanted{DEKO9_DEFAULT_ZCULL_STATS};
     bool m_zcullStats = false;
     void ApplyZcullSettings(); // PresentFrame, after the present
     // CPU model of the zcull region, per pass (m_curPass), when stats are on:
@@ -1573,8 +1784,8 @@ public:
     // m_censusPassMask is the only per-draw cost when off (PrepareDraw).
     struct DrawCensusEntry
     {
-        std::string material, technique, shader;
-        uint64_t psHash = 0;
+        std::string material, technique, shader, vertexShader;
+        uint64_t psHash = 0, vsHash = 0;
         Deko9DkshStats ps{};
         uint32_t blend = 0; // CensusBlendKey
         uint64_t brackets = 0, draws = 0, prims = 0, samples = 0, fsInv = 0, ns = 0;
@@ -1594,7 +1805,8 @@ public:
     // mode: 0 off, 1 samples + timestamps, 2 + fragment shader invocations;
     // brackets every draw whose gpupass bit is in passMask (nonzero when on).
     void SetDrawCensus(uint32_t mode, uint32_t passMask);
-    void CensusLabel(const char *material, const char *technique, const char *shader, const void *psObject);
+    void CensusLabel(const char *material, const char *technique, const char *shader, const char *vertexShader,
+                     const void *psObject);
     void CensusLight(uint32_t lightIndex, uint32_t viewLights);
     void CensusAutoDraw(UINT primCount);
     // Closes an automatic bracket before non-draw GPU work (clears, copies,
@@ -1605,7 +1817,7 @@ public:
             CensusEnd();
     }
     void CensusResetCounts();
-    void CensusBegin(const char *material, const char *technique, const char *shader);
+    void CensusBegin(const char *material, const char *technique, const char *shader, const char *vertexShader);
     void CensusEnd();
     void CensusNoteDraw(UINT primCount);
     // A ranged call (DrawIndexedRanges) records `count` deko3d draws for the
@@ -1627,9 +1839,11 @@ public:
     // Brackets whose reports never landed within kCensusLateLists lists.
     uint64_t m_censusLate = 0;
     static constexpr uint64_t kCensusLateLists = 256;
-    const char *m_censusMaterial = nullptr, *m_censusTechnique = nullptr, *m_censusShader = nullptr;
+    const char *m_censusMaterial = nullptr, *m_censusTechnique = nullptr, *m_censusShader = nullptr,
+               *m_censusVertexShader = nullptr;
     uint32_t m_censusDraws = 0, m_censusPrims = 0, m_censusBlend = 0, m_censusEzDraws = 0, m_censusGpuDraws = 0;
     PixelShader *m_censusPs = nullptr;
+    VertexShader *m_censusVs = nullptr;
     uint32_t m_censusPsMask = 0;
     bool m_censusPsEarlyZ = false;
     // The pass filter, the engine's last
@@ -1639,7 +1853,7 @@ public:
     uint32_t m_censusPassMask = 0;
     struct CensusLabelSlot
     {
-        const char *material = nullptr, *technique = nullptr, *shader = nullptr;
+        const char *material = nullptr, *technique = nullptr, *shader = nullptr, *vertexShader = nullptr;
         const void *ps = nullptr;
     } m_censusLabels[2];
     uint32_t m_censusLabelNext = 0;
@@ -1653,7 +1867,7 @@ public:
 
     // ---- call census storage (r_deko9Census) ----
     std::atomic<bool> m_census{false};
-    std::atomic<bool> m_censusWanted{false};
+    std::atomic<bool> m_censusWanted{DEKO9_DEFAULT_CENSUS};
     CensusEntry m_censusEntries[Census_Count]{};
     uint64_t m_censusFrames = 0;
     struct CensusTexRecord
@@ -1682,14 +1896,26 @@ private:
     // ---- GPU-fault black box state (deko9_gpufault.cpp) ----
     static constexpr uint32_t kDrawRecords = 4096;
     GpuEventRing<512> m_gpuEvents;
-    std::atomic<uint32_t> m_faultTraceWanted{0};
-    std::atomic<uint32_t> m_gpuMapWanted{0};
+    std::atomic<uint32_t> m_faultTraceWanted{DEKO9_DEFAULT_FAULT_TRACE};
+    std::atomic<uint32_t> m_gpuMapWanted{DEKO9_DEFAULT_GPU_MAP};
     uint32_t m_faultTrace = 0; // breadcrumb interval in draws; 0 = off
     uint32_t m_gpuMap = 0;
     bool m_gpuMapStaticLogged = false;
     std::unique_ptr<DrawRecordRing<kFenceRing, kDrawRecords>> m_drawRecords;
-    GpuAlloc m_crumbs;             // 16 bytes, GPU-uncached: the GPU's (seq, draw) report
+    GpuAlloc m_crumbs;             // GPU-uncached: +0 the CROP crumb, +16 the top-of-pipe crumb
     uint32_t m_crumbDraws = 0;     // draws recorded in the open list
+    // Top-of-pipe crumb: deko3d's DkCounter_TimestampPipelineTop words (a host
+    // semaphore release without wait-for-idle) captured once, replayed with
+    // the crumb as payload.
+    uint32_t m_topWords[8]{};
+    uint32_t m_topWordCount = 0;
+    uint32_t m_topPayload = 0; // index of the payload word
+    // Newest swapchain acquire fence and the list that waits for it, for the
+    // watcher (a stall before a present list is either this wait or the GPU).
+    std::mutex m_acquireMutex;
+    DkFence m_acquireFence{};
+    uint64_t m_acquireSeq = 0;
+    int m_acquireSlot = -1;
     std::atomic<uint64_t> m_submittedSeq{0}; // newest submitted list (read by the watcher)
     std::atomic<bool> m_watchStop{false};
     Thread m_watchThread{};
@@ -1698,6 +1924,46 @@ private:
     void LogGpuMapStatic();
     void FaultTraceBeginList();
     void FaultTraceDraw();
+    void FaultTraceTop(uint32_t crumb);
+    void FaultTraceNative(NativeDrawKind kind); // before a native full-screen draw
+    bool CaptureTopWords();
+    // Completes the open list's newest draw record with the GPU draw's arguments.
+    void FaultTraceDrawArgs(bool indexed, DkPrimitive prim, uint32_t count, uint32_t instances, uint32_t first,
+                            int32_t base, uint64_t ib, uint64_t vb0, uint32_t vb0Size, uint32_t gpuDraws = 1);
+    void FaultTraceDrawArgsStreams(bool indexed, DkPrimitive prim, uint32_t count, uint32_t instances,
+                                   uint32_t first, int32_t base, uint32_t gpuDraws = 1);
+    // GPFIFO segments of submitted lists (exact word counts, fetch order), a
+    // POD ring the watcher reads without the lock: the dump decodes the words
+    // around the stuck draw across command-memory chunk switches.
+    struct CmdSegmentRecord
+    {
+        uint64_t seq;
+        const uint32_t *cpu;
+        DkGpuAddr gpu;
+        uint32_t words;
+    };
+    static constexpr uint32_t kCmdSegmentRecords = 4096;
+    std::unique_ptr<CmdSegmentRecord[]> m_cmdSegmentRecords;
+    std::unique_ptr<SegmentWords[]> m_segmentScratch; // dump-time copy of one list's segments
+    std::atomic<uint32_t> m_cmdSegmentRecordHead{0};
+    uint32_t m_badVaReports = 0;
+    // Called between dkCmdBufFinishList and dkCmdBufClear (the control stream
+    // is recycled by the clear).
+    void NoteListSegments(uint64_t seq, DkCmdList list);
+    struct CommandWindow
+    {
+        SegmentPos from, to; // to = end (exclusive)
+        uint32_t segments;   // segments recorded for the list
+        bool closed;         // ends with the closing crumb's words
+    };
+    uint32_t ListSegmentWords(uint64_t seq, SegmentWords *out) const;
+    bool FindCommandWindow(const SegmentWords *segs, uint32_t n, uint32_t fromCrumb, uint32_t toCrumb,
+                           CommandWindow *out) const;
+    void DumpCommandWindow(uint64_t seq, uint32_t fromCrumb, uint32_t toCrumb);
+    void DumpDescriptors(const DrawRecord &r);
+    // Every VA the recorded draw hands the GPU lies in a deko9 heap.
+    void FaultTraceCheckVa(const DrawRecord &r);
+    bool GpuVaMapped(DkGpuAddr va, uint32_t size, bool imageAliases) const;
     void StopWatcher();
     static void WatchMain(void *arg);
     void DumpListStats();
@@ -1709,7 +1975,7 @@ private:
     UINT m_presentInterval = 1;
     // Upload ring overflow uses dedicated allocations freed after the list.
     static constexpr uint32_t kUploadChunk = 8u << 20;
-    static constexpr uint32_t kCmdChunk = 256u << 10; // each list starts a fresh chunk
+    static constexpr uint32_t kCmdChunk = 256u << 10; // default chunk; each list starts a fresh one
 };
 
 // ---- helpers ----------------------------------------------------------------
@@ -1803,9 +2069,28 @@ HRESULT STDMETHODCALLTYPE Object<Base>::QueryInterface(REFIID riid, void **objec
     return E_NOINTERFACE;
 }
 
+// Native full-screen pass helpers shared by the upscalers (deko9_fsr.cpp).
+bool LoadDkshCached(Device *device, Deko9Stage stage, const char *glsl, ShaderVariant *variant, std::string *error);
+void FreeVariant(Device *device, ShaderVariant *variant, uint64_t seq);
+SamplerKey LinearClampKey();
+void BindFullScreenState(DkCmdBuf cmd, uint32_t width, uint32_t height, uint32_t x = 0, uint32_t y = 0);
+
 // Reports FAIL:DEKO9_<what> once and returns D3DERR_INVALIDCALL.
 HRESULT Fail(const char *what, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void Log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+// Per-frame time this renderer adds to the SWITCH_PERF slow-frame line
+// (x.gpu, x.lockwait, x.compile, x.bake and x.gp.<pass>); no-ops unless the
+// CPU profiler (switch_perfTrace) is on.
+enum Deko9FrameExtra
+{
+    DEKO9_EXTRA_GPU,
+    DEKO9_EXTRA_LOCKWAIT,
+    DEKO9_EXTRA_COMPILE,
+    DEKO9_EXTRA_BAKE,
+    DEKO9_EXTRA_COUNT
+};
+void AddFrameExtra(Deko9FrameExtra which, uint64_t ns);
+void AddGpuPassFrameExtra(uint32_t pass, uint64_t ns);
 // Same stdout/debug-string routing as Log/Fail but with no "DEKO9 " prefix,
 // for lines whose own prefix (e.g. "CRASH:") a reader matches on directly.
 void LogLine(const char *line);

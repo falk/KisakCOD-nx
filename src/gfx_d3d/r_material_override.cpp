@@ -343,3 +343,21 @@ bool __cdecl Material_WouldTechniqueSetBeOverridden(const MaterialTechniqueSet *
     Material_RemapTechniqueSetName(techSet->name, remapName, remapMask, remapValue, s_materialFeatures, 0x14u);
     return strcmp(techSet->name, remapName) != 0;
 }
+
+// The technique set Material_RemapTechniqueSet would select for techSet under
+// the current feature dvars, without writing remappedTechniqueSet: callable
+// off the main thread while the renderer reads it.
+MaterialTechniqueSet *__cdecl Material_RuntimeRemapTarget(MaterialTechniqueSet *techSet)
+{
+    char remapName[260];
+    uint32_t remapMask;
+    uint32_t remapValue;
+
+    iassert( techSet );
+    Material_GetRemappedFeatures_RunTime(&remapMask, &remapValue);
+    Material_RemapTechniqueSetName(techSet->name, remapName, remapMask, remapValue, s_materialFeatures, 0x14u);
+    if (!strcmp(techSet->name, remapName))
+        return techSet;
+    MaterialTechniqueSet *remapped = Material_FindTechniqueSet(remapName, MTL_TECHSET_NOT_FOUND_RETURN_NULL);
+    return remapped ? remapped : techSet;
+}

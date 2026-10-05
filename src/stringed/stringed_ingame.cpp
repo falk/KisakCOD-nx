@@ -4,6 +4,10 @@
 #include <universal/com_memory.h>
 #include <database/database.h>
 #include <universal/com_files.h>
+#ifdef __SWITCH__
+#include "stringed_hooks.h"
+#include <port/switch_controller_prompts.h>
+#endif
 
 CStringEdPackage *TheStringPackage;
 
@@ -12,6 +16,14 @@ char sTemp[64];
 
 const char *__cdecl SE_GetString(const char *psPackageAndStringReference)
 {
+#ifdef __SWITCH__
+    if (const char *label = Switch_ControllerControlLabel(psPackageAndStringReference))
+        return label;
+    const int language = loc_forceEnglish && loc_forceEnglish->current.enabled
+        ? 0 : SEH_GetCurrentLanguage();
+    if (const char *prompt = Switch_ControllerPrompt(psPackageAndStringReference, language))
+        return prompt;
+#endif
     if (IsFastFileLoad())
         return SE_GetString_FastFile(psPackageAndStringReference);
     else
@@ -223,4 +235,3 @@ void __cdecl SE_R_ListFiles(
     FS_FreeFileList(sysFiles);
     FS_FreeFileList(dirFiles);
 }
-

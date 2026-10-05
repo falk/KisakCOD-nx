@@ -1,5 +1,6 @@
 #include <universal/q_shared.h>
 #include "r_dynres.h"
+#include "rb_dof_fraction.h"
 #include "rb_postfx.h"
 #include "r_dvars.h"
 #include "rb_state.h"
@@ -255,7 +256,8 @@ void __cdecl RB_ApplyMergedPostEffects(const GfxViewInfo *viewInfo)
         R_UpdateCodeConstant(&gfxCmdBufSourceState, CONST_SRC_CODE_DOF_ROW_DELTA, 0.0, v9, 0.0f, 0.0f);
         smallFrac = RB_GetDepthOfFieldBlurFraction(viewInfo, 1.4f);
         mediumFrac = RB_GetDepthOfFieldBlurFraction(viewInfo, 3.5999999f);
-        if (smallFrac <= 0.0f || mediumFrac <= smallFrac || mediumFrac >= 1.0f)
+        RB_ClampDofBlurFractions(&smallFrac, &mediumFrac);
+        if (!RB_DofBlurFractionsValid(smallFrac, mediumFrac))
         {
             v1 = va("%g, %g, %g, %i", smallFrac, mediumFrac, viewInfo->dof.nearBlur, (int)gfxRenderTargets[R_RENDERTARGET_SCENE].height);
             MyAssertHandler(

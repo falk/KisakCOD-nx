@@ -33,7 +33,8 @@
 // level's spots and groups from its command line or a cfg, e.g.
 //   +set r_deko9EmissiveTour 1 +set r_deko9EmissiveTourGroups rain:rain/nofx:@fx_draw
 // Formats avoid spaces, ';' and '+' (the command line splits on them):
-//   spots  "x,y,z,yaw,pitch/x,y,z,yaw,pitch/..." or "here"
+//   spots  "x,y,z,yaw,pitch[,turn]/..." or "here" (turn: degrees per second
+//          the view keeps turning at that spot, + left / - right)
 //   groups "name:substr,substr/name:@dvar/name:@dvar=value/..." (an @dvar
 //          entry sets that boolean dvar to 0 for the phase instead of
 //          skipping materials, @dvar=value sets any dvar to value and
@@ -47,6 +48,7 @@ struct GfxDrawSurfListInfo;
 struct Material;
 struct MaterialTechnique;
 struct MaterialPixelShader;
+struct MaterialVertexShader;
 
 extern bool g_emissiveSkipOn;      // r_deko9SkipEmissive not empty (this frame)
 extern uint32_t g_emissiveSkipped; // material sublists skipped (backend; read by the tour)
@@ -55,7 +57,8 @@ extern bool g_drawCensusOn;        // r_deko9DrawCensus != 0 (this frame)
 // Draw census labels (only while g_drawCensusOn): the material pass R_SetupPass
 // set up, and the point light R_DrawPointLitSurfs draws (index + 1, 0 after;
 // viewLights with index 0 starts a view).
-void RB_DrawCensusLabel(const Material *material, const MaterialTechnique *technique, const MaterialPixelShader *ps);
+void RB_DrawCensusLabel(const Material *material, const MaterialTechnique *technique, const MaterialPixelShader *ps,
+                        const MaterialVertexShader *vs);
 void RB_DrawCensusLight(uint32_t lightIndex, uint32_t viewLights);
 
 // True when `info` is a view's emissive list.

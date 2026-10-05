@@ -157,7 +157,7 @@ void AllocCpu(ImageStore *store)
 // uncompressed swapchain images, so no explicit decompression is needed.
 // Zcull is set up by deko3d itself (dkCmdBufBindRenderTargets, queue created
 // with DkQueueFlags_EnableZcull, the default).
-std::atomic<bool> g_rtCompression{true};
+std::atomic<bool> g_rtCompression{DEKO9_DEFAULT_RT_COMPRESSION};
 // Deko9_SetRtCompressionOverride: per-thread choice for the images this
 // thread creates next (-1: follow g_rtCompression).
 thread_local int t_rtCompressionOverride = -1;
@@ -219,6 +219,19 @@ bool Device::CreateStore(ImageStore *store, std::string *error)
     maker.dimensions[0] = store->width;
     maker.dimensions[1] = store->height;
     maker.mipLevels = store->levels;
+    if (format.blockWidth > 1 && store->type == D3DRTYPE_TEXTURE)
+    {
+        // deko3d's automatic tile height for block-compressed images disagrees
+        // with the copy engine's for some heights (6..8 block rows), scrambling
+        // every GOB column past the first; pick the standard block-linear height.
+        const uint32_t rows = (store->height + format.blockWidth - 1) / format.blockWidth;
+        const uint32_t gobs = (rows + 7) / 8;
+        uint32_t tile = DkTileSize_SixteenGobs;
+        while (tile && (1u << (tile - 1)) >= gobs)
+            --tile;
+        maker.flags |= DkImageFlags_CustomTileSize;
+        maker.tileSize = (DkTileSize)tile;
+    }
     switch (store->type)
     {
     case D3DRTYPE_CUBETEXTURE:
@@ -240,6 +253,8 @@ bool Device::CreateStore(ImageStore *store, std::string *error)
         return *error = "image memory allocation failed", false;
     dkImageInitialize(&store->image, &store->layout, store->memory.block, store->memory.offset);
     store->gpu = true;
+    store->capacityWidth = store->width;
+    store->capacityHeight = store->height;
     store->uploaded.assign(store->faces * store->levels, false);
     // Standalone RT/DS surfaces are never sampled in D3D9; textures are.
     if (store->type != D3DRTYPE_SURFACE)
@@ -259,7 +274,7 @@ bool Device::CreateStore(ImageStore *store, std::string *error)
     return true;
 }
 
-// Dynamic resolution (r_dynres): a render target allocated for the largest
+// Render scale (r_renderScale, r_dynres): a render target allocated for the largest
 // size is re-laid out for a smaller (or larger, up to that size) one. deko3d
 // derives the block-linear layout (GOB rows, block height, compression kind)
 // from the dimensions, so the image is re-initialised at the new size: every
@@ -370,6 +385,8 @@ bool Device::MoveStoreContents(ImageStore *src, ImageStore *dst, std::string *er
     std::swap(src->layout, dst->layout);
     std::swap(src->image, dst->image);
     std::swap(src->memory, dst->memory);
+    std::swap(src->capacityWidth, dst->capacityWidth);
+    std::swap(src->capacityHeight, dst->capacityHeight);
     std::swap(src->renderEpoch, dst->renderEpoch);
     std::swap(src->copyWriteEpoch, dst->copyWriteEpoch);
     std::swap(src->blitEpoch, dst->blitEpoch);
@@ -1062,6 +1079,11 @@ void Buffer::ReleaseMemory(Device *device)
     if (!m_window)
         device->FreeMemoryAfter(m_memory, device->OpenSeq());
     m_memory = {};
+    // Spares go back to the heap after the later of their stamp and the
+    // open list (nothing recorded after this point can reference them).
+    m_spares.Drain([&](const GpuAlloc &mem, uint64_t stamp) {
+        device->FreeMemoryAfter(mem, std::max<uint64_t>(stamp, device->OpenSeq()));
+    });
 }
 
 void Buffer::BindWindow(Device *device, uint64_t gpu, void *cpu, uint32_t size)
@@ -1089,54 +1111,70 @@ HRESULT Buffer::Lock(Device *device, UINT offset, UINT size, void **data, DWORD 
 {
     if (renamedBytes)
         *renamedBytes = 0;
-    DeviceLockGuard lock(device->Lock());
     if (m_window)
         return Fail("WINDOW_LOCK", "Lock on a window buffer (offset=%u size=%u flags=0x%x)", (unsigned)offset,
                     (unsigned)size, (unsigned)flags);
-    DeviceLockSite site(device->Lock(), "buflock");
-    if (!data || m_locked || offset > m_size || (size && size > m_size - offset))
+    if (!data || offset > m_size || (size && size > m_size - offset))
         return D3DERR_INVALIDCALL;
-    // Busy only matters when the lock may overwrite data the GPU reads, and
-    // the cached completed sequence answers first: a buffer the GPU is known
-    // to be done with (or never used) needs no fence poll.
-    bool busy = false;
-    if (!(flags & (D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY)) && lastUse > device->CachedCompletedSeq())
-    {
-        ++device->m_timing.bufferLockPolls;
-        busy = !device->SeqDone(lastUse);
-    }
+    // Taken before the stamp is read: a draw that binds this buffer from
+    // now on sees the holder (Buffer::StampUse), and one that stamped
+    // before is seen here and renamed past.
+    if (!m_use.BeginLock(ThreadTag()))
+        return D3DERR_INVALIDCALL;
+    // No device lock (see deko9_rename.h): the main thread fills its mesh,
+    // skinning and pre-tessellation buffers every frame while the render
+    // back end holds the lock for whole draw lists. Busy only matters when
+    // the lock may overwrite data the GPU reads; it is answered from the
+    // published completed list sequence, which only ever lags the GPU (a
+    // late "busy" renames, never an early "free"). A busy buffer moves to a
+    // spare whose stamp completed, or to new heap memory (the lock only
+    // then); without DISCARD the new memory starts as a copy, as D3D9
+    // preserves contents.
+    device->m_lockFree.bufLocks.fetch_add(1, std::memory_order_relaxed);
+    const bool busyPossible = !(flags & (D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY));
     const bool discard = (flags & D3DLOCK_DISCARD) && (m_usage & D3DUSAGE_DYNAMIC);
-    if (busy)
+    GpuAlloc previous;
+    const RenameResult r = RenameForLock(
+        &m_memory, &previous, m_use.LastUse(), busyPossible, device->PublishedCompletedSeq(), device->PublishedOpenSeq(),
+        m_spares,
+        [&](GpuAlloc *out) {
+            DeviceLockGuard lock(device->Lock(), "Buffer::Lock grow");
+            return device->AllocMemory(m_memory.pool, m_size + kCanaryBytes, 256, out);
+        },
+        [&](const GpuAlloc &mem, uint64_t stamp) {
+            DeviceLockGuard lock(device->Lock(), "Buffer::Lock evict");
+            device->FreeMemoryAfter(mem, std::max<uint64_t>(stamp, device->OpenSeq()));
+        });
+    if (!r.ok)
     {
-        // The GPU may still read the old contents: rename. Without DISCARD
-        // the new memory starts as a copy, as D3D9 preserves contents.
-        GpuAlloc fresh;
-        if (!device->AllocMemory(m_memory.pool, m_size + kCanaryBytes, 256, &fresh))
-            return D3DERR_OUTOFVIDEOMEMORY;
+        m_use.EndLock();
+        return D3DERR_OUTOFVIDEOMEMORY;
+    }
+    if (r.renamed)
+    {
         if (!discard)
         {
-            std::memcpy(fresh.cpu, m_memory.cpu, m_size);
+            std::memcpy(m_memory.cpu, previous.cpu, m_size);
             if (renamedBytes)
                 *renamedBytes = m_size;
         }
-        FillCanary(fresh.cpu + m_size);
-        device->FreeMemoryAfter(m_memory, device->OpenSeq());
-        m_memory = fresh;
-        lastUse = 0;
+        FillCanary(m_memory.cpu + m_size);
+        m_use.ClearUse();
         // A bound stream's address changed and it must be re-stamped.
-        device->BufferRenamed();
+        device->BufferRenamedAnyThread();
+        device->m_lockFree.bufRenames.fetch_add(1, std::memory_order_relaxed);
+        device->m_lockFree.bufGrows.fetch_add(r.grew, std::memory_order_relaxed);
+        device->m_lockFree.bufEvicts.fetch_add(r.evicted, std::memory_order_relaxed);
     }
-    m_locked = true;
     *data = m_memory.cpu + offset;
     return D3D_OK;
 }
 
 HRESULT Buffer::Unlock(Device *device)
 {
-    DeviceLockGuard lock(device->Lock());
-    if (!m_locked)
+    // Touches only this buffer (the locking thread's), no device state.
+    if (!m_use.Locked())
         return D3DERR_INVALIDCALL;
-    m_locked = false;
 #ifdef DEKO9_CANARY_CHECKS
     if (!CanaryIntact())
     {
@@ -1144,8 +1182,33 @@ HRESULT Buffer::Unlock(Device *device)
              m_memory.pool == POOL_DYNAMIC ? "dynamic" : "static", (unsigned)m_usage);
         FillCanary(m_memory.cpu + m_size);
     }
+#else
+    (void)device;
 #endif
+    m_use.EndLock();
     return D3D_OK;
+}
+
+bool Buffer::StampUse(Device *device, uint64_t seq)
+{
+    if (m_use.Stamp(seq, ThreadTag()))
+        return true;
+    device->NoteLockedDraw(*this);
+    return false;
+}
+
+void Device::NoteLockedDraw(const Buffer &buffer)
+{
+    // A draw bound a buffer another thread holds locked: that lock may move
+    // or overwrite the memory this draw reads. Counted every time, reported
+    // once (the draw still records).
+    if (m_lockFree.lockedDraws.fetch_add(1, std::memory_order_relaxed) == 0)
+        Fail("BUFFER_LOCK_RACE",
+             "list seq=%llu draws from a %u-byte %s buffer (role %s) that another thread holds locked; a thread "
+             "that does not record may lock a buffer only while no list being recorded draws from it (later "
+             "cases: lockedDraws= on the perf waiters line)",
+             (unsigned long long)m_openSeq, buffer.Size(), buffer.Usage() & D3DUSAGE_DYNAMIC ? "dynamic" : "static",
+             buffer.role ? buffer.role : "none");
 }
 
 VertexBuffer::~VertexBuffer()
@@ -1410,7 +1473,7 @@ const char kCacheDir[] = "sdmc:/switch/kisakcod/deko9-cache";
 // Bump whenever the translator output, its preludes or the MojoShader/UAM
 // pins change: a pack from another version must never be loaded (kept
 // in lockstep with deko9_shaderpack.h's kShaderPackVersion default).
-constexpr uint32_t kCacheVersion = 5;
+constexpr uint32_t kCacheVersion = 6;
 
 std::string ShaderPackPath()
 {
@@ -1468,7 +1531,8 @@ void EnsureShaderPackLoaded()
 }
 } // namespace
 
-bool ShaderBase::Init(Device *device, const DWORD *function, Deko9Stage stage, std::string *error)
+bool ShaderBase::Prepare(Device *device, const DWORD *function, Deko9Stage stage, uint32_t shaderOpt,
+                         std::vector<uint8_t> *baseDksh, std::string *error)
 {
     const size_t bytes = BytecodeLength(function);
     if (!bytes)
@@ -1477,11 +1541,10 @@ bool ShaderBase::Init(Device *device, const DWORD *function, Deko9Stage stage, s
     m_bytecode.assign(p, p + bytes);
     m_hash = Deko9_HashBytecode(p, bytes);
     m_stage = stage;
-    id = device->NextId();
     // The base variant's key (no shadow mask, no instancing, no early-Z): a
     // hit supplies m_info too, so a fully cached shader needs no MojoShader
     // translation at all, not even to learn its declared inputs/samplers.
-    const ShaderVariantKey baseKey{m_hash, 0, 0, 0, 0, 0};
+    const ShaderVariantKey baseKey{m_hash, 0, 0, 0, 0, shaderOpt, shaderOpt ? (uint32_t)DEKO9_SHADER_OPT_VERSION : 0u, 0};
     bool cacheHit = false;
     {
         std::lock_guard<std::mutex> lock(g_shaderPackLock);
@@ -1491,41 +1554,84 @@ bool ShaderBase::Init(Device *device, const DWORD *function, Deko9Stage stage, s
             cacheHit = true;
         }
     }
+    device->m_shaderStats.NotePackLookup(cacheHit);
     if (!cacheHit)
     {
         std::string glsl;
-        if (!Deko9_TranslateShader(p, bytes, 0, &glsl, &m_info, error))
+        const uint64_t t0 = LockClockNs();
+        const bool translated = Deko9_TranslateShader(p, bytes, 0, &glsl, &m_info, error, nullptr, 0, false, 0, shaderOpt);
+        device->m_shaderStats.NoteTranslate(LockClockNs() - t0);
+        if (!translated)
             return false;
     }
     if (m_info.stage != stage)
         return *error = "shader stage does not match the create call", false;
     // Compile the base variant now, during loading, not at first draw.
-    return Variant(device, 0) != nullptr;
+    VariantSelect base;
+    base.shaderOpt = shaderOpt;
+    if (!BuildCode(device, base, baseDksh))
+        return *error = "base variant failed to build", false;
+    return true;
 }
 
-const ShaderVariant *ShaderBase::Variant(Device *device, uint32_t shadowMask, const InstanceLayout &instance,
-                                         bool earlyZ)
+bool ShaderBase::Finish(Device *device, const std::vector<uint8_t> &baseDksh, uint32_t shaderOpt, std::string *error)
 {
-    // r_shadowFilter only changes pixel shaders with a depth-compare sampler
-    // (the rewrite is inert without one), so only those get another variant.
-    const uint32_t shadowFilter = shadowMask && m_stage == DEKO9_STAGE_PIXEL ? device->ShadowFilter() : 0;
-    for (const auto &variant : m_variants)
-    {
-        if (variant->shadowMask == shadowMask && variant->instance == instance && variant->earlyZ == earlyZ &&
-            variant->shadowFilter == shadowFilter)
-            return variant.get();
-    }
-    if (instance.count && m_stage != DEKO9_STAGE_VERTEX)
+    id = device->NextId();
+    VariantSelect base;
+    base.shaderOpt = shaderOpt;
+    if (!Install(device, base, baseDksh))
+        return *error = "base variant failed to load", false;
+    // r_deko9ShaderOpt changed since Prepare: the current options' base
+    // variant builds now, with the lock held, as a draw would.
+    if (shaderOpt != device->ShaderOpt() && !Variant(device, 0))
+        return *error = "base variant failed to build", false;
+    return true;
+}
+
+VariantSelect ShaderBase::Select(const Device *device, uint32_t shadowMask, const InstanceLayout &instance,
+                                 bool earlyZ) const
+{
+    VariantSelect s;
+    s.shadowMask = shadowMask;
+    s.instance = instance;
+    s.earlyZ = earlyZ;
+    s.shadowFilter = VariantShadowFilter(m_stage, shadowMask, device->ShadowFilter());
+    s.shaderOpt = device->ShaderOpt();
+    return s;
+}
+
+const ShaderVariant *ShaderBase::Find(const VariantSelect &select) const
+{
+    return m_variants.Find(select);
+}
+
+bool ShaderBase::Valid(const VariantSelect &select) const
+{
+    if (select.instance.count && m_stage != DEKO9_STAGE_VERTEX)
     {
         Fail("SHADER", "%016llx: instance layout on a pixel shader", (unsigned long long)m_hash);
-        return nullptr;
+        return false;
     }
-    if (earlyZ && (m_stage != DEKO9_STAGE_PIXEL || m_info.writesDepth))
+    if (select.earlyZ && (m_stage != DEKO9_STAGE_PIXEL || m_info.writesDepth))
     {
         Fail("SHADER", "%016llx: early-Z variant of a %s", (unsigned long long)m_hash,
              m_stage != DEKO9_STAGE_PIXEL ? "vertex shader" : "depth-writing pixel shader");
-        return nullptr;
+        return false;
     }
+    return true;
+}
+
+bool ShaderBase::BuildCode(Device *device, const VariantSelect &select, std::vector<uint8_t> *dksh, bool *packHit) const
+{
+    if (packHit)
+        *packHit = false;
+    if (!Valid(select))
+        return false;
+    const uint32_t shadowMask = select.shadowMask;
+    const InstanceLayout &instance = select.instance;
+    const bool earlyZ = select.earlyZ;
+    const uint32_t shadowFilter = select.shadowFilter;
+    const uint32_t shaderOpt = select.shaderOpt;
     // DEKO9_SHADOW_FILTER_VERSION rides in the key (not a separate
     // file-name suffix any more): a changed shadowFilter rewrite still
     // never hits a pack record an older one built.
@@ -1534,51 +1640,135 @@ const ShaderVariant *ShaderBase::Variant(Device *device, uint32_t shadowMask, co
                                instance.Hash(),
                                shadowFilter,
                                shadowFilter ? (uint32_t)DEKO9_SHADOW_FILTER_VERSION : 0u,
+                               shaderOpt,
+                               shaderOpt ? (uint32_t)DEKO9_SHADER_OPT_VERSION : 0u,
                                (uint8_t)(earlyZ ? 1 : 0)};
-    std::vector<uint8_t> dksh;
+    dksh->clear();
     {
         std::lock_guard<std::mutex> lock(g_shaderPackLock);
         if (const ShaderPackRecord *hit = g_shaderPack.Find(key))
-            dksh = hit->dksh; // copy out: cheap, and keeps ShaderVariant self-contained
+            *dksh = hit->dksh; // copy out: cheap, and keeps ShaderVariant self-contained
     }
     std::string error;
-    if (dksh.empty())
+    ShaderBuildStats &stats = device->m_shaderStats;
+    stats.NotePackLookup(!dksh->empty());
+    if (!dksh->empty())
     {
-        std::string glsl;
-        Deko9ShaderInfo info{};
-        if (!Deko9_TranslateShader(m_bytecode.data(), m_bytecode.size(), shadowMask, &glsl, &info, &error,
-                                   instance.regs, instance.count, earlyZ, shadowFilter) ||
-            !Deko9_CompileDksh(m_stage, glsl, &dksh, &error))
+        if (packHit)
+            *packHit = true;
+        return true;
+    }
+    std::string glsl;
+    Deko9ShaderInfo info{};
+    // Timing only: translate (MojoShader) and compile (UAM) are timed
+    // apart; the whole miss, retail retry included, is the compile time.
+    const uint64_t buildStart = LockClockNs();
+    uint64_t uamNs = 0;
+    const bool translated = Deko9_TranslateShader(m_bytecode.data(), m_bytecode.size(), shadowMask, &glsl, &info,
+                                                  &error, instance.regs, instance.count, earlyZ, shadowFilter,
+                                                  shaderOpt);
+    const uint64_t translateNs = LockClockNs() - buildStart;
+    stats.NoteTranslate(translateNs);
+    bool compiled = false;
+    if (translated)
+    {
+        const uint64_t uamStart = LockClockNs();
+        compiled = Deko9_CompileDksh(m_stage, glsl, dksh, &error);
+        uamNs += LockClockNs() - uamStart;
+    }
+    if (!translated || !compiled)
+    {
+        Fail("SHADER", "%016llx mask=0x%x inst=%u ez=%u sf=%u opt=%u: %s", (unsigned long long)m_hash, shadowMask,
+             (unsigned)instance.count, (unsigned)earlyZ, shadowFilter, shaderOpt, error.c_str());
+        dksh->clear();
+        return false;
+    }
+    // An option that pushes a program past the register count of full
+    // occupancy (64 warps per SM at up to 32 GPRs) while the retail
+    // translation stays within it costs more latency hiding than it
+    // saves in slots: keep the retail code under the option's key.
+    Deko9DkshStats optStats{};
+    if (shaderOpt && Deko9_DkshStats(dksh->data(), dksh->size(), &optStats) && optStats.gprs > 32)
+    {
+        std::vector<uint8_t> retail;
+        Deko9DkshStats retailStats{};
+        const uint64_t retryStart = LockClockNs();
+        const bool retranslated = Deko9_TranslateShader(m_bytecode.data(), m_bytecode.size(), shadowMask, &glsl,
+                                                        &info, &error, instance.regs, instance.count, earlyZ,
+                                                        shadowFilter, 0);
+        stats.NoteTranslate(LockClockNs() - retryStart);
+        const uint64_t retryUamStart = LockClockNs();
+        const bool recompiled = retranslated && Deko9_CompileDksh(m_stage, glsl, &retail, &error);
+        if (retranslated)
+            uamNs += LockClockNs() - retryUamStart;
+        if (recompiled && Deko9_DkshStats(retail.data(), retail.size(), &retailStats) && retailStats.gprs <= 32)
         {
-            Fail("SHADER", "%016llx mask=0x%x inst=%u ez=%u sf=%u: %s", (unsigned long long)m_hash, shadowMask,
-                 (unsigned)instance.count, (unsigned)earlyZ, shadowFilter, error.c_str());
+            Log("shader %016llx opt=%u needs %u GPRs (%u slots), keeping the retail translation (%u GPRs, %u slots)",
+                (unsigned long long)m_hash, shaderOpt, optStats.gprs, optStats.instrs, retailStats.gprs,
+                retailStats.instrs);
+            dksh->swap(retail);
+        }
+    }
+    const uint64_t buildNs = LockClockNs() - buildStart;
+    const bool locked = device->Lock().OwnedByCaller();
+    // Only a build on the thread recording the frame belongs to that frame.
+    if (locked)
+        AddFrameExtra(DEKO9_EXTRA_COMPILE, buildNs);
+    if (stats.NoteCompile(buildNs))
+        Log("shader compile slow hash=%016llx stage=%s mask=0x%x inst=%u ez=%u sf=%u opt=%u us=%llu translateUs=%llu "
+            "uamUs=%llu locked=%d",
+            (unsigned long long)m_hash, m_stage == DEKO9_STAGE_PIXEL ? "ps" : "vs", shadowMask,
+            (unsigned)instance.count, (unsigned)earlyZ, shadowFilter, shaderOpt, (unsigned long long)(buildNs / 1000),
+            (unsigned long long)(translateNs / 1000), (unsigned long long)(uamNs / 1000), locked ? 1 : 0);
+    // Grown only in memory here; Deko9_FlushShaderPack() (called once
+    // per zone load, off this path) writes the delta back.
+    std::lock_guard<std::mutex> lock(g_shaderPackLock);
+    g_shaderPack.Append(key, info, *dksh);
+    return true;
+}
+
+const ShaderVariant *ShaderBase::Install(Device *device, const VariantSelect &select, const std::vector<uint8_t> &dksh)
+{
+    if (dksh.empty())
+        return m_variants.Find(select);
+    return m_variants.Install(select, [&]() -> std::unique_ptr<ShaderVariant> {
+        auto variant = std::make_unique<ShaderVariant>();
+        variant->shadowMask = select.shadowMask;
+        variant->instance = select.instance;
+        variant->earlyZ = select.earlyZ;
+        variant->shadowFilter = select.shadowFilter;
+        variant->shaderOpt = select.shaderOpt;
+        std::string error;
+        if (!device->LoadShaderCode(dksh, variant.get(), &error))
+        {
+            Fail("SHADER", "%016llx mask=0x%x: %s", (unsigned long long)m_hash, select.shadowMask, error.c_str());
             return nullptr;
         }
-        // Grown only in memory here; Deko9_FlushShaderPack() (called once
-        // per zone load, off this path) writes the delta back.
-        std::lock_guard<std::mutex> lock(g_shaderPackLock);
-        g_shaderPack.Append(key, info, dksh);
-    }
-    auto variant = std::make_unique<ShaderVariant>();
-    variant->shadowMask = shadowMask;
-    variant->instance = instance;
-    variant->earlyZ = earlyZ;
-    variant->shadowFilter = shadowFilter;
-    if (!device->LoadShaderCode(dksh, variant.get(), &error))
-    {
-        Fail("SHADER", "%016llx mask=0x%x: %s", (unsigned long long)m_hash, shadowMask, error.c_str());
+        return variant;
+    });
+}
+
+const ShaderVariant *ShaderBase::Variant(Device *device, uint32_t shadowMask, const InstanceLayout &instance,
+                                         bool earlyZ, bool *built)
+{
+    if (built)
+        *built = false;
+    const VariantSelect select = Select(device, shadowMask, instance, earlyZ);
+    if (const ShaderVariant *variant = Find(select))
+        return variant;
+    std::vector<uint8_t> dksh;
+    if (!BuildCode(device, select, &dksh))
         return nullptr;
-    }
-    m_variants.push_back(std::move(variant));
-    return m_variants.back().get();
+    if (built)
+        *built = true;
+    return Install(device, select, dksh);
 }
 
 void ShaderBase::ReleaseMemory(Device *device)
 {
     DeviceLockGuard lock(device->Lock());
-    for (const auto &variant : m_variants)
-        device->FreeMemoryAfter(variant->code, device->OpenSeq());
-    m_variants.clear();
+    m_variants.ForEach([&](const ShaderVariant &variant) { device->FreeMemoryAfter(variant.code, device->OpenSeq()); });
+    m_variants.Clear();
     device->ForgetBoundShaders();
     device->ForgetProgramObject(id); // baked units point at the freed variants
 }
@@ -1684,13 +1874,27 @@ HRESULT Device::CreateVertexShader(const DWORD *function, IDirect3DVertexShader9
     // Outside the device lock: on a warm boot this is the one SD read for
     // every shader this process creates. A no-op after the first call.
     EnsureShaderPackLoaded();
-    DeviceLockGuard lock(m_lock);
     if (!function || !out)
         return D3DERR_INVALIDCALL;
     *out = nullptr;
+    // Translation and the base variant's compile run without the device
+    // lock (a pack miss takes milliseconds the back end would wait out);
+    // only the install takes it.
+    uint32_t shaderOpt;
+    {
+        DeviceLockGuard lock(m_lock);
+        shaderOpt = m_shaderOpt;
+    }
     VertexShader *vs = new VertexShader(this);
     std::string error;
-    if (!vs->shader.Init(this, function, DEKO9_STAGE_VERTEX, &error))
+    std::vector<uint8_t> base;
+    bool ok = vs->shader.Prepare(this, function, DEKO9_STAGE_VERTEX, shaderOpt, &base, &error);
+    if (ok)
+    {
+        DeviceLockGuard lock(m_lock);
+        ok = vs->shader.Finish(this, base, shaderOpt, &error);
+    }
+    if (!ok)
     {
         vs->Release();
         return Fail("SHADER", "vertex shader: %s", error.c_str());
@@ -1703,13 +1907,24 @@ HRESULT Device::CreatePixelShader(const DWORD *function, IDirect3DPixelShader9 *
 {
     // Outside the device lock: see Device::CreateVertexShader.
     EnsureShaderPackLoaded();
-    DeviceLockGuard lock(m_lock);
     if (!function || !out)
         return D3DERR_INVALIDCALL;
     *out = nullptr;
+    uint32_t shaderOpt;
+    {
+        DeviceLockGuard lock(m_lock);
+        shaderOpt = m_shaderOpt;
+    }
     PixelShader *ps = new PixelShader(this);
     std::string error;
-    if (!ps->shader.Init(this, function, DEKO9_STAGE_PIXEL, &error))
+    std::vector<uint8_t> base;
+    bool ok = ps->shader.Prepare(this, function, DEKO9_STAGE_PIXEL, shaderOpt, &base, &error);
+    if (ok)
+    {
+        DeviceLockGuard lock(m_lock);
+        ok = ps->shader.Finish(this, base, shaderOpt, &error);
+    }
+    if (!ok)
     {
         ps->Release();
         return Fail("SHADER", "pixel shader: %s", error.c_str());

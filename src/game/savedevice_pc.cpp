@@ -11,6 +11,7 @@
 #include <script/scr_readwrite.h>   // Scr_SaveSourceImmediate
 #ifndef KISAK_XBOX
 #include <qcommon/com_playerprofile.h>
+#include <port/switch_save_writer.h>
 #endif
 
 // void __cdecl SaveDevice_Init(void)    8227fb88 f   savedevice_xenon.obj
@@ -149,6 +150,7 @@ int __cdecl OpenDevice(char const *name, void **fileHandle)
 {
 	if (!fileHandle)
 		return -1;
+	SwitchSave_WaitForWrites();
 	int handle = 0;
 	unsigned int size = FS_FOpenFileRead(name, &handle);
 	if (!handle)
@@ -183,6 +185,7 @@ static bool SaveExistsValidated(char const *path)
 	if (!path || !*path)
 		return false;
 
+	SwitchSave_WaitForWrites();
 	FS_FOpenFileRead(path, &handle);
 	if (!handle)
 		return false;
@@ -224,6 +227,12 @@ int __cdecl WriteSaveToDevice(unsigned char *data, struct SaveHeader const *save
 		g_saveDevice_lastSaveSucceeded = false;
 		return -1;
 	}
+
+#ifndef KISAK_XBOX
+	SwitchSave_Submit(saveHeader, data);
+	g_saveDevice_lastSaveSucceeded = true;
+	return 0;
+#endif
 
 #ifdef KISAK_XBOX
 	int handle = FS_FOpenFileWrite(saveHeader->filename);

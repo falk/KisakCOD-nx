@@ -64,6 +64,9 @@ size_t Switch_ServerStackUsed();
 // process mask other than the calling (main) thread's, or libnx's default
 // core (-2) when the process has only one.
 int Switch_ServerThreadCpuId();
+// Core frame worker `threadIndex` was pinned to when spawned, or -1 when it
+// was not spawned or has no core of its own.
+int Switch_WorkerThreadCpuId(uint32_t threadIndex);
 // switch_thread_sync.cpp: retail's renderer handshake events (threads.cpp:145-149),
 // created by Sys_SpawnRenderThread.
 void Switch_CreateRendererEvents();

@@ -18,6 +18,7 @@
 #include <gfx_d3d/r_screenshot.h>
 #include <physics/phys_local.h>
 #include <gfx_d3d/r_model_skin.h>
+#include "switch_dirtree.h"
 
 #ifdef __SWITCH__
 #include <switch.h>
@@ -100,8 +101,7 @@ char *Sys_DefaultInstallPath(void)
 
 BOOL __cdecl Sys_RemoveDirTree(const char *path)
 {
-    (void)path;
-    return 0;
+    return Switch_RemoveDirTree(path);
 }
 
 // switch_sp_main.cpp already performs this port's real one-time platform

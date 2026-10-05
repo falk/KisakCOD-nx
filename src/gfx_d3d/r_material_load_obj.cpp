@@ -2,6 +2,7 @@
 #include <universal/surfaceflags.h>
 #include "r_material.h"
 #include "r_utils.h"
+#include "r_shader_constant_sort.h"
 #include <universal/com_files.h>
 
 #include <algorithm>
@@ -6293,26 +6294,9 @@ uint32_t __cdecl R_DrawSurfStandardPrepassSortKey(const Material *material)
 
 void __cdecl R_RegisterShaderConst(uint32_t dest, const float *value, GfxShaderConstantBlock *consts)
 {
-    uint32_t sortedIndex; // [esp+4h] [ebp-4h]
-
-    if (consts->count >= 0x10)
-        MyAssertHandler(
-            ".\\r_material_consts.cpp",
-            15,
-            1,
-            "consts->count doesn't index ARRAY_COUNT( consts->dest )\n\t%i not in [0, %i)",
-            consts->count,
-            16);
-    for (sortedIndex = consts->count;
-        sortedIndex && *(&consts->count + sortedIndex + 1) > dest;
-        consts->value[sortedIndex + 1] = consts->value[sortedIndex])
-    {
-        --sortedIndex;
-        consts->dest[sortedIndex + 1] = consts->dest[sortedIndex];
-    }
-    consts->dest[sortedIndex] = dest;
-    consts->value[sortedIndex] = value;
-    ++consts->count;
+    if (!R_InsertShaderConstant(*consts, dest, value))
+        Com_Error(ERR_DROP, "Invalid literal shader constant (register %u, count %u, capacity 16)",
+                  dest, consts->count);
 }
 
 void __cdecl R_GetPixelLiteralConsts(
@@ -6434,10 +6418,10 @@ int __cdecl R_ComparePixelConsts(const Material **material, const MaterialPass *
             return comparison;
         for (j = 0; j < 4; ++j)
         {
-            if (pixelLiteralConsts[1].value[constIndex][j] > pixelLiteralConsts[0].value[constIndex][j])
-                return -1;
-            if (pixelLiteralConsts[1].value[constIndex][j] < pixelLiteralConsts[0].value[constIndex][j])
-                return 1;
+            comparison = R_CompareShaderFloat(pixelLiteralConsts[0].value[constIndex][j],
+                                              pixelLiteralConsts[1].value[constIndex][j]);
+            if (comparison)
+                return comparison;
         }
     }
     return 0;

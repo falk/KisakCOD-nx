@@ -27,6 +27,7 @@ const FormatInfo kFormats[] = {
     {D3DFMT_R16F, DkImageFormat_R16_Float, {R, O, O, O}, 1, 2, false, false, true},
     {D3DFMT_G16R16F, DkImageFormat_RG16_Float, {R, G, O, O}, 1, 4, false, false, true},
     {D3DFMT_A16B16G16R16F, DkImageFormat_RGBA16_Float, {R, G, B, A}, 1, 8, false, false, true},
+    {D3DFMT_A2B10G10R10, DkImageFormat_RGB10A2_Unorm, {R, G, B, A}, 1, 4, false, false, true},
     {D3DFMT_R32F, DkImageFormat_R32_Float, {R, O, O, O}, 1, 4, false, false, true},
     {D3DFMT_G32R32F, DkImageFormat_RG32_Float, {R, G, O, O}, 1, 8, false, false, true},
     {D3DFMT_A32B32G32R32F, DkImageFormat_RGBA32_Float, {R, G, B, A}, 1, 16, false, false, true},

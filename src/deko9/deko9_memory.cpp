@@ -114,6 +114,17 @@ bool Heap::Contains(DkGpuAddr addr, uint32_t size) const
     return false;
 }
 
+bool Heap::ContainsWithAliases(DkGpuAddr addr) const
+{
+    for (const Chunk &chunk : m_chunks)
+    {
+        const DkGpuAddr base = dkMemBlockGetGpuAddr(chunk.block);
+        if (addr >= base && addr < base + 3ull * chunk.size)
+            return true;
+    }
+    return false;
+}
+
 void FillCanary(uint8_t *tail)
 {
     std::memset(tail, kCanaryByte, kCanaryBytes);
@@ -420,7 +431,9 @@ bool Deko9_FrameAlloc(IDirect3DDevice9 *device, uint64_t frame, uint32_t bytes, 
     if (!device || !out)
         return false;
     deko9::Device *d = static_cast<deko9::Device *>(device);
-    deko9::DeviceLockGuard lock(d->Lock());
+    // No device lock: the arena has its own mutex (a grow takes the device
+    // lock inside the chunk factory).
+    d->m_lockFree.arenaAllocs.fetch_add(1, std::memory_order_relaxed);
     deko9::ArenaSpan span;
     if (!d->FrameAlloc(frame, bytes, align, &span))
         return false;

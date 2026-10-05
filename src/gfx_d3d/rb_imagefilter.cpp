@@ -43,7 +43,7 @@ void __cdecl RB_VirtualToSceneRadius(float radius, float *radiusX, float *radius
 {
     iassert( radiusX );
     iassert( radiusY );
-    // The frame's scene height (r_dynres sizes the scene per frame).
+    // The frame's scene height (r_renderScale sizes the scene per frame).
     *radiusY = (double)gfxRenderTargets[R_RENDERTARGET_SCENE].height * radius / 480.0;
     *radiusX = *radiusY * vidConfig.aspectRatioScenePixel;
 }

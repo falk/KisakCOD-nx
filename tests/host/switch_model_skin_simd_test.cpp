@@ -269,7 +269,111 @@ void RunCase(std::mt19937 &rng, bool weighted, int mode, const char *name)
 }
 } // namespace
 
-int main()
+// Captures contain surface inputs from the production decoder, never native
+// pointers. Check real character weights and packed directions against the
+// same independent implementation used by the randomized proof.
+static bool CheckCapturedSurface(const char *path)
+{
+    FILE *file = std::fopen(path, "rb");
+    if (!file)
+        return false;
+    uint32_t h[10]{};
+    auto read = [&](void *p, size_t size) { return std::fread(p, 1, size, file) == size; };
+    if (!read(h, sizeof(h)) || h[0] != 0x534b494e || !h[1] || h[1] > 128 ||
+        h[2] > 65535 || h[3] > 1 || h[4] > 65535 || h[5] > 7 * 65535u)
+    {
+        std::fclose(file);
+        return false;
+    }
+    Case c;
+    c.vertCount = h[2];
+    c.surf.vertCount = h[2];
+    c.surf.deformed = h[3];
+    c.surf.vertListCount = h[4];
+    c.blend.resize(h[5]);
+    c.lists.resize(h[4]);
+    DObjSkelMat *bones = AlignedArray<DObjSkelMat>(h[1]);
+    c.verts = AlignedArray<GfxPackedVertex>(h[2] + 4);
+    bool valid = read(bones, h[1] * sizeof(*bones)) && read(c.verts, h[2] * sizeof(*c.verts)) &&
+                 read(c.blend.data(), h[5] * sizeof(uint16_t));
+    for (auto &list : c.lists)
+    {
+        uint16_t pair[2]{};
+        valid = read(pair, sizeof(pair)) && valid;
+        list.boneOffset = pair[0];
+        list.vertCount = pair[1];
+        valid = valid && pair[0] % 64 == 0 && pair[0] / 64 < h[1];
+    }
+    uint32_t vertices = 0, entries = 0;
+    for (int w = 0; w < 4; ++w)
+    {
+        valid = valid && h[6 + w] <= 32767;
+        c.surf.vertInfo.vertCount[w] = h[6 + w];
+        vertices += h[6 + w];
+        entries += (2 * w + 1) * h[6 + w];
+    }
+    if (h[3])
+    {
+        valid = valid && vertices == h[2] && entries == h[5] && h[4] == 0;
+        size_t index = 0;
+        for (int w = 0; valid && w < 4; ++w)
+            for (uint32_t v = 0; valid && v < h[6 + w]; ++v)
+            {
+                valid = c.blend[index] % 64 == 0 && c.blend[index] / 64 < h[1];
+                for (int k = 1; k <= w; ++k)
+                    valid = valid && c.blend[index + 2 * k - 1] % 64 == 0 &&
+                            c.blend[index + 2 * k - 1] / 64 < h[1];
+                index += 2 * w + 1;
+            }
+    }
+    else
+    {
+        vertices = 0;
+        for (const auto &list : c.lists)
+            vertices += list.vertCount;
+        valid = valid && vertices == h[2] && h[5] == 0;
+    }
+    valid = valid && std::fgetc(file) == EOF;
+    std::fclose(file);
+    c.surf.verts0 = c.verts;
+    c.surf.vertInfo.vertsBlend = c.blend.data();
+    c.surf.vertList = c.lists.data();
+    auto *a = AlignedArray<GfxPackedVertex>(h[2] + 1);
+    auto *b = AlignedArray<GfxPackedVertex>(h[2] + 1);
+    auto *na = AlignedArray<GfxPackedVertexNormal>(h[2] + 1);
+    auto *nb = AlignedArray<GfxPackedVertexNormal>(h[2] + 1);
+    auto *input = AlignedArray<GfxPackedVertexNormal>(h[2] + 1);
+    for (uint32_t v = 0; v < h[2]; ++v)
+    {
+        input[v].normal = c.verts[v].normal;
+        input[v].tangent = c.verts[v].tangent;
+    }
+    std::mt19937 rng(0xFACEu);
+    for (int pose = 0; valid && pose < 9; ++pose)
+    {
+        if (pose)
+            RandomBones(rng, bones, h[1]);
+        for (int mode = 0; mode < 3; ++mode)
+        {
+            R_SkinXSurfaceSkinnedSse(&c.surf, bones, mode == 2 ? input : nullptr, mode ? na : nullptr, a);
+            R_SkinXSurfaceSkinnedSimd(&c.surf, bones, mode == 2 ? input : nullptr, mode ? nb : nullptr, b);
+            Check(SameVerts(a, b, h[2]), path);
+            if (mode)
+                Check(!std::memcmp(na, nb, h[2] * sizeof(*na)), path);
+        }
+    }
+    std::printf("CAPTURE_SKIN valid=%d bones=%u vertices=%u poses=9 modes=3 file=%s\n", valid, h[1], h[2], path);
+    std::free(bones);
+    std::free(c.verts);
+    std::free(a);
+    std::free(b);
+    std::free(na);
+    std::free(nb);
+    std::free(input);
+    return valid;
+}
+
+int main(int argc, char **argv)
 {
     DecodeDivisionIsExact();
 #ifdef KISAK_SKIN_NEON_TEST
@@ -277,6 +381,8 @@ int main()
 #endif
     std::mt19937 rng(0xC0D4u);
     int cases = 0;
+    for (int i = 1; i < argc; ++i)
+        Check(CheckCapturedSurface(argv[i]), "character surface capture is invalid");
     for (int round = 0; round < 200; ++round)
     {
         for (int mode = 0; mode < 3; ++mode)

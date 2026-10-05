@@ -352,15 +352,11 @@ void __cdecl R_SyncGpu(int(__cdecl *WorkCallback)(unsigned __int64))
         PROF_SCOPED("R_SyncGpu");
         useWorkCallback = WorkCallback != 0;
         dx.gpuSyncStart = __rdtsc();
-#ifdef __SWITCH__
         SwitchPerf_AddEvent(SWITCH_PERF_EV_SYNCGPU_CALLS, 1);
-#endif
         R_AcquireGpuFenceLock();
         while (!R_GpuFenceTimeout())
         {
-#ifdef __SWITCH__
             SwitchPerf_AddEvent(SWITCH_PERF_EV_SYNCGPU_WAITS, 1);
-#endif
             if (useWorkCallback)
             {
                 R_ReleaseGpuFenceLock();
@@ -4412,6 +4408,13 @@ HRESULT __cdecl R_CreateDeviceInternal(HWND__ *hwnd, uint32_t behavior, _D3DPRES
             // r_deko9GpuMap from the start: the render targets are created
             // before the first frame applies the per-frame settings.
             Deko9_SetGpuMap(dx.device, r_deko9GpuMap ? (uint32_t)r_deko9GpuMap->current.integer : 0u);
+            // The shader variant options too: the zones loaded before the
+            // first frame create and prebake their shaders with them.
+            Deko9_SetEarlyZ(dx.device, r_deko9EarlyZ ? r_deko9EarlyZ->current.enabled : DEKO9_DEFAULT_EARLY_Z);
+            Deko9_SetShadowFilter(dx.device, r_shadowFilter ? (uint32_t)r_shadowFilter->current.integer
+                                                            : DEKO9_DEFAULT_SHADOW_FILTER);
+            Deko9_SetShaderOpt(dx.device, r_deko9ShaderOpt ? (uint32_t)r_deko9ShaderOpt->current.integer
+                                                           : DEKO9_DEFAULT_SHADER_OPT);
             break;
         }
         NET_Sleep(100);
@@ -4532,12 +4535,13 @@ static void R_SwitchApplyRenderResolution(GfxWindowParms *wndParms)
 {
     if (!r_renderResolution)
         return;
-    // r_dynres: the targets are allocated for the display size and the
-    // scene size is chosen per frame (r_dynres.h); r_renderResolution does
-    // not apply.
-    if (R_DynResEnabled())
+    // Scene layout (r_renderScale below 1 or r_dynres): the targets are
+    // allocated for the display size and the scene size is chosen per frame
+    // (r_dynres.h); r_renderResolution does not apply.
+    if (R_SceneLayoutEnabled())
     {
-        Com_Printf(CON_CHANNEL_GFX, "R_SetWndParms: r_dynres on: scene up to %dx%d, sized per frame, "
+        Com_Printf(CON_CHANNEL_GFX, "R_SetWndParms: scene layout on (r_renderScale/r_dynres): scene up to %dx%d, "
+                   "sized per frame, "
                    "r_renderResolution %s ignored\n", wndParms->displayWidth, wndParms->displayHeight,
                    Dvar_EnumToString(r_renderResolution));
         return;

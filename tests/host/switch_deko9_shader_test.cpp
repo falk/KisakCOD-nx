@@ -480,6 +480,8 @@ void CorpusCases(const char *dir)
     uint32_t shadowFilterVariants = 0;
     uint64_t shadowFilterInstrs[2] = {}, shadowFilterTex[2] = {};
     uint32_t pixelPrograms = 0, killing = 0, depthWriting = 0, earlyZVariants = 0;
+    uint64_t guardInstrs[2] = {}, guardBranches[2] = {};
+    uint32_t guardTernaries = 0, guardOverRegs = 0;
     const char *statsPath = std::getenv("KISAK_DEKO_SHADER_STATS");
     FILE *statsFile = statsPath ? std::fopen(statsPath, "w") : nullptr;
     while (dirent *entry = readdir(d))
@@ -666,6 +668,50 @@ void CorpusCases(const char *dir)
                 variantsOk = false;
             }
         }
+        // DEKO9_SHADER_OPT_GUARDS: every program compiles without a ternary
+        // in its body, with the same interface, no more control flow and at
+        // most one more slot (two retail programs trade a predicated pair
+        // for a select).
+        {
+            std::vector<uint8_t> optDksh;
+            Deko9ShaderInfo optInfo{};
+            Deko9DkshStats optStats{};
+            std::string optGlsl;
+            if (!Deko9_TranslateShader(bytes.data(), bytes.size(), 0, &optGlsl, &optInfo, &error, nullptr, 0, false,
+                                       0, DEKO9_SHADER_OPT_GUARDS) ||
+                !Deko9_CompileDksh(optInfo.stage, optGlsl, &optDksh, &error) ||
+                !Deko9_DkshStats(optDksh.data(), optDksh.size(), &optStats))
+            {
+                std::printf("DEKO9_CORPUS_FAIL %s guards: %s\n", entry->d_name, error.c_str());
+                variantsOk = false;
+            }
+            else
+            {
+                const size_t body = optGlsl.find("void deko9_main()") != std::string::npos
+                                        ? optGlsl.find("void deko9_main()")
+                                        : optGlsl.find("void main()");
+                const bool ternary = optGlsl.find(" ? ", body) != std::string::npos;
+                guardTernaries += ternary;
+                const bool sameInterface = optInfo.constRegs == base.constRegs &&
+                                           optInfo.samplerMask == base.samplerMask &&
+                                           optInfo.inputMask == base.inputMask &&
+                                           optInfo.varyingMask == base.varyingMask && optInfo.kills == base.kills &&
+                                           optInfo.writesDepth == base.writesDepth;
+                if (ternary || !sameInterface || optStats.branches > stats.branches ||
+                    optStats.instrs > stats.instrs + 1)
+                {
+                    std::printf("DEKO9_CORPUS_FAIL %s guards: ternary=%d interface=%d branches %u->%u slots %u->%u\n",
+                                entry->d_name, ternary, sameInterface, stats.branches, optStats.branches,
+                                stats.instrs, optStats.instrs);
+                    variantsOk = false;
+                }
+                guardInstrs[0] += stats.instrs;
+                guardInstrs[1] += optStats.instrs;
+                guardBranches[0] += stats.branches;
+                guardBranches[1] += optStats.branches;
+                guardOverRegs += optStats.gprs > 32 && stats.gprs <= 32;
+            }
+        }
         if (!variantsOk)
             continue;
         ++passed;
@@ -680,6 +726,10 @@ void CorpusCases(const char *dir)
     std::printf("DEKO9_CORPUS shadow_filter_variants=%u instrs=%llu->%llu tex=%llu->%llu\n", shadowFilterVariants,
                 (unsigned long long)shadowFilterInstrs[0], (unsigned long long)shadowFilterInstrs[1],
                 (unsigned long long)shadowFilterTex[0], (unsigned long long)shadowFilterTex[1]);
+    std::printf("DEKO9_CORPUS guards instrs=%llu->%llu branches=%llu->%llu ternaries=%u over_32_gprs=%u\n",
+                (unsigned long long)guardInstrs[0], (unsigned long long)guardInstrs[1],
+                (unsigned long long)guardBranches[0], (unsigned long long)guardBranches[1], guardTernaries,
+                guardOverRegs);
     Check(total > 0 && passed == total, "every corpus program translates and compiles");
 }
 
@@ -790,12 +840,217 @@ void ShaderPackCases()
 }
 } // namespace
 
+
+// ps_2_0 with every guarded D3D9 op: dcl t0; def c1; mov r0, t0;
+// rcp r1.x, r0.w; rcp r5.xyz, r0.w; rsq r1.y, r0.z; nrm r2.xyz, r0;
+// pow r1.z, r0.x, c1.y; cmp r3.xyz, -r0.x, c1, r2; cmp r3.w, r0.w, c1.x,
+// r5.x; mul r3.xyz, r3, r1; add r3.xyz, r3, r5; mov oC0, r3
+const uint32_t kPsGuards[] = {
+    0xFFFF0200,
+    0x0200001F, 0x80000000, 0xB00F0000,
+    0x05000051, 0xA00F0001, 0x00000000, 0x40828F5C, 0x3F800000, 0xC0400000,
+    0x02000001, 0x800F0000, 0xB0E40000,
+    0x02000006, 0x80010001, 0x80FF0000,
+    0x02000006, 0x80070005, 0x80FF0000,
+    0x02000007, 0x80020001, 0x80AA0000,
+    0x02000024, 0x80070002, 0x80E40000,
+    0x03000020, 0x80040001, 0x80000000, 0xA0550001,
+    0x04000058, 0x80070003, 0x81000000, 0xA0E40001, 0x80E40002,
+    0x04000058, 0x80080003, 0x80FF0000, 0xA0000001, 0x80000005,
+    0x03000005, 0x80070003, 0x80E40003, 0x80E40001,
+    0x03000002, 0x80070003, 0x80E40003, 0x80E40005,
+    0x02000001, 0x800F0800, 0x80E40003,
+    0x0000FFFF,
+};
+// vs_2_0: dcl_position v0; dp4 r0.x, v0, v0; rsq r0.y, r0.x; rcp r0.z,
+// r0.y; mov r0.w, c5.x; mul oPos, v0, r0.y; mov oT0, r0
+const uint32_t kVsGuards[] = {
+    0xFFFE0200,
+    0x0200001F, 0x80000000, 0x900F0000,
+    0x03000009, 0x80010000, 0x90E40000, 0x90E40000,
+    0x02000007, 0x80020000, 0x80000000,
+    0x02000006, 0x80040000, 0x80550000,
+    0x02000001, 0x80080000, 0xA0000005,
+    0x03000005, 0xC00F0000, 0x90E40000, 0x80550000,
+    0x02000001, 0xE00F0000, 0x80E40000,
+    0x0000FFFF,
+};
+
+// Host replicas of the guard formulas, old (MojoShader zero test around
+// the deko9 helper) and new (DEKO9_SHADER_OPT_GUARDS: the helper alone),
+// evaluated the way Maxwell does: denormal operands and results flushed,
+// min/max returning the non-NaN operand (fminf/fmaxf).
+float Flush(float x)
+{
+    return std::fpclassify(x) == FP_SUBNORMAL ? std::copysign(0.0f, x) : x;
+}
+float Clamp38(float x)
+{
+    return std::fminf(std::fmaxf(Flush(x), -1e38f), 1e38f);
+}
+float OldRcp(float x)
+{
+    x = Flush(x);
+    return x == 0.0f ? 1e38f : Clamp38(1.0f / x);
+}
+float NewRcp(float x)
+{
+    return Clamp38(1.0f / Flush(x));
+}
+float OldRsq(float x)
+{
+    x = Flush(x);
+    return x == 0.0f ? 1e38f : std::fminf(Flush(1.0f / std::sqrt(std::fabs(x))), 1e38f);
+}
+float NewRsq(float x)
+{
+    x = Flush(x);
+    return std::fminf(Flush(1.0f / std::sqrt(std::fabs(x))), 1e38f);
+}
+float OldPow(float a, float b)
+{
+    return Flush(std::exp2(b == 0.0f ? 0.0f : Flush(b * std::log2(Flush(a)))));
+}
+float NewPow(float a, float b)
+{
+    const float t = Flush(b * std::log2(Flush(a)));
+    return Flush(std::exp2(b == 0.0f ? 0.0f : t));
+}
+float OldCmp(float c, float a, float b)
+{
+    return (-c >= 0.0f) ? a : b;
+}
+float NewCmp(float c, float a, float b)
+{
+    const bool pick = -c >= 0.0f;
+    return pick ? a : b;
+}
+bool SameBits(float a, float b)
+{
+    uint32_t x, y;
+    std::memcpy(&x, &a, 4);
+    std::memcpy(&y, &b, 4);
+    return x == y || (std::isnan(a) && std::isnan(b));
+}
+
+// DEKO9_SHADER_OPT_GUARDS: the same programs translate without a ternary,
+// compile to straight-line code with fewer slots (the compiler predicates
+// the retail ternaries' if/else, so both sides issue), and the guard
+// formulas agree bit for bit on the edge cases they exist for; the one
+// intended difference is the sign of rcp's clamped infinity for -0 (IEEE,
+// as D3D9 hardware and DXVK).
+void ShaderOptCases()
+{
+    struct Program
+    {
+        const char *name;
+        const uint32_t *code;
+        size_t bytes;
+    };
+    const Program programs[] = {{"ps guards", kPsGuards, sizeof(kPsGuards)},
+                                {"vs guards", kVsGuards, sizeof(kVsGuards)},
+                                {"ps", kPs, sizeof(kPs)},
+                                {"vs", kVs, sizeof(kVs)}};
+    for (const Program &p : programs)
+    {
+        Deko9ShaderInfo info[2]{};
+        std::string glsl[2], error;
+        std::vector<uint8_t> dksh[2];
+        Deko9DkshStats stats[2]{};
+        bool ok = true;
+        for (uint32_t opt = 0; opt < 2 && ok; ++opt)
+        {
+            ok = Deko9_TranslateShader(p.code, p.bytes, 0, &glsl[opt], &info[opt], &error, nullptr, 0, false, 0,
+                                       opt ? DEKO9_SHADER_OPT_GUARDS : 0u) &&
+                 Deko9_CompileDksh(info[opt].stage, glsl[opt], &dksh[opt], &error) &&
+                 Deko9_DkshStats(dksh[opt].data(), dksh[opt].size(), &stats[opt]);
+            if (!ok)
+                std::printf("%s opt=%u: %s\n%s\n", p.name, opt, error.c_str(), glsl[opt].c_str());
+        }
+        char what[128];
+        std::snprintf(what, sizeof(what), "%s translates and compiles with both translations", p.name);
+        Check(ok, what);
+        if (!ok)
+            continue;
+        const size_t body = glsl[1].find("void main()");
+        std::snprintf(what, sizeof(what), "%s guards translation has no ternary", p.name);
+        Check(body != std::string::npos && glsl[1].find(" ? ", body) == std::string::npos, what);
+        std::snprintf(what, sizeof(what), "%s guards translation is straight-line code (%u branches)", p.name,
+                      stats[1].branches);
+        Check(stats[1].branches == 0, what);
+        std::snprintf(what, sizeof(what), "%s guards translation is no longer (%u -> %u slots)", p.name,
+                      stats[0].instrs, stats[1].instrs);
+        Check(stats[1].instrs <= stats[0].instrs, what);
+        std::snprintf(what, sizeof(what), "%s same interface under both translations", p.name);
+        Check(info[0].constRegs == info[1].constRegs && info[0].samplerMask == info[1].samplerMask &&
+                  info[0].inputMask == info[1].inputMask && info[0].varyingMask == info[1].varyingMask,
+              what);
+        if (p.code == kPsGuards)
+        {
+            Check(stats[1].instrs < stats[0].instrs, "ps guards translation saves slots");
+            Check(glsl[0].find("((ps_r0.w == 0.0) ? FLT_MAX : deko9_rcp(ps_r0.w))") != std::string::npos &&
+                      glsl[0].find("vec3((ps_r0.w == 0.0) ? FLT_MAX : deko9_rcp(ps_r0.w))") != std::string::npos &&
+                      glsl[0].find("((ps_r0.z == 0.0) ? FLT_MAX : deko9_rsq(abs(ps_r0.z)))") != std::string::npos &&
+                      glsl[0].find("((-ps_r0.x >= 0.0) ? ps_c1.xyz : ps_r2.xyz)") != std::string::npos &&
+                      glsl[0].find("((ps_r0.w >= 0.0) ? ps_c1.x : ps_r5.x)") != std::string::npos,
+                  "ps guards retail translation keeps the ternaries");
+            Check(glsl[1].find("ps_r1.x = (deko9_rcp(ps_r0.w));") != std::string::npos &&
+                      glsl[1].find("ps_r5.xyz = vec3(deko9_rcp(ps_r0.w));") != std::string::npos &&
+                      glsl[1].find("ps_r1.y = (deko9_rsq(abs(ps_r0.z)));") != std::string::npos &&
+                      glsl[1].find("ps_r2.xyz = deko9_nrm(ps_r0.xyz);") != std::string::npos &&
+                      glsl[1].find("ps_r1.z = deko9_pow(abs(ps_r0.x), ps_c1.y);") != std::string::npos &&
+                      glsl[1].find("ps_r3.xyz = (deko9_cmp(-ps_r0.x, ps_c1.xyz, ps_r2.xyz));") != std::string::npos &&
+                      glsl[1].find("ps_r3.w = (deko9_cmp(ps_r0.w, ps_c1.x, ps_r5.x));") != std::string::npos,
+                  "ps guards translation rewrites rcp/rsq/cmp to the helpers");
+            Check(glsl[1].find("float deko9_pow(float a, float b) { return exp2(mix(b * log2(a), 0.0, b == 0.0)); }") !=
+                      std::string::npos,
+                  "ps guards translation selects the pow exponent");
+        }
+        if (p.code == kVsGuards)
+            Check(glsl[1].find("vs_r0.y = (deko9_rsq(abs(vs_r0.x)));") != std::string::npos &&
+                      glsl[1].find("vs_r0.z = (deko9_rcp(vs_r0.y));") != std::string::npos,
+                  "vs guards translation rewrites rsq/rcp");
+    }
+    Deko9ShaderInfo info{};
+    std::string glsl, error;
+    Check(!Deko9_TranslateShader(kPs, sizeof(kPs), 0, &glsl, &info, &error, nullptr, 0, false, 0, 0x80u),
+          "unknown shader option bits are refused");
+
+    const float denormal = 1e-40f, inf = INFINITY, nan = NAN;
+    const float edges[] = {0.0f, -0.0f, denormal, -denormal, FLT_MIN, -FLT_MIN, FLT_TRUE_MIN, 1.0f, -1.0f, 3.0f,
+                           -0.5f, 1e-20f, -1e-20f, 1e20f, -1e20f, 1e38f, -1e38f, FLT_MAX, -FLT_MAX, inf, -inf, nan};
+    uint32_t rcpSignCases = 0;
+    for (float x : edges)
+    {
+        const float oldRcp = OldRcp(x), newRcp = NewRcp(x);
+        if (!SameBits(oldRcp, newRcp))
+        {
+            // Only a flushed -0: +1e38 before, -1e38 now.
+            Check(std::signbit(x) && Flush(x) == 0.0f && oldRcp == 1e38f && newRcp == -1e38f,
+                  "rcp guards differ only in the sign of the clamped infinity of -0");
+            ++rcpSignCases;
+        }
+        Check(SameBits(OldRsq(x), NewRsq(x)), "rsq guard formulas agree");
+        Check(std::isfinite(NewRcp(x)) == std::isfinite(OldRcp(x)) && (std::isnan(x) || std::isfinite(NewRsq(x))),
+              "guards keep rcp/rsq finite");
+        for (float y : edges)
+        {
+            Check(SameBits(OldPow(x, y), NewPow(x, y)), "pow guard formulas agree");
+            Check(SameBits(OldCmp(x, y, 3.0f), NewCmp(x, y, 3.0f)), "cmp select formulas agree");
+        }
+    }
+    Check(rcpSignCases == 2, "exactly -0 and the flushed negative denormal take the rcp sign case");
+    Check(NewPow(0.0f, 0.0f) == 1.0f && NewPow(0.0f, 2.0f) == 0.0f && OldPow(0.0f, 0.0f) == 1.0f,
+          "pow(0, 0) stays 1 and pow(0, 2) stays 0");
+}
+
 int main()
 {
     BuiltInCases();
     DkshStatsCases();
     EarlyZCases();
     ShadowFilterCases();
+    ShaderOptCases();
     ShaderPackCases();
     if (const char *corpus = std::getenv("KISAK_DEKO_SHADER_CORPUS"))
         CorpusCases(corpus);

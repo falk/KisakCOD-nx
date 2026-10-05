@@ -172,4 +172,46 @@ inline void OffscreenSize(int w, int h, int factor, int *ow, int *oh)
     *oh = (h + factor - 1) / factor;
 }
 
+// r_halfResParticles 3 (auto): whether the off-screen path is on, decided from
+// the measured GPU cost of the particle-bearing passes (Emissive, plus Hrp
+// when off-screen) averaged over a window of frames. The pass costs a fixed
+// ~2 ms and shrinks the particles' own cost to about a quarter, so it only
+// pays above a break-even particle cost; two thresholds and a dwell keep it
+// from flapping, and the window restarts at every switch so each decision
+// uses only frames drawn in the current mode.
+struct AutoGate
+{
+    bool on = false;
+    uint32_t frames = 0;      // frames in the current window
+    uint64_t ns = 0;          // particle-pass ns in the window
+    uint32_t sinceSwitch = 0; // frames since the last switch
+
+    static constexpr uint32_t kWindow = 30;
+    static constexpr uint32_t kDwell = 90;
+
+    // One call per frame with that frame's particle-pass GPU ns; returns
+    // whether the next frame draws off-screen.
+    bool Update(uint64_t frameNs, double onMs, double offMs)
+    {
+        ++sinceSwitch;
+        ns += frameNs;
+        if (++frames < kWindow)
+            return on;
+        const double ms = (double)ns / frames / 1e6;
+        frames = 0;
+        ns = 0;
+        if (sinceSwitch < kDwell)
+            return on;
+        if (!on && ms > onMs)
+            on = true, sinceSwitch = 0;
+        else if (on && ms < offMs)
+            on = false, sinceSwitch = 0;
+        return on;
+    }
+    void Reset()
+    {
+        *this = AutoGate();
+    }
+};
+
 } // namespace hrp

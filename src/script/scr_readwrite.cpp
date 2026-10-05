@@ -1519,6 +1519,11 @@ void __cdecl SaveMemory_SaveWriteImmediate(const void *buffer, unsigned int len,
 {
     if (!save || !save->f || !buffer || !len)
         return;
+    if (save->sink)
+    {
+        save->sink(save->f, buffer, len);
+        return;
+    }
     int handle = (int)(intptr_t)save->f;
     FS_Write((const char *)buffer, len, handle);
 }

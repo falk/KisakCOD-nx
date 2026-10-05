@@ -197,6 +197,8 @@ int main(void)
         if (Switch_InputPadButtonForCommand("+frag") != SWITCH_INPUT_BUTTON_R)
             return 1;
         if (Switch_InputPadButtonForCommand("+holdbreath") != 0
+            || Switch_InputPadButtonForCommand("+speed") != SWITCH_INPUT_BUTTON_ZL
+            || Switch_InputPadButtonForCommand("+throw") != SWITCH_INPUT_BUTTON_R
             || Switch_InputPadButtonForCommand("+melee_breath") != 0
             || Switch_InputPadButtonForCommand(NULL) != 0)
             return 1;

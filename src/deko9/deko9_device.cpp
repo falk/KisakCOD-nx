@@ -6,8 +6,11 @@
 
 #include "deko9_internal.h"
 #include "deko9_native.h"
+#include <platform/switch/switch_profile_format.h>
+#include <port/switch_perf.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 
 namespace deko9
@@ -62,6 +65,10 @@ bool Device::Init(std::string *error)
     // teardown is what actually releases this memory, like every other
     // POOL_BUFFER allocation that outlives its owner.
     m_frameArena.SetFactory([this](uint32_t size, ArenaChunkMemory *out) {
+        // A grow comes from any producer thread, outside the device lock;
+        // the heap needs it (FrameArena calls this with its own mutex
+        // released, so the lock order stays device lock -> arena mutex).
+        DeviceLockGuard lock(m_lock, "FrameArena grow");
         GpuAlloc mem;
         if (!AllocMemory(POOL_BUFFER, size, 256, &mem))
             return false;
@@ -213,6 +220,7 @@ Device::~Device()
         Rebind(m_vs, (VertexShader *)nullptr);
         Rebind(m_ps, (PixelShader *)nullptr);
         ReleaseUpscaler();
+        ReleaseTaau();
         if (m_backBuffer)
             m_backBuffer->Release();
         if (m_swapChainObject)
@@ -246,11 +254,19 @@ void Device::AddCmdMemory(void *userData, DkCmdBuf cmd, size_t minSize)
 {
     Device *device = static_cast<Device *>(userData);
     GpuAlloc chunk;
-    const uint32_t want = std::max<uint32_t>(kCmdChunk, AlignUp((uint32_t)minSize, 256));
-    if (want == kCmdChunk && !device->m_freeCmdChunks.empty())
+    const uint32_t size = device->m_cmdChunkBytes;
+    const uint32_t want = std::max<uint32_t>(size, AlignUp((uint32_t)minSize, 256));
+    auto &free = device->m_freeCmdChunks;
+    while (!free.empty() && free.back().size != size)
     {
-        chunk = device->m_freeCmdChunks.back();
-        device->m_freeCmdChunks.pop_back();
+        // Oversize or from an earlier chunk size; its list has completed.
+        device->FreeMemoryAfter(free.back(), 0);
+        free.pop_back();
+    }
+    if (want == size && !free.empty())
+    {
+        chunk = free.back();
+        free.pop_back();
     }
     else if (!device->AllocMemory(POOL_CMD, want, 256, &chunk))
     {
@@ -261,6 +277,12 @@ void Device::AddCmdMemory(void *userData, DkCmdBuf cmd, size_t minSize)
     device->m_openCmdChunks.push_back(chunk);
 }
 
+void Device::SetCmdChunkBytes(uint32_t bytes)
+{
+    bytes = bytes ? std::min<uint32_t>(std::max<uint32_t>(AlignUp(bytes, 256), 1u << 10), 4u << 20) : kCmdChunk;
+    m_cmdChunkWanted.store(bytes, std::memory_order_relaxed);
+}
+
 void Device::RecordTimestamp(bool end)
 {
     if (m_timestamps.gpu)
@@ -268,14 +290,63 @@ void Device::RecordTimestamp(bool end)
                               m_timestamps.gpu + (m_openSeq % kFenceRing) * 32 + (end ? 16 : 0));
 }
 
+void Device::TiledSync()
+{
+    // Tiled caching keeps binned work in the cache until a flush: it must be
+    // flushed before anything reads what was rendered (barriers, a target
+    // change, the end of the list).
+    if (m_tiledOn)
+    {
+        dkCmdBufTiledCacheOp(m_cmd, DkTiledCacheOp_Flush);
+        ++m_cc.tiledOps;
+    }
+}
+
+void Device::CmdBarrier(DkBarrier mode, uint32_t invalidate)
+{
+    TiledSync();
+    ++m_cc.barrier[mode];
+    m_cc.inval[0] += (invalidate & DkInvalidateFlags_L2Cache) != 0;
+    m_cc.inval[1] += (invalidate & DkInvalidateFlags_Image) != 0;
+    m_cc.inval[2] += (invalidate & DkInvalidateFlags_Shader) != 0;
+    m_cc.inval[3] += (invalidate & DkInvalidateFlags_Descriptors) != 0;
+    m_cc.inval[4] += (invalidate & DkInvalidateFlags_Zcull) != 0;
+    dkCmdBufBarrier(m_cmd, mode, invalidate);
+}
+
+void Device::CmdBindTargets(const DkImageView *const colors[], uint32_t count, const DkImageView *depth)
+{
+    TiledSync();
+    ++m_cc.targetBinds;
+    dkCmdBufBindRenderTargets(m_cmd, colors, count, depth);
+}
+
 void Device::BeginList()
 {
+    if (m_faultTrace)
+        FaultTraceTop(CrumbBegin(m_openSeq));
     RecordTimestamp(false);
     // Every list starts from coherent caches: CPU writes made before this
     // point (uploads, renamed buffers, recycled memory) become visible.
-    dkCmdBufBarrier(m_cmd, DkBarrier_None,
+    CmdBarrier(DkBarrier_None,
                     DkInvalidateFlags_Image | DkInvalidateFlags_Shader | DkInvalidateFlags_Descriptors |
                         DkInvalidateFlags_L2Cache);
+    if (m_tiledWanted != m_tiledOn)
+    {
+        if (m_tiledWanted)
+        {
+            const uint32_t size = m_tiledWanted == 2 ? 64 : 128;
+            dkCmdBufSetTileSize(m_cmd, size, size);
+            dkCmdBufTiledCacheOp(m_cmd, DkTiledCacheOp_Enable);
+        }
+        else
+        {
+            dkCmdBufTiledCacheOp(m_cmd, DkTiledCacheOp_Flush);
+            dkCmdBufTiledCacheOp(m_cmd, DkTiledCacheOp_Disable);
+        }
+        m_tiledOn = m_tiledWanted;
+        m_cc.tiledOps += 2;
+    }
     // Per-pass timing: the pass that was running when the last list closed
     // continues here (the GPU idle time in between is not counted).
     if (GpuPassesOn())
@@ -302,9 +373,30 @@ void Device::BeginList()
         FaultTraceBeginList();
 }
 
+void Device::FlushProfileFrames()
+{
+    if (!m_profileFrameCount)
+        return;
+    kisakperf::Json record;
+    kisakperf::Samples(record, "gpu.busy", "busy", ++m_profileBatchSeq,
+                      "\"frame\",\"time\",\"value\",\"width\",\"height\",\"list_seq\"");
+    for (unsigned i = 0; i < m_profileFrameCount; ++i)
+    {
+        const ProfileFrame &f = m_profileFrames[i];
+        record.Raw("%s[%llu,%llu,%llu,%u,%u,%llu]", i ? "," : "",
+                   (unsigned long long)f.frame, (unsigned long long)f.time,
+                   (unsigned long long)f.busy, f.width, f.height, (unsigned long long)f.list);
+    }
+    // Observation time is the CPU clock at retirement, not a GPU start time.
+    record.Raw("],\"tags\":{\"timing\":\"sum_of_list_busy\",\"alignment\":\"retirement_observation\",\"frame_domain\":\"gpu\"}}");
+    LogLine(record.Line());
+    m_profileFrameCount = 0;
+}
+
 void Device::RetireSeq(uint64_t seq)
 {
     m_completedSeq = seq;
+    m_completedSeqPub.store(seq, std::memory_order_release);
     // Query markers of retired lists: their queries answer from the list's
     // fence from now on (EventDone asks the list first), so the fence
     // struct may be recorded into a later list.
@@ -328,6 +420,7 @@ void Device::RetireSeq(uint64_t seq)
         const uint64_t ns = dkTimestampToNs(end - start);
         m_timing.gpuNs += ns;
         m_frameAccumNs += ns;
+        AddFrameExtra(DEKO9_EXTRA_GPU, ns);
     }
     ++m_timing.lists;
     // Dynamic resolution: a presented frame's GPU busy time is the sum of
@@ -339,6 +432,14 @@ void Device::RetireSeq(uint64_t seq)
         const uint64_t count = ++m_gpuFramesPublished;
         const uint64_t us = std::min<uint64_t>(m_frameAccumNs / 1000, 0xffffffffull);
         m_frameAccumNs = 0;
+        if (GpuPassesOn() && !m_profileFrameIncomplete)
+        {
+            m_profileFrames[m_profileFrameCount++] = {count, armTicksToNs(armGetSystemTick()) / 1000,
+                                                     us, end.seq, end.width, end.height};
+            if (m_profileFrameCount == 8)
+                FlushProfileFrames();
+        }
+        m_profileFrameIncomplete = false;
         m_gpuFrameA.store(count << 32 | us, std::memory_order_relaxed);
         m_gpuFrameB.store(count << 32 | (uint64_t)(end.width & 0xffff) << 16 | (end.height & 0xffff),
                           std::memory_order_release);
@@ -413,6 +514,7 @@ void Device::RetirePassMarks(uint64_t seq)
             const uint64_t ns = dkTimestampToNs(ts - m_passPrevTs);
             m_passNs[m_passPrev] += ns;
             m_passNsTotal[m_passPrev] += ns;
+            AddGpuPassFrameExtra(m_passPrev, ns);
         }
         if (mark.zcull)
             ZcullRetireMark(slot, mark);
@@ -430,8 +532,41 @@ namespace
 const char *const kGpuPassNames[Deko9GpuPass_Count] = {
     "other", "shadow", "floatz", "clear", "prepass", "lit", "decal", "sun",
     "lights", "resolve", "emissive", "postfx", "sunpost", "view2d", "hud2d", "present", "upscale", "hrp",
+    "taau_resolve", "taau_motion", "taau_reactive",
+};
+// Slow-frame extra names for the GPU passes (kGpuPassNames with a gp. prefix).
+const char *const kGpuPassExtraNames[Deko9GpuPass_Count] = {
+    "gp.other", "gp.shadow", "gp.floatz", "gp.clear", "gp.prepass", "gp.lit", "gp.decal", "gp.sun",
+    "gp.lights", "gp.resolve", "gp.emissive", "gp.postfx", "gp.sunpost", "gp.view2d", "gp.hud2d", "gp.present",
+    "gp.upscale", "gp.hrp", "gp.taau_resolve", "gp.taau_motion", "gp.taau_reactive",
 };
 } // namespace
+
+void AddFrameExtra(Deko9FrameExtra which, uint64_t ns)
+{
+    static const int slots[DEKO9_EXTRA_COUNT] = {
+        SwitchPerf_RegisterFrameExtra("gpu"),
+        SwitchPerf_RegisterFrameExtra("lockwait"),
+        SwitchPerf_RegisterFrameExtra("compile"),
+        SwitchPerf_RegisterFrameExtra("bake"),
+    };
+    if (SwitchPerf_g_enabled && which < DEKO9_EXTRA_COUNT)
+        SwitchPerf_AddFrameExtra(slots[which], ns);
+}
+
+void AddGpuPassFrameExtra(uint32_t pass, uint64_t ns)
+{
+    if (!SwitchPerf_g_enabled || pass >= Deko9GpuPass_Count)
+        return;
+    static int slots[Deko9GpuPass_Count];
+    static const bool registered = [] {
+        for (uint32_t i = 0; i < Deko9GpuPass_Count; ++i)
+            slots[i] = SwitchPerf_RegisterFrameExtra(kGpuPassExtraNames[i]);
+        return true;
+    }();
+    (void)registered;
+    SwitchPerf_AddFrameExtra(slots[pass], ns);
+}
 
 void Device::ReportGpuPasses()
 {
@@ -482,18 +617,28 @@ void Device::SubmitOpenList()
     bool firstForeign;
     if (!m_submitOwner.Check(ThreadTag(), &firstForeign) && firstForeign)
         ReportForeignSubmit();
-    const uint32_t slot = (uint32_t)(m_openSeq % kFenceRing);
     // The slot's previous list must be finished before its fence is reused.
-    if (m_fenceSeq[slot] && m_fenceSeq[slot] > m_completedSeq)
-        WaitSeq(m_fenceSeq[slot]);
+    // WaitSeq releases the device lock while the GPU runs, and a thread that
+    // submits meanwhile advances m_openSeq, so the slot is derived again
+    // after each wait; nothing from here to the signal releases the lock.
+    const uint32_t slot = ReserveListSlot(m_fenceSeq, m_openSeq, m_completedSeq, [&](uint64_t seq) {
+        WaitSeq(seq);
+        return m_completedSeq >= seq;
+    });
     Stats().thread = (uintptr_t)threadGetSelf();
     CensusBreak(); // a bracket never spans lists (the idle gap between them)
     if (GpuPassesOn())
         RecordPassMark(kPassClose);
     RecordTimestamp(true);
     if (m_faultTrace)
+    {
         dkCmdBufReportValue(m_cmd, CrumbEnd(m_openSeq), m_crumbs.gpu);
+        FaultTraceTop(CrumbEnd(m_openSeq));
+    }
+    TiledSync();
     const DkCmdList list = dkCmdBufFinishList(m_cmd);
+    if (m_faultTrace)
+        NoteListSegments(m_openSeq, list);
     if (dkQueueIsInErrorState(m_queue))
     {
         // A GPU fault (details come from libdeko3dd as FAIL:DEKO9_DK lines).
@@ -513,6 +658,8 @@ void Device::SubmitOpenList()
     dkQueueSubmitCommands(m_queue, list);
     dkQueueSignalFence(m_queue, &m_fences[slot], true);
     dkQueueFlush(m_queue);
+    ++m_cc.submits;
+    ++m_cc.flushes;
     m_fenceSeq[slot] = m_openSeq;
     m_submittedSeq.store(m_openSeq, std::memory_order_release);
     {
@@ -526,15 +673,16 @@ void Device::SubmitOpenList()
     }
     RetireCmdMemory(m_openSeq);
     ++m_openSeq;
+    m_openSeqPub.store(m_openSeq, std::memory_order_release);
     m_listHasWork = false;
     BeginList();
 }
 
 void Device::ReportForeignSubmit()
 {
-    // Not fatal by itself (the interleave needs the owner to be inside one of
-    // its unlocked GPU waits at the same time), but the rule the unlocked
-    // waits rely on is broken: report it with where it happened.
+    // Not fatal by itself (the unlocked waits re-derive their fence slot),
+    // but it cuts the render owner's list at an arbitrary call: report it
+    // with where it happened.
     Fail("SUBMIT_THREAD",
          "list seq=%llu submitted by thread 0x%llx while thread 0x%llx owns rendering (last draw thread %s); "
          "only the render owner may submit (unlocked waits in SubmitOpenList/Present); later violations are "
@@ -578,9 +726,9 @@ void Device::WaitSeq(uint64_t seq)
                  (unsigned long long)m_openSeq);
             break;
         }
-        // A copy of the fence: the slot is reused only by the draw thread's
-        // SubmitOpenList after this list retired, and the semaphore only
-        // moves forward (same reasoning as WaitSeqFor).
+        // A copy of the fence: the slot is reused only by a SubmitOpenList
+        // after this list retired, and the semaphore only moves forward
+        // (same reasoning as WaitSeqFor).
         DkFence fence = m_fences[next % kFenceRing];
         // Watchdog: a GPU that stops signalling must show up in the log
         // with the wait it blocks, not as a silent hang.
@@ -592,9 +740,11 @@ void Device::WaitSeq(uint64_t seq)
             {
                 // The GPU wait runs without the device lock: with the render
                 // back end on its own thread this is the section the main
-                // thread contends on most. The open list is not submitted
-                // meanwhile (only the draw thread submits); another thread's
-                // fence poll may retire lists, handled below.
+                // thread contends on most. Another thread's fence poll may
+                // retire lists meanwhile (handled below), and a thread that
+                // does not own rendering (a readback, WaitIdle) may submit
+                // the open list: callers re-derive what they read before the
+                // wait (SubmitOpenList re-derives its fence slot).
                 DeviceUnlockScope unlocked(m_lock);
                 result = dkFenceWait(&fence, 2000000000ll);
             }
@@ -697,6 +847,7 @@ EventMarker *Device::RecordEventMarker()
 
 bool Device::FrameDone(uint64_t frame)
 {
+    FoldObservedFrames();
     switch (m_frameRing.Query(frame))
     {
     case FrameRing<kFramesInFlight>::State::Done:
@@ -722,26 +873,30 @@ bool Device::FrameDone(uint64_t frame)
     return true;
 }
 
+bool Device::FrameDoneAnyThread(uint64_t frame)
+{
+    // No device lock: the engine's end-fence and GPU-sync polls run on the
+    // main thread while the render back end holds the lock for whole draw
+    // lists. The fence is a published copy (the slot is re-signalled only
+    // after this frame passed); polling it only reads its semaphore.
+    m_lockFree.framePolls.fetch_add(1, std::memory_order_relaxed);
+    return PublishedFrameDone(m_framePub, PublishedCompletedSeq(), frame,
+                              [](DkFence fence) { return dkFenceWait(&fence, 0) == DkResult_Success; });
+}
+
 bool Device::WaitFrameFor(uint64_t frame, int64_t timeoutNs)
 {
-    DkFence fence;
-    {
-        DeviceLockGuard lock(m_lock);
-        if (FrameDone(frame))
-            return true;
-        // Not presented: nothing will signal until the recording thread
-        // presents it. Inside a batch: never block with the lock held.
-        if (m_frameRing.Query(frame) != FrameRing<kFramesInFlight>::State::Pending || m_lock.Depth() > 1)
-            return false;
-        // A copy: the slot is re-signalled only after this frame passed.
-        fence = m_frameFences[FrameRing<kFramesInFlight>::Slot(frame)];
-    }
-    uint64_t waited = 0;
-    SleepPollFence(fence, timeoutNs, &waited);
-    DeviceLockGuard lock(m_lock);
-    ++m_timing.frameWaits;
-    m_timing.frameWaitNs += waited;
-    return FrameDone(frame);
+    m_lockFree.framePolls.fetch_add(1, std::memory_order_relaxed);
+    return PublishedFrameWait(
+        m_framePub, PublishedCompletedSeq(), frame, m_lock.OwnedByCaller(),
+        [](DkFence fence) { return dkFenceWait(&fence, 0) == DkResult_Success; },
+        [&](DkFence fence) {
+            uint64_t waited = 0;
+            const bool done = SleepPollFence(fence, timeoutNs, &waited);
+            m_lockFree.frameWaits.fetch_add(1, std::memory_order_relaxed);
+            m_lockFree.frameWaitNs.fetch_add(waited, std::memory_order_relaxed);
+            return done;
+        });
 }
 
 bool Device::RawSeqPassed(uint64_t seq)
@@ -816,12 +971,12 @@ void Device::Barrier(bool copyEngine)
     // full barrier: those engines run beside the 3D pipe.
     if (m_barrierMode && !copyEngine)
     {
-        dkCmdBufBarrier(m_cmd, m_barrierMode == 2 ? DkBarrier_Fragments : DkBarrier_Primitives,
+        CmdBarrier(m_barrierMode == 2 ? DkBarrier_Fragments : DkBarrier_Primitives,
                         DkInvalidateFlags_Image);
         ++m_lightBarriers;
     }
     else
-        dkCmdBufBarrier(m_cmd, DkBarrier_Full, DkInvalidateFlags_Image | DkInvalidateFlags_L2Cache);
+        CmdBarrier(DkBarrier_Full, DkInvalidateFlags_Image | DkInvalidateFlags_L2Cache);
     ++m_writeClock;
     // S4a's static-store readEpoch re-stamp (a bound store OLD's tracker
     // would have re-added, and so re-stamped, every draw) lives in
@@ -991,9 +1146,56 @@ void Device::HazardCommit()
 
 // ---- presentation -----------------------------------------------------------
 
+// DEKO9 perf waiters: device-lock acquisitions by threads other than the
+// draw thread, per call site, over the last 60 frames (per frame: acquired,
+// of those blocked, time blocked), and the lock-free paths that replaced
+// the frame-loop ones. Steady state should show otherAcquires=0.00.
+void Device::ReportLockWaiters()
+{
+    char callers[640];
+    int off = 0;
+    const DeviceLock::CallerStats *cs = m_lock.Callers();
+    for (uint32_t i = 0; i < DeviceLock::kCallerSlots && cs[i].site; ++i)
+    {
+        DeviceLock::CallerStats &prev = m_callersReported[i];
+        const uint64_t acq = cs[i].acquisitions - prev.acquisitions;
+        const uint64_t blocked = cs[i].contended - prev.contended;
+        const uint64_t ns = cs[i].ns - prev.ns;
+        prev = cs[i];
+        if (!acq || off >= (int)sizeof(callers) - 1)
+            continue;
+        off += std::snprintf(callers + off, sizeof(callers) - (size_t)off, " %s=%.2f/%.2f/%.3fms", cs[i].site,
+                             acq / 60.0, blocked / 60.0, ns / 60e6);
+    }
+    const uint64_t other = m_lock.OtherAcquisitions();
+    const uint64_t now[8] = {
+        m_lockFree.framePolls.load(std::memory_order_relaxed), m_lockFree.bufLocks.load(std::memory_order_relaxed),
+        m_lockFree.bufRenames.load(std::memory_order_relaxed), m_lockFree.bufGrows.load(std::memory_order_relaxed),
+        m_lockFree.bufEvicts.load(std::memory_order_relaxed), m_lockFree.arenaAllocs.load(std::memory_order_relaxed),
+        m_lockFree.lockedDraws.load(std::memory_order_relaxed), 0};
+    double d[8];
+    for (int i = 0; i < 8; ++i)
+    {
+        d[i] = (now[i] - m_lockFreeReported[i]) / 60.0;
+        m_lockFreeReported[i] = now[i];
+    }
+    Log("perf waiters otherAcquires=%.2f lfFramePolls=%.1f lfBufLocks=%.1f bufRenames=%.2f bufGrows=%.2f "
+        "bufEvicts=%.2f arenaAllocs=%.1f lockedDraws=%.2f (per frame) callers=%s",
+        (other - m_otherAcquisitionsReported) / 60.0, d[0], d[1], d[2], d[3], d[4], d[5], d[6], off ? callers : " none");
+    m_otherAcquisitionsReported = other;
+}
+
 void Device::PresentFrame()
 {
     DeviceLockSite site(m_lock, "present");
+    {
+        // Device-lock wait since the last present, for the slow-frame line
+        // (owned here, so the wait totals are stable).
+        const uint64_t waitNs = m_lock.WaitNs(false) + m_lock.WaitNs(true);
+        if (waitNs > m_lockWaitNsExtra)
+            AddFrameExtra(DEKO9_EXTRA_LOCKWAIT, waitNs - m_lockWaitNsExtra);
+        m_lockWaitNsExtra = waitNs;
+    }
     // Cheap once-per-present check: SubmitOpenList only sees a faulted queue
     // on its own next submit, so a fault between submits (nothing more
     // queued) would otherwise go unreported.
@@ -1003,19 +1205,30 @@ void Device::PresentFrame()
     if (m_lastPresentNs)
         m_timing.periodNs += acquireStart - m_lastPresentNs;
     m_lastPresentNs = acquireStart;
-    int slot;
+    int slot = -1;
+    DkFence acquire{};
     {
         // The acquire blocks until the display frees an image (vsync, or the
         // GPU when it is behind). With the render back end on its own thread
         // (r_smp_backend 1) every main-thread device call would queue behind
-        // it once per frame. No other thread submits on the queue
-        // (SplitLongList and Query::GetData flush only from the draw
-        // thread), so the acquire
-        // runs unlocked; the calls that run meanwhile (buffer locks, uploads
-        // recorded into the open list, fence polls) are what the inline back
-        // end interleaves with a present anyway.
+        // it once per frame, so the acquire runs unlocked. The calls that
+        // run meanwhile (buffer locks, uploads recorded into the open list,
+        // fence polls) are what the inline back end interleaves with a
+        // present anyway; a submit by another thread (a readback) lands
+        // before the present list on the same queue, and nothing cached
+        // above is reused after the wait.
         DeviceUnlockScope unlocked(m_lock);
-        slot = dkQueueAcquireImage(m_queue, m_swapchain);
+        dkSwapchainAcquireImage(m_swapchain, &slot, &acquire);
+    }
+    // dkQueueAcquireImage split in two: the queue waits for the display's
+    // release fence before the present list, and the black box keeps the
+    // fence to tell a compositor wait from a GPU stall.
+    dkQueueWaitFence(m_queue, &acquire);
+    {
+        std::lock_guard<std::mutex> guard(m_acquireMutex);
+        m_acquireFence = acquire;
+        m_acquireSeq = m_openSeq;
+        m_acquireSlot = slot;
     }
     m_timing.acquireNs += armTicksToNs(armGetSystemTick()) - acquireStart;
     Stats().acquire = slot;
@@ -1053,10 +1266,25 @@ void Device::PresentFrame()
         const uint32_t tagH = m_frameTagHeight ? m_frameTagHeight : m_params.BackBufferHeight;
         m_frameEnds.push_back({m_openSeq - 1, tagW, tagH});
         while (m_frameEnds.size() > 16)
+        {
             m_frameEnds.pop_front();
+            m_profileFrameIncomplete = true;
+            if (GpuPassesOn())
+                LogLine("KPERF {\"v\":1,\"type\":\"event\",\"stream\":\"gpu.busy\",\"clock\":\"source_line\",\"name\":\"frame_boundary_lost\",\"count\":1,\"message\":\"Dropped GPU frame boundary; next combined busy sample omitted\"}");
+        }
     }
     ApplyZcullSettings();
     ApplyFaultTraceSettings();
+    {
+        // The open list keeps its chunk; the next chunk it or a later list
+        // takes has the new size.
+        const uint32_t chunkBytes = m_cmdChunkWanted.load(std::memory_order_relaxed);
+        if (chunkBytes != m_cmdChunkBytes)
+        {
+            Log("cmdchunk bytes=%u (was %u)", chunkBytes, m_cmdChunkBytes);
+            m_cmdChunkBytes = chunkBytes;
+        }
+    }
     ++m_frames;
     m_timing.maxListsInFlight = std::max<uint64_t>(m_timing.maxListsInFlight, m_openSeq - 1 - m_completedSeq);
     // Native frame ring (deko9_framepace.h): frame F signals fence slot
@@ -1067,6 +1295,7 @@ void Device::PresentFrame()
     // device lock (SleepPollFence), for the same reason as the acquire
     // above; the watchdog matches WaitSeq's.
     {
+        FoldObservedFrames();
         const uint64_t frame = m_frameRing.Recording();
         const uint32_t frameSlot = FrameRing<kFramesInFlight>::Slot(frame);
         const uint64_t prev = FrameRing<kFramesInFlight>::ReuseFrame(frame);
@@ -1099,11 +1328,17 @@ void Device::PresentFrame()
             NoteFrameDone(prev);
             m_timing.fenceWaitNs += armTicksToNs(armGetSystemTick()) - waitStart;
         }
-        if (!m_frameRing.Present(m_openSeq - 1))
+        const bool presented = m_frameRing.Present(m_openSeq - 1);
+        if (!presented)
             Fail("FRAME_RING", "frame=%llu would reuse slot %u before frame %llu passed", (unsigned long long)frame,
                  frameSlot, (unsigned long long)prev);
         dkQueueSignalFence(m_queue, &m_frameFences[frameSlot], true);
+        // Threads without the lock see the frame only from here on, with
+        // the fence just signalled into its slot.
+        if (presented)
+            m_framePub.PublishPresent(frame, m_openSeq - 1, m_frameFences[frameSlot]);
         dkQueueFlush(m_queue);
+        ++m_cc.flushes;
         m_timing.maxFramesInFlight = std::max<uint64_t>(m_timing.maxFramesInFlight, m_frameRing.InFlight());
     }
     CollectCompleted();
@@ -1113,11 +1348,15 @@ void Device::PresentFrame()
     {
         ++m_passFramesTotal;
         if (++m_passFrames == 60)
+        {
+            FlushProfileFrames();
             ReportGpuPasses();
+        }
     }
     const bool wantPasses = m_gpuPassesWanted.load(std::memory_order_relaxed);
     if (wantPasses != GpuPassesOn())
     {
+        FlushProfileFrames();
         m_gpuPasses.store(wantPasses, std::memory_order_relaxed);
         std::memset(m_passNs, 0, sizeof(m_passNs));
         m_passDropped = m_passFrames = 0;
@@ -1145,12 +1384,18 @@ void Device::PresentFrame()
     }
     if (!(m_frames % 60))
     {
+        // Native frame waits run without the lock (WaitFrameFor).
+        m_timing.frameWaits += m_lockFree.frameWaits.exchange(0, std::memory_order_relaxed);
+        m_timing.frameWaitNs += m_lockFree.frameWaitNs.exchange(0, std::memory_order_relaxed);
         // render= is the latest frame's scene size (the engine's dynamic
         // resolution tag, else the back buffer): oled-digest groups by it.
+        // Shader build totals for the 60-frame window (not per frame).
+        char shaderStats[400];
+        ShaderBuildStats::Format(m_shaderStats.Take(), shaderStats, sizeof(shaderStats));
         Log("perf frames=60 period=%.1fms gpu=%.1fms drawCpu=%.1fms drawNs/draw=%.0f fenceWait=%.1fms acquire=%.1fms "
             "draws=%llu lists=%llu (per frame) maxInFlight=%llu maxFramesInFlight=%llu frameWaits=%.1f frameWait=%.2fms "
             "barrierMode=%u lightBarriers=%.1f render=%ux%u "
-            "resizes=%llu moves=%llu",
+            "resizes=%llu moves=%llu%s",
             m_timing.periodNs / 60e6, m_timing.gpuNs / 60e6, m_timing.drawCpuNs / 60e6,
             m_timing.draws ? (double)m_timing.drawCpuNs / m_timing.draws : 0.0, m_timing.fenceWaitNs / 60e6,
             m_timing.acquireNs / 60e6, (unsigned long long)(m_timing.draws / 60),
@@ -1159,8 +1404,19 @@ void Device::PresentFrame()
             (unsigned)m_barrierMode, m_lightBarriers / 60.0,
             m_frameTagWidth ? m_frameTagWidth : m_params.BackBufferWidth,
             m_frameTagHeight ? m_frameTagHeight : m_params.BackBufferHeight, (unsigned long long)m_resizes,
-            (unsigned long long)m_moves);
+            (unsigned long long)m_moves, shaderStats);
         m_lightBarriers = 0;
+        {
+            const CmdCensus &c = m_cc;
+            Log("perf cmds tiled=%u/%u barriers(none/tiles/frag/prim/full)=%.1f/%.1f/%.1f/%.1f/%.1f "
+                "inval(l2/image/shader/desc/zcull)=%.1f/%.1f/%.1f/%.1f/%.1f targetBinds=%.1f clears=%.1f "
+                "tiledOps=%.1f submits=%.1f flushes=%.1f (per frame)",
+                m_tiledOn, m_tiledWanted, c.barrier[0] / 60.0, c.barrier[1] / 60.0, c.barrier[2] / 60.0,
+                c.barrier[3] / 60.0, c.barrier[4] / 60.0, c.inval[0] / 60.0, c.inval[1] / 60.0, c.inval[2] / 60.0,
+                c.inval[3] / 60.0, c.inval[4] / 60.0, c.targetBinds / 60.0, c.clears / 60.0, c.tiledOps / 60.0,
+                c.submits / 60.0, c.flushes / 60.0);
+            m_cc = {};
+        }
         // Fast-path work per frame: lock entries vs real mutex acquisitions
         // (the rest were inline re-entries), texture binds, sampler state
         // sets and how their descriptors resolved.
@@ -1183,9 +1439,12 @@ void Device::PresentFrame()
             m_timing.staticHazardChecks / 60.0, (unsigned)m_perDraw);
         const double draws = m_timing.draws ? (double)m_timing.draws : 1.0;
         Log("perf consts vsBytes/draw=%.0f psBytes/draw=%.0f vsPushes/draw=%.2f psPushes/draw=%.2f "
-            "regsSet=%.0f regsChanged=%.0f (per frame unless /draw)",
+            "regsSet=%.0f regsChanged=%.0f vsBytesFrame=%.0f psBytesFrame=%.0f probe=0x%x split=%u "
+            "extraDraws=%.0f (per frame unless /draw)",
             m_timing.constBytes[0] / draws, m_timing.constBytes[1] / draws, m_timing.constPushes[0] / draws,
-            m_timing.constPushes[1] / draws, m_timing.constRegsSet / 60.0, m_timing.constRegsChanged / 60.0);
+            m_timing.constPushes[1] / draws, m_timing.constRegsSet / 60.0, m_timing.constRegsChanged / 60.0,
+            m_timing.constBytes[0] / 60.0, m_timing.constBytes[1] / 60.0, (unsigned)m_probe.flags,
+            (unsigned)m_probe.split, m_timing.probeExtraDraws / 60.0);
         Log("perf sync fencePolls=%.1f fencePollsDone=%.1f seqCacheHits=%.1f collects=%.1f queryGetData=%.1f "
             "queryPending=%.1f bufferLockPolls=%.1f queryWaits=%.1f queryWait=%.2fms (per frame)",
             m_timing.fencePolls / 60.0, m_timing.fencePollsDone / 60.0, m_timing.seqCacheHits / 60.0,
@@ -1231,6 +1490,7 @@ void Device::PresentFrame()
                 m_lockWaitNsReported[i] = w[i];
             }
         }
+        ReportLockWaiters();
         m_drawsTotal += m_timing.draws;
         m_drawCpuNsTotal += m_timing.drawCpuNs;
         m_timing = {};
@@ -1661,6 +1921,7 @@ void Device::GetCounters(Deko9Counters *out)
     out->drawsTotal = m_drawsTotal + m_timing.draws;
     out->drawCpuNsTotal = m_drawCpuNsTotal + m_timing.drawCpuNs;
     out->hazardSkips = m_timing.hazardSkips;
+    out->probeExtraDraws = m_timing.probeExtraDraws;
     out->rangeCalls = m_timing.rangeCalls;
     out->rangeDraws = m_timing.rangeDraws;
     out->uploadAfterReadBarriers = m_writeAfterReadBarriers;
@@ -1731,6 +1992,24 @@ uint32_t Device::SetSamplerPacked(uint32_t slot, uint32_t packed, uint32_t oldPa
     }
     ++m_timing.samplerSets;
     return final;
+}
+
+void Device::SetEngineLodBias(float bias)
+{
+    const int steps = std::min(std::max((int)std::lround(-bias * 8.0f), 0), 15);
+    const float rounded = -(float)steps / 8.0f;
+    DWORD bits = 0;
+    if (steps)
+        std::memcpy(&bits, &rounded, sizeof(bits));
+    for (uint32_t slot = 0; slot < DEKO9_MAX_SAMPLERS * 2; ++slot)
+    {
+        if (m_ss[slot][D3DSAMP_MIPMAPLODBIAS] == bits)
+            continue;
+        m_ss[slot][D3DSAMP_MIPMAPLODBIAS] = bits;
+        m_ssDescriptor[slot][0] = m_ssDescriptor[slot][1] = UINT32_MAX;
+        m_dirtyTextures = true;
+        MarkTexSlotDirty(slot);
+    }
 }
 
 HRESULT Device::GetSamplerState(DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD *value)
@@ -2061,6 +2340,13 @@ void Deko9_SetTexture(IDirect3DDevice9 *device, uint32_t sampler, IDirect3DBaseT
     d->BindTexture((uint32_t)slot, texture);
 }
 
+void Deko9_SetEngineLodBias(IDirect3DDevice9 *device, float bias)
+{
+    deko9::Device *d = static_cast<deko9::Device *>(device);
+    deko9::DeviceLockGuard lock(d->Lock());
+    d->SetEngineLodBias(bias);
+}
+
 uint32_t Deko9_SetSamplerPacked(IDirect3DDevice9 *device, uint32_t sampler, uint32_t packed, uint32_t oldPacked)
 {
     deko9::Device *d = static_cast<deko9::Device *>(device);
@@ -2096,6 +2382,13 @@ void Deko9_ClaimSubmitThread(IDirect3DDevice9 *device)
     d->ClaimSubmitThread();
 }
 
+void Deko9_SetDrawProbe(IDirect3DDevice9 *device, uint32_t flags, uint32_t split)
+{
+    deko9::Device *d = static_cast<deko9::Device *>(device);
+    deko9::DeviceLockGuard lock(d->Lock());
+    d->SetDrawProbe(flags, split < 1 ? 1 : split > 16 ? 16 : split);
+}
+
 void Deko9_SetPerDraw(IDirect3DDevice9 *device, uint32_t flags)
 {
     deko9::Device *d = static_cast<deko9::Device *>(device);
@@ -2110,11 +2403,8 @@ bool Deko9_BeginInstances(IDirect3DDevice9 *device, const uint8_t *regs, uint32_
     if (!regs || !regCount || regCount > deko9::kMaxInstanceRegs)
         return false;
     deko9::InstanceLayout layout;
-    for (uint32_t i = 0; i < regCount; ++i)
-    {
-        if (!deko9::AddInstanceRegs(&layout, regs[i], 1))
-            return false;
-    }
+    if (!deko9::LayoutFromRegs(regs, regCount, &layout))
+        return false;
     return d->BeginInstances(layout);
 }
 
@@ -2188,19 +2478,14 @@ uint32_t Deko9_FramesInFlight()
 
 uint64_t Deko9_FrameRecording(IDirect3DDevice9 *device)
 {
-    deko9::Device *d = static_cast<deko9::Device *>(device);
-    deko9::DeviceLockGuard lock(d->Lock());
-    return d->FrameRecording();
+    // Published by the recording thread at each Present; no device lock.
+    return static_cast<deko9::Device *>(device)->FrameRecording();
 }
 
 bool Deko9_FrameDone(IDirect3DDevice9 *device, uint64_t frame)
 {
-    deko9::Device *d = static_cast<deko9::Device *>(device);
-    // Lock-free answer for frames already known done (the common poll).
-    if (frame <= d->FrameDonePublished())
-        return true;
-    deko9::DeviceLockGuard lock(d->Lock());
-    return d->FrameDone(frame);
+    // No device lock from any thread (published frame state + one fence poll).
+    return static_cast<deko9::Device *>(device)->FrameDoneAnyThread(frame);
 }
 
 bool Deko9_WaitFrame(IDirect3DDevice9 *device, uint64_t frame, int64_t timeoutNs)
@@ -2223,6 +2508,20 @@ void Deko9_SetShadowFilter(IDirect3DDevice9 *device, uint32_t mode)
     deko9::Device *d = static_cast<deko9::Device *>(device);
     deko9::DeviceLockGuard lock(d->Lock());
     d->SetShadowFilter(mode);
+}
+
+void Deko9_SetShaderOpt(IDirect3DDevice9 *device, uint32_t mask)
+{
+    deko9::Device *d = static_cast<deko9::Device *>(device);
+    deko9::DeviceLockGuard lock(d->Lock());
+    d->SetShaderOpt(mask);
+}
+
+void Deko9_SetTiledCache(IDirect3DDevice9 *device, uint32_t mode)
+{
+    deko9::Device *d = static_cast<deko9::Device *>(device);
+    deko9::DeviceLockGuard lock(d->Lock());
+    d->SetTiledCache(mode);
 }
 
 void Deko9_SetBarrierMode(IDirect3DDevice9 *device, uint32_t mode)

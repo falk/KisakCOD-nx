@@ -19,8 +19,13 @@
 #include "rb_gpupass.h"
 #include "rb_state.h"
 
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 bool g_hrpRedirecting;
 
@@ -154,6 +159,22 @@ uint32_t HwRules()
                                 : DEKO9_HRP_RULES_ALL;
 }
 
+// r_halfResParticlesDebug bits that apply at any factor.
+constexpr int kDebugNoComposite = 8, kDebugFullSync = 16, kDebugNoDepth = 32, kDebugProbe = 64;
+
+int DebugBits()
+{
+    return r_halfResParticlesDebug ? r_halfResParticlesDebug->current.integer : 0;
+}
+
+// kDebugFullSync: the strongest barrier at an off-screen edge, beside the
+// hazard tracker's own.
+void DebugSync()
+{
+    if (DebugBits() & kDebugFullSync)
+        Deko9_ParticleFullBarrier(dx.device);
+}
+
 // Every texel of the three targets gets a defined value once, before any
 // pass uses them: (C, T) = (0, 0, 0, 1), float-Z 0, depth 1. The per-view
 // clears cover only the view's rectangle; the rest of the image is never
@@ -273,7 +294,9 @@ void EnterOffscreen(GfxCmdBufContext context, bool clear)
     const int dbg = v.factor == 1 ? r_halfResParticlesDebug->current.integer : 0;
     const bool sceneDepth = (dbg & 3) != 0, sceneFloatZ = (dbg & 5) != 0;
     device->SetRenderTarget(0, t.color);
-    device->SetDepthStencilSurface(sceneDepth ? gfxRenderTargets[R_RENDERTARGET_SCENE].surface.depthStencil : t.depth);
+    device->SetDepthStencilSurface((DebugBits() & kDebugNoDepth) ? nullptr
+                                   : sceneDepth ? gfxRenderTargets[R_RENDERTARGET_SCENE].surface.depthStencil
+                                                : t.depth);
     // Engine bookkeeping: the next R_SetRenderTarget rebinds for real.
     context.state->renderTargetId = R_RENDERTARGET_NONE;
     GfxCmdBufSourceState *source = context.source;
@@ -297,6 +320,7 @@ void EnterOffscreen(GfxCmdBufContext context, bool clear)
     // same sort key are still pending (they keep accumulating).
     if (clear)
         device->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_ARGB(255, 0, 0, 0), 1.0f, 0);
+    DebugSync();
     g_hrpRedirecting = true;
     v.inOffscreen = true;
     ++v.runs;
@@ -321,6 +345,11 @@ void LeaveOffscreen(GfxCmdBufContext context)
     SetScissor(device, sc.x, sc.y, sc.width, sc.height);
 }
 
+bool ProbeDue();
+bool ReadSurface(IDirect3DSurface9 *surface, std::vector<uint8_t> *out, uint32_t *w, uint32_t *h, uint32_t *bpp);
+void Probe(const ViewState &v, const std::vector<uint8_t> &before, uint32_t sw, uint32_t sh,
+           const deko9::hrpref::CompositeConstants &c, const int32_t dstRect[4]);
+
 // Composite the pending off-screen content over the scene (scene bound).
 void Composite(GfxCmdBufContext context)
 {
@@ -329,7 +358,7 @@ void Composite(GfxCmdBufContext context)
     IDirect3DDevice9 *device = context.state->prim.device;
     v.pending = false;
     // r_halfResParticlesDebug 8 (bisection): drop the off-screen content.
-    if (r_halfResParticlesDebug->current.integer & 8)
+    if (DebugBits() & kDebugNoComposite)
         return;
     // Over the scissor rectangle of the scene viewport.
     const GfxViewport &sc = v.view->scissorViewport;
@@ -346,14 +375,169 @@ void Composite(GfxCmdBufContext context)
                                   r_halfResParticlesDepthTol->current.value);
     GfxImage *fullZ = gfxRenderTargets[R_RENDERTARGET_FLOAT_Z].image;
     RB_GPU_PASS(Hrp);
+    DebugSync();
+    // kDebugProbe: the scene before the composite, for the reference.
+    std::vector<uint8_t> before;
+    uint32_t sw = 0, sh = 0, sbpp = 0;
+    const bool probe = ProbeDue() &&
+                       ReadSurface(gfxRenderTargets[R_RENDERTARGET_SCENE].surface.color, &before, &sw, &sh, &sbpp);
     const bool sceneFloatZ = v.factor == 1 && (r_halfResParticlesDebug->current.integer & 5) != 0;
     if (!Deko9_ParticleComposite(device, t.colorTex,
                                  sceneFloatZ && fullZ ? fullZ->texture.basemap : t.floatZImage.texture.basemap,
                                  fullZ ? fullZ->texture.basemap : nullptr,
                                  gfxRenderTargets[R_RENDERTARGET_SCENE].surface.color, dstRect, &constants))
         Com_Error(ERR_FATAL, "r_halfResParticles: composite failed (see FAIL:DEKO9_HRP_COMPOSITE)");
+    DebugSync();
+    if (probe)
+        Probe(v, before, sw, sh, constants, dstRect);
     RB_GPU_PASS(Emissive);
     ++v.composites;
+}
+
+// kDebugProbe: after a composite, read the off-screen float-Z and colour,
+// the scene float-Z and the passes' constant memory back from the GPU and
+// log how the off-screen float-Z relates to the scene's (every covered
+// texel must equal one texel of its factor x factor footprint), plus raw
+// dumps on the SD card. Stalls on the GPU: a hardware diagnostic only.
+bool ReadSurface(IDirect3DSurface9 *surface, std::vector<uint8_t> *out, uint32_t *w, uint32_t *h, uint32_t *bpp)
+{
+    D3DSURFACE_DESC desc;
+    if (!surface || FAILED(surface->GetDesc(&desc)))
+        return false;
+    IDirect3DSurface9 *sys = nullptr;
+    if (FAILED(dx.device->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format, D3DPOOL_SYSTEMMEM, &sys,
+                                                      nullptr)))
+        return false;
+    D3DLOCKED_RECT locked;
+    bool ok = SUCCEEDED(dx.device->GetRenderTargetData(surface, sys)) &&
+              SUCCEEDED(sys->LockRect(&locked, nullptr, D3DLOCK_READONLY));
+    if (ok)
+    {
+        *w = desc.Width;
+        *h = desc.Height;
+        *bpp = 4;
+        out->resize((size_t)desc.Width * desc.Height * 4);
+        for (UINT y = 0; y < desc.Height; ++y)
+            std::memcpy(out->data() + (size_t)y * desc.Width * 4,
+                        static_cast<const uint8_t *>(locked.pBits) + (size_t)y * locked.Pitch, desc.Width * 4);
+        sys->UnlockRect();
+    }
+    sys->Release();
+    return ok;
+}
+
+
+// Probe due at this composite (three times, a second apart at 60 Hz).
+bool ProbeDue()
+{
+    static uint32_t s_composites, s_probes;
+    if (!(DebugBits() & kDebugProbe) || s_probes >= 3 || (s_composites++ % 120) != 60)
+        return false;
+    ++s_probes;
+    return true;
+}
+
+void Probe(const ViewState &v, const std::vector<uint8_t> &before, uint32_t sw, uint32_t sh,
+           const deko9::hrpref::CompositeConstants &c, const int32_t dstRect[4])
+{
+    using deko9::hrpref::Rgba;
+    static uint32_t s_index;
+    const uint32_t index = s_index++;
+    std::vector<uint8_t> half, full, color, after;
+    uint32_t hw = 0, hh = 0, fw = 0, fh = 0, cw = 0, ch = 0, aw = 0, ah = 0, bpp = 0;
+    const bool read = ReadSurface(v.t->floatZ, &half, &hw, &hh, &bpp) &&
+                      ReadSurface(gfxRenderTargets[R_RENDERTARGET_FLOAT_Z].surface.color, &full, &fw, &fh, &bpp) &&
+                      ReadSurface(v.t->color, &color, &cw, &ch, &bpp) &&
+                      ReadSurface(gfxRenderTargets[R_RENDERTARGET_SCENE].surface.color, &after, &aw, &ah, &bpp);
+    uint32_t depthWords[8] = {}, compositeWords[12] = {};
+    const bool constants = Deko9_ReadParticleConstants(dx.device, depthWords, compositeWords);
+    if (!read || aw != sw || ah != sh || hw != cw || hh != ch)
+    {
+        Com_Printf(CON_CHANNEL_SYSTEM, "FAIL:HRP_PROBE readback failed\n");
+        return;
+    }
+    const float *hz = reinterpret_cast<const float *>(half.data());
+    const float *fz = reinterpret_cast<const float *>(full.data());
+    const GfxViewport &sv = v.view->sceneViewport;
+    const int f = v.factor;
+    auto fullAt = [&](int x, int y) {
+        x = x < 0 ? 0 : x >= (int)fw ? (int)fw - 1 : x;
+        y = y < 0 ? 0 : y >= (int)fh ? (int)fh - 1 : y;
+        return fz[(size_t)y * fw + x];
+    };
+    // Off-screen float-Z against its footprint, transmittance histogram.
+    uint32_t footprint = 0, total = 0, tBins[5] = {};
+    for (int y = 0; y < v.oh && y < (int)hh; ++y)
+        for (int x = 0; x < v.ow && x < (int)hw; ++x)
+        {
+            const float z = hz[(size_t)y * hw + x];
+            const int bx = sv.x + x * f, by = sv.y + y * f, lx = sv.x + sv.width - 1, ly = sv.y + sv.height - 1;
+            bool inFootprint = false;
+            for (int dy = 0; dy < f; ++dy)
+                for (int dx = 0; dx < f; ++dx)
+                    inFootprint |= fullAt(bx + dx < lx ? bx + dx : lx, by + dy < ly ? by + dy : ly) == z;
+            footprint += inFootprint;
+            ++total;
+            const uint8_t a = color[((size_t)y * cw + x) * 4 + 3];
+            ++tBins[a < 64 ? 0 : a < 128 ? 1 : a < 192 ? 2 : a < 243 ? 3 : 4];
+        }
+    // The composite's output against the CPU reference of the same inputs.
+    std::vector<Rgba> offColor((size_t)cw * ch);
+    for (size_t i = 0; i < offColor.size(); ++i)
+    {
+        const uint8_t *p = color.data() + i * 4; // B, G, R, A
+        offColor[i] = {p[2] / 255.0f, p[1] / 255.0f, p[0] / 255.0f, p[3] / 255.0f};
+    }
+    uint32_t pixels = 0, bad = 0, maxLsb = 0, picks = 0, logged = 0;
+    for (int py = dstRect[1]; py < dstRect[1] + dstRect[3]; ++py)
+        for (int px = dstRect[0]; px < dstRect[0] + dstRect[2]; ++px)
+        {
+            const uint8_t *b = before.data() + ((size_t)py * sw + px) * 4;
+            const uint8_t *a = after.data() + ((size_t)py * sw + px) * 4;
+            const Rgba dst{b[2] / 255.0f, b[1] / 255.0f, b[0] / 255.0f, 1.0f};
+            const Rgba s = deko9::hrpref::CompositeSample(c, offColor.data(), hz, (int)cw, fullAt(px, py), px, py);
+            deko9::hrpref::CompositeConstants bilinear = c;
+            bilinear.limit[2] = 0;
+            const Rgba sb = deko9::hrpref::CompositeSample(bilinear, offColor.data(), hz, (int)cw, fullAt(px, py),
+                                                           px, py);
+            picks += s.r != sb.r || s.g != sb.g || s.b != sb.b || s.a != sb.a;
+            const Rgba want = deko9::hrpref::Composite(dst, s);
+            const int wr = (int)(want.r * 255.0f + 0.5f), wg = (int)(want.g * 255.0f + 0.5f),
+                      wb = (int)(want.b * 255.0f + 0.5f);
+            const uint32_t lsb = (uint32_t)std::max(std::abs(wr - a[2]), std::max(std::abs(wg - a[1]), std::abs(wb - a[0])));
+            ++pixels;
+            maxLsb = lsb > maxLsb ? lsb : maxLsb;
+            if (lsb > 4)
+            {
+                ++bad;
+                if (logged < 8 && (bad % 997) == 1)
+                {
+                    ++logged;
+                    const float hx = ((float)px + 0.5f) * c.map[0] + c.map[2];
+                    const float hy = ((float)py + 0.5f) * c.map[1] + c.map[3];
+                    const int ix = (int)std::floor(hx), iy = (int)std::floor(hy);
+                    const int cx = ix < 0 ? 0 : ix > c.limit[0] ? c.limit[0] : ix;
+                    const int cy = iy < 0 ? 0 : iy > c.limit[1] ? c.limit[1] : iy;
+                    const Rgba &t0 = offColor[(size_t)cy * cw + cx];
+                    Com_Printf(CON_CHANNEL_SYSTEM,
+                               "HRP_PROBE_PIXEL probe=%u at=%d,%d before=%u,%u,%u after=%u,%u,%u want=%d,%d,%d "
+                               "fullz=%g halfz0=%g t0=%.3f,%.3f,%.3f,%.3f c=%.3f,%.3f,%.3f,%.3f\n",
+                               index, px, py, b[2], b[1], b[0], a[2], a[1], a[0], wr, wg, wb, fullAt(px, py),
+                               hz[(size_t)cy * cw + cx], t0.r, t0.g, t0.b, t0.a, s.r, s.g, s.b, s.a);
+                }
+            }
+        }
+    Com_Printf(CON_CHANNEL_SYSTEM,
+               "HRP_PROBE probe=%u factor=%d view=%d,%d,%dx%d covered=%dx%d half=%ux%u full=%ux%u scene=%ux%u "
+               "texels=%u in_footprint=%u t_bins=%u,%u,%u,%u,%u composite_pixels=%u composite_bad=%u max_lsb=%u "
+               "ref_picks=%u constants=%d depth_ubo=%d,%d,%d,%d,%d composite_ubo=%g,%g,%g,%g,%d,%d,%d,%g\n",
+               index, f, sv.x, sv.y, sv.width, sv.height, v.ow, v.oh, hw, hh, fw, fh, sw, sh, total, footprint,
+               tBins[0], tBins[1], tBins[2], tBins[3], tBins[4], pixels, bad, maxLsb, picks, constants ? 1 : 0,
+               (int)depthWords[0], (int)depthWords[1], (int)depthWords[2], (int)depthWords[3], (int)depthWords[4],
+               *reinterpret_cast<const float *>(&compositeWords[0]), *reinterpret_cast<const float *>(&compositeWords[1]),
+               *reinterpret_cast<const float *>(&compositeWords[2]), *reinterpret_cast<const float *>(&compositeWords[3]),
+               (int)compositeWords[4], (int)compositeWords[5], (int)compositeWords[6],
+               *reinterpret_cast<const float *>(&compositeWords[8]));
 }
 
 void NoteRun(char c)
@@ -373,10 +557,67 @@ void NoteRun(char c)
 
 } // namespace
 
+// r_halfResParticles 3 (auto): decided once per frame (RB_HrpFrameUpdate),
+// so a frame never mixes both paths.
+namespace
+{
+hrp::AutoGate s_auto;
+uint64_t s_autoPrevNs, s_autoPrevFrames;
+bool s_autoSeeded;
+
+int EffectiveMode()
+{
+    const int mode = r_halfResParticles ? r_halfResParticles->current.integer : 0;
+    return mode == 3 ? (s_auto.on ? 1 : 0) : mode;
+}
+} // namespace
+
+bool RB_HrpWantsGpuPasses()
+{
+    return r_halfResParticles && r_halfResParticles->current.integer == 3;
+}
+
+void RB_HrpFrameUpdate()
+{
+    if (!RB_HrpWantsGpuPasses())
+    {
+        s_auto.Reset();
+        s_autoSeeded = false;
+        return;
+    }
+    uint64_t ns[Deko9GpuPass_Count];
+    uint64_t frames;
+    Deko9_GetGpuPassTotals(dx.device, ns, &frames);
+    const uint64_t particleNs = ns[Deko9GpuPass_Emissive] + ns[Deko9GpuPass_Hrp];
+    if (!s_autoSeeded)
+    {
+        // Targets exist before the first off-screen frame, so the switch
+        // itself allocates nothing mid-frame.
+        Targets &t = s_targets[2];
+        if (!t.color && !t.failed && !CreateTargets(t, 2))
+            t.failed = true;
+        s_autoPrevNs = particleNs;
+        s_autoPrevFrames = frames;
+        s_autoSeeded = true;
+        return;
+    }
+    if (frames <= s_autoPrevFrames)
+        return;
+    const uint64_t n = std::min<uint64_t>(frames - s_autoPrevFrames, 8);
+    const uint64_t per = (particleNs - s_autoPrevNs) / (frames - s_autoPrevFrames);
+    s_autoPrevNs = particleNs;
+    s_autoPrevFrames = frames;
+    const bool was = s_auto.on;
+    for (uint64_t i = 0; i < n; ++i)
+        s_auto.Update(per, r_halfResParticlesAutoOnMs->current.value, r_halfResParticlesAutoOffMs->current.value);
+    if (s_auto.on != was)
+        Com_Printf(CON_CHANNEL_SYSTEM, "HRP_AUTO %s\n", s_auto.on ? "on" : "off");
+}
+
 void RB_HrpBeginView(const GfxViewInfo *viewInfo)
 {
     s_v = ViewState();
-    const int mode = r_halfResParticles ? r_halfResParticles->current.integer : 0;
+    const int mode = EffectiveMode();
     ++s_stats.views;
     if (!mode || !viewInfo->needsFloatZ || !R_HaveFloatZ())
         return;
@@ -459,6 +700,7 @@ void RB_HrpBeginView(const GfxViewInfo *viewInfo)
     if (!Deko9_ParticleDepth(dx.device, gfxRenderTargets[R_RENDERTARGET_SCENE].surface.depthStencil,
                              fullZ ? fullZ->texture.basemap : nullptr, rect, (uint32_t)factor, t.depth, t.floatZ))
         Com_Error(ERR_FATAL, "r_halfResParticles: off-screen depth pass failed (see FAIL:DEKO9_HRP_DEPTH)");
+    DebugSync();
     RB_GPU_PASS(Emissive);
 }
 

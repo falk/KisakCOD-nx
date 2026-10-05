@@ -2,19 +2,40 @@
 #error This file is for SinglePlayer only
 #endif
 
-// This is the original menu key-dispatch owner split from ui_shared.cpp.
-// Keep its control flow intact: controller navigation must share the desktop
-// UI semantics rather than acquire a Switch-only cursor implementation.
+// Controller and desktop keys share the SP menu dispatch owner.
 #include "ui_shared.h"
 
 #include <client/client.h>
 #include <qcommon/cmd.h>
+#ifdef __SWITCH__
+#include <port/switch_ui_menus.h>
+#endif
 
 extern int g_waitingForKey;
 extern int g_editingField;
 extern itemDef_s *g_editItem;
 extern int g_debugMode;
 void __cdecl Menus_HandleOOBClick(UiContext *dc, menuDef_t *menu, int key, int down);
+
+static bool Menu_HasInteractiveParent(UiContext *dc, menuDef_t *menu)
+{
+    bool below = false;
+    for (int i = dc->openMenuCount - 1; i >= 0; --i)
+    {
+        menuDef_t *parent = dc->menuStack[i];
+        if (parent == menu) { below = true; continue; }
+        // A background-only menu cannot receive control when Back closes a page.
+        if (below && Window_IsVisible(dc->localClientNum, &parent->window))
+            for (int j = 0; j < parent->itemCount; ++j)
+            {
+                const itemDef_s *candidate = parent->items[j];
+                if (!(candidate->window.staticFlags & 0x100000)
+                    && (candidate->type || candidate->action || candidate->onKey))
+                    return true;
+            }
+    }
+    return false;
+}
 
 itemDef_s *g_bindItem;
 int inHandleKey;
@@ -73,7 +94,9 @@ void __cdecl Menu_HandleKey(UiContext *dc, menuDef_t *menu, int key, int down)
             {
                 for (i = 0; i < menu->itemCount; ++i)
                 {
-                    if (Item_IsVisible(dc->localClientNum, menu->items[i]))
+                    if (Item_IsVisible(dc->localClientNum, menu->items[i])
+                        && ((menu->items[i]->dvarFlags & 3) == 0
+                            || Item_EnableShowViaDvar(menu->items[i], 1)))
                     {
                         if (Window_HasFocus(dc->localClientNum, &menu->items[i]->window))
                             item = menu->items[i];
@@ -106,6 +129,10 @@ void __cdecl Menu_HandleKey(UiContext *dc, menuDef_t *menu, int key, int down)
                                 {
                                     if (Item_IsTextField(item))
                                     {
+#ifdef __SWITCH__
+                                        if (Switch_UI_EditTextField(dc, item))
+                                            break;
+#endif
                                         item->cursorPos[dc->localClientNum] = 0;
                                         g_editingField = 1;
                                         g_editItem = item;
@@ -123,15 +150,10 @@ void __cdecl Menu_HandleKey(UiContext *dc, menuDef_t *menu, int key, int down)
                                     it.parent = menu;
                                     Item_RunScript(dc, &it, (char*)menu->onESC);
                                 }
-                                else if (!g_waitingForKey && dc->openMenuCount > 1)
+                                else if (!g_waitingForKey && Menu_HasInteractiveParent(dc, menu))
                                 {
-                                    // Retail backstop: menus without an onESC
-                                    // script (e.g. apply_picmip_popmenu) had no
-                                    // back behavior at all, so B/ESC appeared
-                                    // dead. Close the top menu instead. The
-                                    // openMenuCount guard never strands the
-                                    // root menu, and menus with onESC keep
-                                    // their authored behavior untouched.
+                                    // Missing Escape scripts return to an interactive
+                                    // parent; the root stays above its backdrop.
                                     Menus_Close(dc, menu);
                                 }
                                 break;

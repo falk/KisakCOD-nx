@@ -1,4 +1,5 @@
-// Dynamic render resolution for the deko3d renderer (see r_dynres.h).
+// Scene render scale and the dynamic resolution controller for the deko3d
+// renderer (see r_dynres.h).
 
 #include "r_dynres.h"
 
@@ -12,8 +13,10 @@
 #include "r_image.h"
 #include "r_init.h"
 #include "r_rendercmds.h"
+#include "r_render_scale.h"
 #include "r_rendertarget.h"
 #include "r_state.h"
+#include "r_taau.h"
 #include "rb_state.h"
 #include "rb_backend.h"
 #include "rb_gpupass.h"
@@ -28,7 +31,10 @@ extern uint32_t s_smpFrame; // r_rendercmds.cpp: frontEndDataOut = &s_backEndDat
 
 namespace
 {
-int s_enabled = -1; // -1: not read yet
+int s_enabled = -1;    // the scene layout; -1: not read yet
+bool s_controller;     // r_dynres when the layout was chosen
+bool s_controllerHeld; // R_DynResHoldController: r_renderScale sets the size
+float s_nativeScaleSeen = 1.0f; // r_renderScale last seen with the layout off
 
 dynres::Config s_cfg;
 dynres::Controller s_ctl;
@@ -72,9 +78,9 @@ struct Stats
     uint64_t drops0 = 0, raises0 = 0;
 } s_stats;
 
-const char *ModeName()
+render_scale::Mode FrameMode()
 {
-    return r_dynresForceScale->current.value > 0.0f ? "forced" : "controller";
+    return render_scale::ModeFor(R_SceneLayoutEnabled(), s_controller && !s_controllerHeld);
 }
 
 dynres::Config ConfigFromDvars()
@@ -82,7 +88,7 @@ dynres::Config ConfigFromDvars()
     dynres::Config c;
     c.maxWidth = (int)vidConfig.sceneWidth;
     c.maxHeight = (int)vidConfig.sceneHeight;
-    c.budgetMs = r_dynresBudgetMs->current.value;
+    c.budgetMs = dynres::BudgetForFrameCap(com_maxfps ? com_maxfps->current.integer : 0);
     c.minScale = std::min(r_dynresMin->current.value, r_dynresMax->current.value);
     c.maxScale = std::max(r_dynresMin->current.value, r_dynresMax->current.value);
     return c;
@@ -112,10 +118,13 @@ void Report(const dynres::Size &size)
     if (++s_stats.frames < 60)
         return;
     Com_Printf(CON_CHANNEL_GFX,
-               "DEKO9 dynres frames=%u mode=%s render=%dx%d scale_min=%.3f scale_avg=%.3f scale_max=%.3f "
+               "DEKO9 dynres frames=%u mode=%s upscaler=%s render=%dx%d scale_min=%.3f scale_avg=%.3f "
+               "scale_max=%.3f "
                "gpu_avg=%.2fms gpu_max=%.2fms samples=%u changes=%u drops=%llu raises=%llu budget=%.1fms "
                "min=%.3f max=%.3f fake=%.1f backoff=%d fsr=%s\n",
-               s_stats.frames, ModeName(), size.width, size.height, s_stats.scaleMin,
+               s_stats.frames, render_scale::ModeName(FrameMode()),
+               render_scale::UpscalerName(render_scale::UpscalerFor(FrameMode(), R_TaauActive())), size.width,
+               size.height, s_stats.scaleMin,
                s_stats.scaleSum / s_stats.frames, s_stats.scaleMax,
                s_stats.samples ? s_stats.gpuSum / s_stats.samples : 0.0, s_stats.gpuMax, s_stats.samples,
                s_stats.changes, (unsigned long long)(s_ctl.drops - s_stats.drops0),
@@ -146,7 +155,7 @@ void Apply(const dynres::Size &size)
         if (color && std::find(done.begin(), done.end(), color) == done.end())
         {
             if (!Deko9_ResizeRenderTarget(dx.device, color, w, h))
-                Com_Error(ERR_FATAL, "r_dynres: cannot resize %s to %ux%u", R_RenderTargetName(t.id), w, h);
+                Com_Error(ERR_FATAL, "r_renderScale: cannot resize %s to %ux%u", R_RenderTargetName(t.id), w, h);
             done.push_back(color);
         }
         GfxRenderTarget &rt = gfxRenderTargets[t.id];
@@ -159,17 +168,39 @@ void Apply(const dynres::Size &size)
         }
     }
     if (!Deko9_ResizeRenderTarget(dx.device, s_sceneDepth, (uint32_t)size.width, (uint32_t)size.height))
-        Com_Error(ERR_FATAL, "r_dynres: cannot resize the scene depth to %dx%d", size.width, size.height);
+        Com_Error(ERR_FATAL, "r_renderScale: cannot resize the scene depth to %dx%d", size.width, size.height);
     s_back = size;
 }
 
 } // namespace
 
-bool R_DynResEnabled()
+bool R_SceneLayoutEnabled()
 {
     if (s_enabled < 0)
-        s_enabled = r_dynres && r_dynres->current.enabled ? 1 : 0;
+    {
+        s_controller = r_dynres && r_dynres->current.enabled;
+        s_controllerHeld = false;
+        s_enabled = render_scale::SceneLayoutFor(s_controller, r_renderScale ? r_renderScale->current.value : 1.0f)
+                        ? 1
+                        : 0;
+    }
     return s_enabled == 1;
+}
+
+bool R_DynResControllerEnabled()
+{
+    R_SceneLayoutEnabled();
+    return s_controller;
+}
+
+render_scale::Mode R_RenderScaleMode()
+{
+    return FrameMode();
+}
+
+void R_DynResHoldController()
+{
+    s_controllerHeld = true;
 }
 
 void R_DynResInitSceneTarget(GfxRenderTarget *scene, uint32_t d3dFormat)
@@ -178,14 +209,14 @@ void R_DynResInitSceneTarget(GfxRenderTarget *scene, uint32_t d3dFormat)
     HRESULT hr = dx.device->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, (D3DFORMAT)d3dFormat, D3DPOOL_DEFAULT,
                                           &s_sceneTexture, nullptr);
     if (FAILED(hr) || !s_sceneTexture)
-        Com_Error(ERR_FATAL, "r_dynres: couldn't create the %ux%u scene target: %s", w, h, R_ErrorDescription(hr));
+        Com_Error(ERR_FATAL, "r_renderScale: couldn't create the %ux%u scene target: %s", w, h, R_ErrorDescription(hr));
     hr = s_sceneTexture->GetSurfaceLevel(0, &scene->surface.color);
     if (FAILED(hr))
-        Com_Error(ERR_FATAL, "r_dynres: scene target surface: %s", R_ErrorDescription(hr));
+        Com_Error(ERR_FATAL, "r_renderScale: scene target surface: %s", R_ErrorDescription(hr));
     hr = dx.device->CreateDepthStencilSurface(w, h, dx.depthStencilFormat, D3DMULTISAMPLE_NONE, 0, 0,
                                               &scene->surface.depthStencil, nullptr);
     if (FAILED(hr))
-        Com_Error(ERR_FATAL, "r_dynres: couldn't create the %ux%u scene depth: %s", w, h, R_ErrorDescription(hr));
+        Com_Error(ERR_FATAL, "r_renderScale: couldn't create the %ux%u scene depth: %s", w, h, R_ErrorDescription(hr));
     s_sceneDepth = scene->surface.depthStencil;
     s_sceneDepth->AddRef();
     scene->image = nullptr; // never sampled by materials; the upscale reads s_sceneTexture
@@ -195,16 +226,21 @@ void R_DynResInitSceneTarget(GfxRenderTarget *scene, uint32_t d3dFormat)
     // (R_AssignSingleSampleDepthStencilSurface), so one resize covers them.
     dx.singleSampleDepthStencilSurface = s_sceneDepth;
     Com_Printf(CON_CHANNEL_GFX,
-               "r_dynres: scene targets %ux%u (output %dx%d), scale %.3f..%.3f, budget %.1f ms, upscale r_fsrMode "
-               "%s before the 2D pass\n",
-               w, h, vidConfig.displayWidth, vidConfig.displayHeight, r_dynresMin->current.value,
-               r_dynresMax->current.value, r_dynresBudgetMs->current.value, Dvar_EnumToString(r_fsrMode));
+               "r_renderScale: scene targets %ux%u (output %dx%d), %s, upscale %s (r_fsrMode %s) before the 2D "
+               "pass\n",
+               w, h, vidConfig.displayWidth, vidConfig.displayHeight,
+               s_controller ? va("adaptive r_dynres %.3f..%.3f budget %.1f ms", r_dynresMin->current.value,
+                                 r_dynresMax->current.value,
+                                 dynres::BudgetForFrameCap(com_maxfps ? com_maxfps->current.integer : 0))
+                            : va("fixed r_renderScale %.3f", r_renderScale->current.value),
+               render_scale::UpscalerName(render_scale::UpscalerFor(FrameMode(), R_TaauActive())),
+               Dvar_EnumToString(r_fsrMode));
 }
 
 void R_DynResRegisterTargets()
 {
     s_targets.clear();
-    if (!R_DynResEnabled())
+    if (!R_SceneLayoutEnabled())
         return;
     static const Target kTargets[] = {
         {R_RENDERTARGET_SCENE, 0},         {R_RENDERTARGET_FLOAT_Z, 0},       {R_RENDERTARGET_RESOLVED_SCENE, 0},
@@ -236,12 +272,25 @@ void R_DynResShutdownTargets()
     s_sceneDepth = nullptr;
     s_targets.clear();
     s_ctlReady = false;
-    s_enabled = -1; // vid_restart re-reads the latched r_dynres
+    s_enabled = -1; // vid_restart re-reads r_dynres and r_renderScale
 }
 
 void R_DynResBeginFrame()
 {
-    if (!R_DynResEnabled() || !s_ctlReady || !dx.device)
+    if (!R_SceneLayoutEnabled())
+    {
+        // Started native: the scene has no target of its own to resize.
+        if (r_renderScale && r_renderScale->current.value != s_nativeScaleSeen)
+        {
+            s_nativeScaleSeen = r_renderScale->current.value;
+            if (s_nativeScaleSeen < 1.0f)
+                Com_Printf(CON_CHANNEL_GFX,
+                           "r_renderScale %.3f applies after vid_restart: the game started at native size\n",
+                           s_nativeScaleSeen);
+        }
+        return;
+    }
+    if (!s_ctlReady || !dx.device)
         return;
     if (s_lastFrontFrame != rg.frontEndFrameCount)
     {
@@ -262,16 +311,21 @@ void R_DynResBeginFrame()
             ++s_stats.samples;
             s_stats.gpuSum += gpuMs;
             s_stats.gpuMax = std::max(s_stats.gpuMax, gpuMs);
-            if (r_dynresForceScale->current.value <= 0.0f)
+            if (FrameMode() == render_scale::Mode::Adaptive)
                 s_ctl.Sample(gpuMs, {(int)w, (int)h});
         }
-        dynres::Size size = s_ctl.Current();
-        if (r_dynresForceScale->current.value > 0.0f)
+        // The controller is one driver of the scale; the size below is all
+        // the rest of the frame sees.
+        const dynres::Size controller = s_ctl.Current();
+        const float scale = render_scale::FrameScale(FrameMode(), r_renderScale->current.value,
+                                                     (float)controller.width / (float)s_cfg.maxWidth);
+        dynres::Size size = controller;
+        if (FrameMode() != render_scale::Mode::Adaptive)
         {
             dynres::Config any = s_cfg;
-            any.minScale = 0.25f;
+            any.minScale = render_scale::kMinScale;
             any.maxScale = 1.0f;
-            size = dynres::SizeForLevel(any, dynres::LevelForScale(any, r_dynresForceScale->current.value));
+            size = dynres::SizeForLevel(any, dynres::LevelForScale(any, scale));
         }
         if (size != s_front)
             ++s_stats.changes;
@@ -283,17 +337,17 @@ void R_DynResBeginFrame()
 
 uint32_t R_DynResSceneWidth()
 {
-    return R_DynResEnabled() && s_front.width ? (uint32_t)s_front.width : vidConfig.sceneWidth;
+    return R_SceneLayoutEnabled() && s_front.width ? (uint32_t)s_front.width : vidConfig.sceneWidth;
 }
 
 uint32_t R_DynResSceneHeight()
 {
-    return R_DynResEnabled() && s_front.height ? (uint32_t)s_front.height : vidConfig.sceneHeight;
+    return R_SceneLayoutEnabled() && s_front.height ? (uint32_t)s_front.height : vidConfig.sceneHeight;
 }
 
 void RB_DynResBeginFrame(const GfxBackEndData *data)
 {
-    if (!R_DynResEnabled() || s_targets.empty())
+    if (!R_SceneLayoutEnabled() || s_targets.empty())
         return;
     dynres::Size size = s_back;
     for (const FrameSize &f : s_frames)
@@ -304,16 +358,22 @@ void RB_DynResBeginFrame(const GfxBackEndData *data)
     if (size != s_back)
         Apply(size);
     Deko9_SetFrameTag(dx.device, (uint32_t)s_back.width, (uint32_t)s_back.height);
+    RB_TaauBeginFrame((float)s_back.width / (float)s_cfg.maxWidth);
 }
 
 int RB_DynResPostTarget()
 {
-    return R_DynResEnabled() ? R_RENDERTARGET_SCENE : R_RENDERTARGET_FRAME_BUFFER;
+    return R_SceneLayoutEnabled() ? R_RENDERTARGET_SCENE : R_RENDERTARGET_FRAME_BUFFER;
+}
+
+IDirect3DBaseTexture9 *RB_DynResSceneTexture()
+{
+    return R_SceneLayoutEnabled() ? s_sceneTexture : nullptr;
 }
 
 void RB_DynResResolveView(const GfxViewInfo *viewInfo, bool firstView)
 {
-    if (!R_DynResEnabled() || !s_sceneTexture)
+    if (!R_SceneLayoutEnabled() || !s_sceneTexture)
         return;
     if (tess.indexCount)
         RB_EndTessSurface();
@@ -330,8 +390,11 @@ void RB_DynResResolveView(const GfxViewInfo *viewInfo, bool firstView)
     const int32_t src[4] = {sv.x, sv.y, sv.width, sv.height};
     const int32_t dst[4] = {dv.x, dv.y, dv.width, dv.height};
     if (sv.x < 0 || sv.y < 0 || sv.x + sv.width > s_back.width || sv.y + sv.height > s_back.height)
-        Com_Error(ERR_FATAL, "r_dynres: scene viewport %d,%d %dx%d outside the %dx%d scene target", sv.x, sv.y,
+        Com_Error(ERR_FATAL, "r_renderScale: scene viewport %d,%d %dx%d outside the %dx%d scene target", sv.x, sv.y,
                   sv.width, sv.height, s_back.width, s_back.height);
+    if (firstView && RB_TaauResolveView(viewInfo, s_sceneTexture, s_sceneDepth, src,
+                                        gfxRenderTargets[R_RENDERTARGET_FRAME_BUFFER].surface.color, dst))
+        return;
     // At scale 1 the upscale is a whole-image copy and the scene is not read
     // again this frame, so hand its image to the back buffer instead; the
     // next frame's scene clear rewrites the scene target.
@@ -344,7 +407,7 @@ void RB_DynResResolveView(const GfxViewInfo *viewInfo, bool firstView)
         Deko9_IsCompressed(s_sceneTexture) == Deko9_IsCompressed(back))
     {
         if (!Deko9_MoveContents(dx.device, s_sceneTexture, back))
-            Com_Error(ERR_FATAL, "r_dynres: scene -> back buffer move failed (see FAIL:DEKO9_MOVE_CONTENTS)");
+            Com_Error(ERR_FATAL, "r_renderScale: scene -> back buffer move failed (see FAIL:DEKO9_MOVE_CONTENTS)");
         if (!s_moves++)
             Com_Printf(CON_CHANNEL_SYSTEM, "R_DYNRES_MOVE first scene -> back buffer move %dx%d\n", dv.width,
                        dv.height);
@@ -352,7 +415,7 @@ void RB_DynResResolveView(const GfxViewInfo *viewInfo, bool firstView)
     }
     if (!Deko9_UpscaleSurface(dx.device, s_sceneTexture, src, gfxRenderTargets[R_RENDERTARGET_FRAME_BUFFER].surface.color,
                               dst))
-        Com_Error(ERR_FATAL, "r_dynres: scene upscale %dx%d -> %dx%d failed", sv.width, sv.height, dv.width,
+        Com_Error(ERR_FATAL, "r_renderScale: scene upscale %dx%d -> %dx%d failed", sv.width, sv.height, dv.width,
                   dv.height);
 }
 

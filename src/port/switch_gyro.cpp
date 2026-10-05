@@ -36,6 +36,7 @@ const dvar_t *s_invertPitch;
 const dvar_t *s_deadzone;
 const dvar_t *s_smoothing;
 const dvar_t *s_ratchetButton;
+const dvar_t *s_debug;
 
 SwitchGyroFilterState s_filter;
 float s_lastYawDeltaDeg;
@@ -46,6 +47,7 @@ bool s_haveLastFrameMs;
 // Sensor handle lifecycle: re-acquired whenever the pad's active style
 // changes (dock<->handheld, Joy-Con pair<->Pro Controller, reconnects).
 bool s_sensorStarted;
+Result s_sensorResult; // last handle/start result, for gyro_debug
 u32 s_sensorStyle; // the HidNpadStyleTag bit the current handle was opened for
 HidSixAxisSensorHandle s_sensorHandle;
 
@@ -106,22 +108,28 @@ bool EnsureSensor(const PadState *pad)
 
     StopSensor();
 
+    // Joy-Cons attached to the console answer as the handheld controller, not
+    // as player 1; asking No1 for a handheld sensor yields no motion at all.
+    const HidNpadIdType id =
+        styleTag == HidNpadStyleTag_NpadHandheld ? HidNpadIdType_Handheld : HidNpadIdType_No1;
     HidSixAxisSensorHandle handles[2] = {};
     Result rc;
     if (styleTag == HidNpadStyleTag_NpadJoyDual)
     {
-        rc = hidGetSixAxisSensorHandles(handles, 2, HidNpadIdType_No1, (HidNpadStyleTag)styleTag);
+        rc = hidGetSixAxisSensorHandles(handles, 2, id, (HidNpadStyleTag)styleTag);
         s_sensorHandle = handles[1];
     }
     else
     {
-        rc = hidGetSixAxisSensorHandles(handles, 1, HidNpadIdType_No1, (HidNpadStyleTag)styleTag);
+        rc = hidGetSixAxisSensorHandles(handles, 1, id, (HidNpadStyleTag)styleTag);
         s_sensorHandle = handles[0];
     }
+    s_sensorResult = rc;
     if (R_FAILED(rc))
         return false;
 
     rc = hidStartSixAxisSensor(s_sensorHandle);
+    s_sensorResult = rc;
     if (R_FAILED(rc))
         return false;
 
@@ -131,6 +139,15 @@ bool EnsureSensor(const PadState *pad)
     // fast rotation: drop the low-pass filter's memory instead of letting it
     // blend the old source's last sample into the new one.
     Switch_GyroFilterReset(&s_filter);
+    return true;
+}
+
+bool DebugDue(uint32_t nowMs)
+{
+    static uint32_t s_lastDebugMs;
+    if (nowMs - s_lastDebugMs < 1000)
+        return false;
+    s_lastDebugMs = nowMs;
     return true;
 }
 
@@ -184,6 +201,8 @@ void Switch_GyroRegisterDvars(void)
     s_ratchetButton = Dvar_RegisterInt(
         "gyro_ratchetButton", 0, 0, 0x7FFFFFFF, DVAR_ARCHIVE,
         "SWITCH_INPUT_BUTTON_* bitmask that pauses gyro rotation while held (0 disables; default: none bound)");
+    s_debug = Dvar_RegisterBool("gyro_debug", false, DVAR_NOFLAG,
+                                "Print the gyro sensor state and raw angular velocity once a second");
 }
 
 void Switch_GyroFrame(void)
@@ -214,24 +233,41 @@ void Switch_GyroFrame(void)
         return;
 
     if (!EnsureSensor(&input->pad))
+    {
+        if (s_debug && s_debug->current.enabled && DebugDue(nowMs))
+            Com_Printf(CON_CHANNEL_SYSTEM, "GYRO no sensor styles=0x%x rc=0x%x\n",
+                       (unsigned)padGetStyleSet(&input->pad), s_sensorResult);
         return;
+    }
 
     HidSixAxisSensorState states[1] = {};
     const size_t count = hidGetSixAxisSensorStates(s_sensorHandle, states, 1);
     if (count == 0)
         return;
 
-    // Assumed axis convention for a controller held normally (see
-    // switch_gyro.h's top comment and the hardware test note): x = pitch
-    // (nose up/down), y = yaw (nose left/right). Unverified against real
-    // hardware (some emulators do not emulate motion); gyro_invertYaw/
-    // gyro_invertPitch are the escape hatch if a build turns out backwards.
+    // Axis convention for a controller held normally: x = pitch (nose
+    // up/down), y = yaw (nose left/right). The sensor's yaw is positive for a
+    // turn to the right, the opposite of the view's yaw, so it is negated
+    // here. gyro_invertYaw/gyro_invertPitch flip either axis on top.
+    // The sensor reports rotations per second; the math below works in rad/s.
+    const float kRevToRad = 6.28318531f;
+    const float rateX = states[0].angular_velocity.x * kRevToRad;
+    const float rateY = -states[0].angular_velocity.y * kRevToRad;
+    const float rateZ = states[0].angular_velocity.z * kRevToRad;
+    if (s_debug && s_debug->current.enabled && DebugDue(nowMs))
+    {
+        {
+            Com_Printf(CON_CHANNEL_SYSTEM, "GYRO style=0x%x rc=0x%x raw=%.3f,%.3f,%.3f dps=%.1f,%.1f,%.1f\n",
+                       s_sensorStyle, s_sensorResult, states[0].angular_velocity.x,
+                       states[0].angular_velocity.y, states[0].angular_velocity.z, rateX * 57.2958f,
+                       rateY * 57.2958f, rateZ * 57.2958f);
+        }
+    }
     float filteredX;
     float filteredY;
     float filteredZ;
-    Switch_GyroLowPass(&s_filter, states[0].angular_velocity.x, states[0].angular_velocity.y,
-                       states[0].angular_velocity.z, dtSeconds, cfg.smoothingHz,
-                       &filteredX, &filteredY, &filteredZ);
+    Switch_GyroLowPass(&s_filter, rateX, rateY, rateZ, dtSeconds, cfg.smoothingHz, &filteredX, &filteredY,
+                       &filteredZ);
 
     Switch_GyroComputeDelta(&cfg, filteredX, filteredY, dtSeconds, &s_lastYawDeltaDeg,
                             &s_lastPitchDeltaDeg);

@@ -1869,7 +1869,7 @@ bool ReadRetailSndAliasListBody(RetailZoneLoadSession *session,
     {
         aliasOffsets = static_cast<RetailWalkSndAliasOffsets *>(RetailZoneLoadSessionAlloc(
             session, static_cast<std::size_t>(aliasCount) * sizeof(RetailWalkSndAliasOffsets),
-            4));
+            alignof(RetailWalkSndAliasOffsets)));
         if (!aliasOffsets)
             return false;
         std::memset(aliasOffsets, 0xFF,

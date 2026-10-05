@@ -17,6 +17,7 @@
 #include "r_init.h"
 #include <deko9/deko9_baked.h>
 #include <deko9/deko9_native.h>
+#include <port/switch_shader_prebake.h>
 
 // Pre-draw bounds checks that turn an OOB static-model
 // draw into a counted skip instead of
@@ -226,25 +227,7 @@ void __cdecl R_SetupStaticModelPrim(XSurface *xsurf, GfxDrawPrimArgs *args, GfxC
 // model.
 namespace
 {
-bool R_StaticModelInstanceRegs(const MaterialPass *pass, uint8_t *regs, uint32_t *regCount)
-{
-    uint32_t count = 0;
-    for (uint32_t argIndex = 0; argIndex < pass->perPrimArgCount; ++argIndex)
-    {
-        const MaterialShaderArgument &arg = pass->args[argIndex];
-        if (arg.type != MTL_ARG_CODE_VERTEX_CONST)
-            return false;
-        for (uint32_t row = 0; row < arg.u.codeConst.rowCount; ++row)
-        {
-            const uint32_t reg = arg.dest + row;
-            if (count >= deko9::kMaxInstanceRegs || reg >= 256)
-                return false;
-            regs[count++] = (uint8_t)reg;
-        }
-    }
-    *regCount = count;
-    return count != 0;
-}
+static_assert(deko9::kMaxInstanceRegs == 16, "R_StaticModelInstanceRegs fills at most 16 registers");
 
 void R_DrawStaticModelInstance(const GfxStaticModelDrawInst *smodelDrawInst, GfxCmdBufContext context, bool lit)
 {

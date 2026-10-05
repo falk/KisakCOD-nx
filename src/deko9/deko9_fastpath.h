@@ -32,14 +32,29 @@ enum : uint32_t
     kSampStateCount = 14, // rows are indexed by type; [0] is unused
 };
 
-// Packs a sampler-state row into 27 bits when it only uses the fields the
-// engine sets (filters, address modes, anisotropy) and every other field is
-// at its D3D9 default. The packed value keys SamplerIdCache, replacing the
-// 60-byte SamplerKey hash + compare on the draw path. Returns false (use the
-// full key) for anything else.
+// A MIPMAPLODBIAS state the compact key carries: -k/8 for k in 1..15 (the
+// engine's scene LOD bias, Deko9_SetEngineLodBias); 0 for none, -1 for any
+// other value.
+inline int CompactLodBiasSteps(uint32_t state)
+{
+    if (!state)
+        return 0;
+    float bias;
+    std::memcpy(&bias, &state, sizeof(bias));
+    const float steps = -bias * 8.0f;
+    const int k = (int)steps;
+    return k >= 1 && k <= 15 && (float)k == steps ? k : -1;
+}
+
+// Packs a sampler-state row into 31 bits when it only uses the fields the
+// engine sets (filters, address modes, anisotropy, a CompactLodBiasSteps
+// bias) and every other field is at its D3D9 default. The packed value keys
+// SamplerIdCache, replacing the 60-byte SamplerKey hash + compare on the
+// draw path. Returns false (use the full key) for anything else.
 inline bool CompactSamplerKey(const uint32_t state[kSampStateCount], bool compare, uint32_t *key)
 {
-    if (state[kSampBorderColor] || state[kSampMipLodBias] || state[kSampMaxMipLevel] || state[kSampSrgbTexture] ||
+    const int bias = CompactLodBiasSteps(state[kSampMipLodBias]);
+    if (state[kSampBorderColor] || bias < 0 || state[kSampMaxMipLevel] || state[kSampSrgbTexture] ||
         state[kSampElementIndex] || state[kSampDmapOffset])
         return false;
     const uint32_t u = state[kSampAddressU], v = state[kSampAddressV], w = state[kSampAddressW];
@@ -47,7 +62,8 @@ inline bool CompactSamplerKey(const uint32_t state[kSampStateCount], bool compar
     const uint32_t aniso = state[kSampMaxAnisotropy];
     if ((u | v | w) >= 8 || (mag | min | mip) >= 16 || aniso >= 32)
         return false;
-    *key = u | v << 3 | w << 6 | mag << 9 | min << 13 | mip << 17 | aniso << 21 | (compare ? 1u << 26 : 0u);
+    *key = u | v << 3 | w << 6 | mag << 9 | min << 13 | mip << 17 | aniso << 21 | (compare ? 1u << 26 : 0u) |
+           (uint32_t)bias << 27;
     return true;
 }
 
@@ -101,7 +117,7 @@ public:
     uint32_t Count() const { return m_count; }
 
 private:
-    static constexpr uint32_t kEmpty = UINT32_MAX; // compact keys use 27 bits
+    static constexpr uint32_t kEmpty = UINT32_MAX; // compact keys use 31 bits
     static uint32_t Hash(uint32_t key) { return (key * 0x9E3779B1u) >> 22; } // top 10 bits
     uint32_t m_keys[kCapacity];
     uint32_t m_ids[kCapacity];
@@ -242,12 +258,14 @@ public:
         {
             // Extend the run over dirty registers and short clean gaps.
             uint32_t end = reg + 1; // exclusive, last dirty register + 1
+            uint32_t next;
             for (;;)
             {
-                const uint32_t next = NextDirty(end);
+                next = NextDirty(end);
                 if (next >= Regs || next - end > kMergeGapRegs)
                     break;
-                end = next + 1;
+                // Keep isolated registers cheap; word-skip only a contiguous run.
+                end = next == end ? NextClean(next) : next + 1;
             }
             for (uint32_t first = reg; first < end; first += kMaxPushRegs)
             {
@@ -255,7 +273,7 @@ public:
                 push(first, n);
                 ++pushes;
             }
-            reg = NextDirty(end);
+            reg = next;
         }
         for (uint32_t w = 0; w < kWords; ++w)
             m_dirty[w] = 0;
@@ -264,6 +282,26 @@ public:
     }
 
 private:
+    // Skip a contiguous dirty run a bitmap word at a time.
+    uint32_t NextClean(uint32_t from) const
+    {
+        if (from >= Regs)
+            return Regs;
+        uint32_t w = from >> 6;
+        uint64_t bits = ~m_dirty[w] & (~0ull << (from & 63));
+        for (;;)
+        {
+            if (bits)
+            {
+                const uint32_t r = (w << 6) + (uint32_t)__builtin_ctzll(bits);
+                return r < Regs ? r : Regs;
+            }
+            if (++w >= kWords)
+                return Regs;
+            bits = ~m_dirty[w];
+        }
+    }
+
     // First dirty register >= from, or Regs.
     uint32_t NextDirty(uint32_t from) const
     {

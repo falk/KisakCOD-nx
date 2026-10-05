@@ -1,4 +1,5 @@
 #include "r_dynres.h"
+#include "r_taau.h"
 #include <universal/q_shared.h>
 #include "r_outdoor.h"
 #include <port/switch_perf.h>
@@ -172,9 +173,7 @@ void __cdecl R_AddDObjToScene(
     iassert(pose);
     bcassert(entnum, gfxCfg.entCount);
 
-#ifdef __SWITCH__
     SWITCH_PERF_SCOPE(SWITCH_PERF_ENTS_DOBJ_ADD);
-#endif
 
     if (r_drawEntities->current.enabled)
     {
@@ -1467,6 +1466,7 @@ void __cdecl R_RenderScene(const refdef_s *refdef)
         viewParmsDraw = R_AllocViewParms();
         R_SetViewParmsForScene(refdef, viewParmsDraw);
         R_SetSceneParms(refdef, &sceneParms);
+        R_TaauJitterView(viewParmsDraw, sceneParms.sceneViewport);
         R_CorrectLodScale(refdef);
         iassert( scene.def.time == refdef->time );
         iassert( rg.lodParms.valid );
@@ -1526,6 +1526,27 @@ static bool R_DoesDrawSurfListInfoNeedResolvedPostSun(const GfxDrawSurfListInfo 
     return false;
 }
 
+// switch_perfTrace only: after the entity DPVS and skin waits, split the scene
+// DObjs skinned this frame by whether the camera view sees them.  Read-only.
+static void R_CountSkinnedSceneEntsForPerf()
+{
+    const uint8_t *cameraVis = scene.dpvs.entVisData[SCENE_VIEW_CAMERA];
+    const uint32_t count = scene.sceneDObjCount;
+    uint64_t camera = 0, shadowOnly = 0;
+    for (uint32_t i = 0; i < count && i < ARRAY_COUNT(scene.sceneDObj); ++i)
+    {
+        const GfxSceneEntity *ent = &scene.sceneDObj[i];
+        if (__atomic_load_n(&ent->cull.state, __ATOMIC_ACQUIRE) < CULL_STATE_SKINNED_PENDING)
+            continue;
+        if (cameraVis && ent->entnum != gfxCfg.entnumNone && ent->entnum < gfxCfg.entCount && cameraVis[ent->entnum])
+            ++camera;
+        else
+            ++shadowOnly;
+    }
+    SwitchPerf_AddEvent(SWITCH_PERF_EV_ENT_SKINNED_CAMERA, camera);
+    SwitchPerf_AddEvent(SWITCH_PERF_EV_ENT_SKINNED_SHADOW, shadowOnly);
+}
+
 void __cdecl R_GenerateSortedDrawSurfs(
     const GfxSceneParms *sceneParms,
     const GfxViewParms *viewParmsDpvs,
@@ -1555,10 +1576,8 @@ void __cdecl R_GenerateSortedDrawSurfs(
     SceneEntCmd sceneEntCmd; // [esp+170h] [ebp-8h] BYREF
     int visibleLightCount; // [esp+174h] [ebp-4h]
 
-#ifdef __SWITCH__
     // SWITCH_PERF: total frontend scene build plus its phase breakdown.
     SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_TOTAL);
-#endif
     iassert(frontEndDataOut->viewInfoCount == rg.viewInfoCount);
     viewInfoIndex = rg.viewInfoCount++;
     frontEndDataOut->viewInfoCount = rg.viewInfoCount;
@@ -1566,9 +1585,7 @@ void __cdecl R_GenerateSortedDrawSurfs(
     frontEndDataOut->viewInfoIndex = viewInfoIndex;
     viewInfo = &frontEndDataOut->viewInfo[viewInfoIndex];
     {
-#ifdef __SWITCH__
     SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SETUP);
-#endif
     dynamicShadowType = R_DynamicShadowType();
     rg.sunShadowFull = r_rendererInUse->current.integer == 1;
     if (rg.sunShadowFull)
@@ -1646,55 +1663,59 @@ void __cdecl R_GenerateSortedDrawSurfs(
     cameraCellIndex = R_CellForPoint(rgp.world, viewParmsDpvs->origin);
     }
     KISAK_NULLSUB();
-#ifdef __SWITCH__
     {
         SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_FILTERENTS);
         R_FilterEntitiesIntoCells(cameraCellIndex);
     }
-#else
-    R_FilterEntitiesIntoCells(cameraCellIndex);
-#endif
     {
         PROF_SCOPED("R_AddWorldSurfacesDpvs");
-#ifdef __SWITCH__
         SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_DPVS);
-#endif
         R_AddWorldSurfacesDpvs(viewParmsDpvs, cameraCellIndex);
     }
-    R_BeginAllStaticModelLighting();
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SMODEL_LIGHT);
+        R_BeginAllStaticModelLighting();
+    }
     {
         PROF_SCOPED("WaitFX");
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_WAIT);
         R_WaitWorkerCmdsOfType(WRKCMD_FIRST_FRONTEND);
     }
-    R_AddEmissiveSpotLight(viewInfo);
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_MISC);
+        R_AddEmissiveSpotLight(viewInfo);
+    }
     usePreTess = !dx.deviceLost && r_pretess->current.enabled;
     if (usePreTess)
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_PRETESS);
         R_BeginPreTess();
-    R_WaitWorkerCmdsOfType(WRKCMD_DPVS_CELL_STATIC);
+    }
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_WAIT);
+        R_WaitWorkerCmdsOfType(WRKCMD_DPVS_CELL_STATIC);
+    }
     {
         PROF_SCOPED("bsp surfaces");
         if (gfxDrawMethod.drawScene == GFX_DRAW_SCENE_STANDARD)
         {
-#ifdef __SWITCH__
             {
                 SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_BSP_CAMERA);
                 R_AddAllBspDrawSurfacesCamera();
             }
-#else
-            R_AddAllBspDrawSurfacesCamera();
-#endif
+            {
+            SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_MISC);
             if (!sm_sunEnable->current.enabled && rgp.world->sunPrimaryLightIndex)
                 Com_BitClearAssert(scene.shadowableLightIsUsed, rgp.world->sunPrimaryLightIndex, 128);
             Com_Memset(frontEndDataOut->shadowableLightHasShadowMap, 0, 32);
             if (R_GetAllowShadowMaps())
                 R_ChooseShadowedLights(viewInfo);
             R_UpdateDrawMethod(frontEndDataOut, viewInfo);
+            }
             if (dynamicShadowType == SHADOW_MAP && Com_BitCheckAssert(frontEndDataOut->shadowableLightHasShadowMap, rgp.world->sunPrimaryLightIndex, 32))
             {
                 rg.drawSunShadow = 1;
-#ifdef __SWITCH__
                 SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SUNSETUP);
-#endif
                 R_SetupSunShadowMaps(viewParmsDpvs, &viewInfo->sunShadow);
                 R_SetSunShadowConstants(&viewInfo->input, &viewInfo->sunShadow.sunProj); // these constants look perfect
                 R_SunShadowMaps();
@@ -1702,46 +1723,37 @@ void __cdecl R_GenerateSortedDrawSurfs(
         }
         else
         {
+            SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_BSP_CAMERA);
             R_AddAllBspDrawSurfacesCameraNonlit(rgp.world->dpvs.litSurfsBegin, rgp.world->dpvs.litSurfsEnd, 0);
             R_AddAllBspDrawSurfacesCameraNonlit(rgp.world->dpvs.decalSurfsBegin, rgp.world->dpvs.decalSurfsEnd, 3u);
         }
-#ifdef __SWITCH__
         {
             SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_BSP_EMISSIVE);
             R_AddAllBspDrawSurfacesCameraNonlit(rgp.world->dpvs.emissiveSurfsBegin, rgp.world->dpvs.emissiveSurfsEnd, 9u);
         }
-#else
-        R_AddAllBspDrawSurfacesCameraNonlit(rgp.world->dpvs.emissiveSurfsBegin, rgp.world->dpvs.emissiveSurfsEnd, 9u);
-#endif
     }
-#ifdef __SWITCH__
     {
         SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SMODEL_CAMERA);
         R_AddAllStaticModelSurfacesCamera();
     }
-#else
-    R_AddAllStaticModelSurfacesCamera();
-#endif
     {
         PROF_SCOPED("DynEntPieces_AddDrawSurfs");
-#ifdef __SWITCH__
         SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_FX);
-#endif
         DynEntPieces_AddDrawSurfs();
     }
     {
         PROF_SCOPED("wait for r_dpvs_dynmodel");
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_WAIT);
         R_WaitWorkerCmdsOfType(WRKCMD_DPVS_CELL_DYN_MODEL);
     }
     {
         PROF_SCOPED("wait for r_dpvs_dynbrush");
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_WAIT);
         R_WaitWorkerCmdsOfType(WRKCMD_DPVS_CELL_DYN_BRUSH);
     }
     {
         PROF_SCOPED("R_DrawAllDynEnt");
-#ifdef __SWITCH__
         SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_DYNENT);
-#endif
         R_DrawAllDynEnt(viewInfo);
     }
     
@@ -1751,55 +1763,59 @@ void __cdecl R_GenerateSortedDrawSurfs(
     {
         {
             PROF_SCOPED("wait for more r_dpvs_static");
+            SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_WAIT);
             R_WaitWorkerCmdsOfType(WRKCMD_DPVS_CELL_STATIC);
         }
         {
             PROF_SCOPED("R_AddAllBspDrawSurfacesSunShadow");
-#ifdef __SWITCH__
             SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_BSP_SUNSHADOW);
-#endif
             R_AddAllBspDrawSurfacesSunShadow();
         }
         {
             PROF_SCOPED("R_AddAllStaticModelSurfacesSunShadow");
-#ifdef __SWITCH__
             SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SMODEL_SUNSHADOW);
-#endif
             R_AddAllStaticModelSurfacesSunShadow();
         }
     }
     KISAK_NULLSUB();
     {
         PROF_SCOPED("WaitFX");
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_WAIT);
         R_WaitWorkerCmdsOfType(WRKCMD_UPDATE_FX_NON_DEPENDENT);
         R_WaitWorkerCmdsOfType(WRKCMD_UPDATE_FX_REMAINING);
     }
-    R_WaitWorkerCmdsOfType(WRKCMD_DPVS_CELL_SCENE_ENT);
-    R_WaitWorkerCmdsOfType(WRKCMD_DPVS_ENTITY);
-    R_WaitWorkerCmdsOfType(WRKCMD_SPOT_SHADOW_ENT);
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_WAIT);
+        R_WaitWorkerCmdsOfType(WRKCMD_DPVS_CELL_SCENE_ENT);
+        R_WaitWorkerCmdsOfType(WRKCMD_DPVS_ENTITY);
+        R_WaitWorkerCmdsOfType(WRKCMD_SPOT_SHADOW_ENT);
+    }
     KISAK_NULLSUB();
-#ifdef __SWITCH__
     {
         SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SCENEENT);
         R_DrawAllSceneEnt(viewInfo);
     }
-#else
-    R_DrawAllSceneEnt(viewInfo);
-#endif
-    R_WaitWorkerCmdsOfType(WRKCMD_SKIN_ENT_DELAYED);
-    sceneEntCmd.viewInfo = viewInfo;
-    R_AddWorkerCmd(WRKCMD_ADD_SCENE_ENT, (uint8_t *)&sceneEntCmd);
-#ifdef __SWITCH__
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_WAIT);
+        R_WaitWorkerCmdsOfType(WRKCMD_SKIN_ENT_DELAYED);
+    }
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_MISC);
+        if (KISAK_PERF_ACTIVE)
+            R_CountSkinnedSceneEntsForPerf();
+        sceneEntCmd.viewInfo = viewInfo;
+        R_AddWorkerCmd(WRKCMD_ADD_SCENE_ENT, (uint8_t *)&sceneEntCmd);
+    }
     {
         SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SMODEL_SORT);
         R_SortAllStaticModelSurfacesCamera();
     }
-#else
-    R_SortAllStaticModelSurfacesCamera();
-#endif
+    {
+    SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_LIGHTS);
     visibleLightCount = R_GetVisibleDLights(visibleLights);
     R_GetLightSurfs(visibleLightCount, visibleLights);
     R_GetPointLightShadowSurfs(viewInfo, scene.visLightShadow, visibleLights);
+    }
     viewInfo->shadowCookieList.cookieCount = 0;
     if (gfxDrawMethod.drawScene == GFX_DRAW_SCENE_STANDARD)
     {
@@ -1808,8 +1824,10 @@ void __cdecl R_GenerateSortedDrawSurfs(
             if (Com_BitCheckAssert(frontEndDataOut->shadowableLightHasShadowMap, rgp.world->sunPrimaryLightIndex, 32))
             {
                 KISAK_NULLSUB();
-                R_AddAllSceneEntSurfacesSunShadow();
-#ifdef __SWITCH__
+                {
+                    SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SCENEENT_SUNSHADOW);
+                    R_AddAllSceneEntSurfacesSunShadow();
+                }
                 {
                     SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SMODEL_SORT);
                     R_SortAllStaticModelSurfacesSunShadow();
@@ -1818,22 +1836,15 @@ void __cdecl R_GenerateSortedDrawSurfs(
                     SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SHADOWEMIT);
                     R_GenerateSortedSunShadowDrawSurfs(viewInfo);
                 }
-#else
-                R_SortAllStaticModelSurfacesSunShadow();
-                R_GenerateSortedSunShadowDrawSurfs(viewInfo);
-#endif
             }
-#ifdef __SWITCH__
             {
                 SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SHADOWEMIT);
                 R_GenerateAllSortedSpotShadowDrawSurfs(viewInfo);
             }
-#else
-            R_GenerateAllSortedSpotShadowDrawSurfs(viewInfo);
-#endif
         }
         else if (dynamicShadowType == SHADOW_COOKIE)
         {
+            SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_MISC);
             shadowCookieCmd.viewParmsDpvs = viewParmsDpvs;
             shadowCookieCmd.viewParmsDraw = viewParmsDraw;
             shadowCookieCmd.shadowCookieList = &viewInfo->shadowCookieList;
@@ -1841,14 +1852,30 @@ void __cdecl R_GenerateSortedDrawSurfs(
             R_AddWorkerCmd(WRKCMD_SHADOW_COOKIE, (uint8_t *)&shadowCookieCmd);
         }
     }
-    R_SetAllStaticModelLighting();
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SMODEL_LIGHT);
+        R_SetAllStaticModelLighting();
+    }
     if (dynamicShadowType == SHADOW_COOKIE)
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_WAIT);
         R_WaitWorkerCmdsOfType(WRKCMD_SHADOW_COOKIE);
+    }
     KISAK_NULLSUB();
-    R_EmitShadowCookieSurfs(viewInfo);
-    R_WaitWorkerCmdsOfType(WRKCMD_ADD_SCENE_ENT);
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_MISC);
+        R_EmitShadowCookieSurfs(viewInfo);
+    }
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_WAIT);
+        R_WaitWorkerCmdsOfType(WRKCMD_ADD_SCENE_ENT);
+    }
     if (usePreTess)
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_PRETESS);
         R_EndPreTess();
+    }
+    SwitchPerfMarks perfListInfo;
     litInfo = &viewInfo->litInfo;
     R_InitDrawSurfListInfo(&viewInfo->litInfo);
     litInfo->baseTechType = gfxDrawMethod.baseTechType;
@@ -1860,37 +1887,41 @@ void __cdecl R_GenerateSortedDrawSurfs(
     viewOrigin[3] = viewParmsDraw->origin[3];
     litInfo->cameraView = 1;
     firstDrawSurfCount = frontEndDataOut->drawSurfCount;
-#ifdef __SWITCH__
+    perfListInfo.mark(SWITCH_PERF_SCENE_MISC);
     {
         SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_MERGE);
         R_MergeAndEmitDrawSurfLists(DRAW_SURF_CAMERA_LIT_BEGIN, 3);
     }
-#else
-    R_MergeAndEmitDrawSurfLists(DRAW_SURF_CAMERA_LIT_BEGIN, 3);
-#endif
     litInfo->drawSurfs = &frontEndDataOut->drawSurfs[firstDrawSurfCount];
     litInfo->drawSurfCount = frontEndDataOut->drawSurfCount - firstDrawSurfCount;
     pointLightCount = 0;
     if (r_dlightLimit->current.integer && gfxDrawMethod.drawScene == GFX_DRAW_SCENE_STANDARD)
     {
         KISAK_NULLSUB();
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_LIGHTS);
         pointLightCount = R_EmitPointLightPartitionSurfs(viewInfo, visibleLights, visibleLightCount, viewParmsDpvs->origin);
     }
     viewInfo->pointLightCount = pointLightCount;
     if (!viewInfo->localClientNum)
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SOUND);
         CL_UpdateSound();
-    FX_RunPhysics(viewInfo->localClientNum);
-#ifdef __SWITCH__
+    }
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_FX_PHYSICS);
+        FX_RunPhysics(viewInfo->localClientNum);
+    }
     {
         SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_DYNENT);
         DynEntCl_ProcessEntities(viewInfo->localClientNum);
     }
-#else
-    DynEntCl_ProcessEntities(viewInfo->localClientNum);
-#endif
-    R_WaitWorkerCmdsOfType(WRKCMD_GENERATE_MARK_VERTS);
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_WAIT);
+        R_WaitWorkerCmdsOfType(WRKCMD_GENERATE_MARK_VERTS);
+    }
     if (!dx.deviceLost && fx_marks->current.enabled)
     {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_MARKS);
         if (fx_marks_smodels->current.enabled)
             FX_GenerateMarkVertsForStaticModels(
                 viewInfo->localClientNum,
@@ -1900,14 +1931,11 @@ void __cdecl R_GenerateSortedDrawSurfs(
             R_GenerateMarkVertsForDynamicModels();
     }
     KISAK_NULLSUB();
-#ifdef __SWITCH__
     {
         SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SORT);
         R_SortDrawSurfs(scene.drawSurfs[6], scene.drawSurfCount[6]);
     }
-#else
-    R_SortDrawSurfs(scene.drawSurfs[6], scene.drawSurfCount[6]);
-#endif
+    perfListInfo = SwitchPerfMarks();
     decalInfo = &viewInfo->decalInfo;
     R_InitDrawSurfListInfo(&viewInfo->decalInfo);
     decalInfo->baseTechType = gfxDrawMethod.baseTechType;
@@ -1918,26 +1946,23 @@ void __cdecl R_GenerateSortedDrawSurfs(
     decalInfo->viewOrigin[3] = viewParmsDraw->origin[3];
     decalInfo->cameraView = 1;
     firstDrawSurfCount = frontEndDataOut->drawSurfCount;
-#ifdef __SWITCH__
+    perfListInfo.mark(SWITCH_PERF_SCENE_MISC);
     {
         SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_MERGE);
         R_MergeAndEmitDrawSurfLists(DRAW_SURF_BSP_CAMERA_DECAL, 6);
     }
-#else
-    R_MergeAndEmitDrawSurfLists(DRAW_SURF_BSP_CAMERA_DECAL, 6);
-#endif
     decalInfo->drawSurfs = &frontEndDataOut->drawSurfs[firstDrawSurfCount];
     decalInfo->drawSurfCount = frontEndDataOut->drawSurfCount - firstDrawSurfCount;
-    R_WaitWorkerCmdsOfType(WRKCMD_GENERATE_FX_VERTS);
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_WAIT);
+        R_WaitWorkerCmdsOfType(WRKCMD_GENERATE_FX_VERTS);
+    }
     KISAK_NULLSUB();
-#ifdef __SWITCH__
     {
         SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SORT);
         R_SortDrawSurfs(scene.drawSurfs[DRAW_SURF_FX_CAMERA_EMISSIVE], scene.drawSurfCount[DRAW_SURF_FX_CAMERA_EMISSIVE]);
     }
-#else
-    R_SortDrawSurfs(scene.drawSurfs[DRAW_SURF_FX_CAMERA_EMISSIVE], scene.drawSurfCount[DRAW_SURF_FX_CAMERA_EMISSIVE]);
-#endif
+    perfListInfo = SwitchPerfMarks();
     emissiveInfo = &viewInfo->emissiveInfo;
     R_InitDrawSurfListInfo(&viewInfo->emissiveInfo);
     EmissiveTechnique = R_GetEmissiveTechnique(viewInfo, gfxDrawMethod.emissiveTechType);
@@ -1954,16 +1979,14 @@ void __cdecl R_GenerateSortedDrawSurfs(
         emissiveInfo->light = &viewInfo->emissiveSpotLight;
     }
     firstDrawSurfCount = frontEndDataOut->drawSurfCount;
-#ifdef __SWITCH__
+    perfListInfo.mark(SWITCH_PERF_SCENE_MISC);
     {
         SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_MERGE);
         R_MergeAndEmitDrawSurfLists(DRAW_SURF_CAMERA_EMISSIVE_BEGIN, 6);
     }
-#else
-    R_MergeAndEmitDrawSurfLists(DRAW_SURF_CAMERA_EMISSIVE_BEGIN, 6);
-#endif
     emissiveInfo->drawSurfs = &frontEndDataOut->drawSurfs[firstDrawSurfCount];
     emissiveInfo->drawSurfCount = frontEndDataOut->drawSurfCount - firstDrawSurfCount;
+    perfListInfo = SwitchPerfMarks();
     if (!viewInfo->needsFloatZ)
     {
         DoesDrawSurfListInfoNeedFloatz = R_DoesDrawSurfListInfoNeedFloatz(emissiveInfo);
@@ -1972,6 +1995,7 @@ void __cdecl R_GenerateSortedDrawSurfs(
     viewInfo->needsResolvedPostSun = !r_distortionResolveOnDemand->current.enabled
         || R_DoesDrawSurfListInfoNeedResolvedPostSun(emissiveInfo);
     R_ShowCull();
+    perfListInfo.mark(SWITCH_PERF_SCENE_MISC);
 }
 
 // LWSS: not sure why this variable was here, guess from initial development. (no xref's)
@@ -2414,7 +2438,7 @@ void __cdecl R_SetSceneParms(const refdef_s *refdef, GfxSceneParms *sceneParms)
     sceneParms->displayViewport.y = refdef->y;
     sceneParms->displayViewport.width = refdef->width;
     sceneParms->displayViewport.height = refdef->height;
-    // r_dynres: the size this frame's scene renders at (vidConfig.scene*
+    // r_renderScale: the size this frame's scene renders at (vidConfig.scene*
     // otherwise).
     const uint32_t sceneWidth = R_DynResSceneWidth(), sceneHeight = R_DynResSceneHeight();
     sceneParms->sceneViewport.x = sceneWidth * refdef->x / vidConfig.displayWidth;

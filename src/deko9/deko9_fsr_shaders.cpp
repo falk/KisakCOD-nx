@@ -383,23 +383,25 @@ void main()
     vec4 t2 = texelFetch(uColor, ivec2(lo.x, hi.y), 0);
     vec4 t3 = texelFetch(uColor, hi, 0);
     vec4 outc = mix(mix(t0, t1, f.x), mix(t2, t3, f.x), f.y);
-    if (uLimit.z != 0)
-    {
-        float z = abs(texelFetch(uFullZ, ivec2(gl_FragCoord.xy), 0).x);
-        vec4 dz = abs(vec4(abs(texelFetch(uHalfZ, lo, 0).x), abs(texelFetch(uHalfZ, ivec2(hi.x, lo.y), 0).x),
-                           abs(texelFetch(uHalfZ, ivec2(lo.x, hi.y), 0).x), abs(texelFetch(uHalfZ, hi, 0).x)) - z);
-        if (max(max(dz.x, dz.y), max(dz.z, dz.w)) > uTol.x * z)
-        {
-            vec4 pick = t0;
-            float best = dz.x;
-            if (dz.y < best) { best = dz.y; pick = t1; }
-            if (dz.z < best) { best = dz.z; pick = t2; }
-            if (dz.w < best) { pick = t3; }
-            // Mode 2 (diagnostic): mark the pixels that took the
-            // nearest-depth texel.
-            outc = uLimit.z == 2 ? vec4(0.5, 0.0, 0.0, 0.5) : pick;
-        }
-    }
+    // No control flow: the nearest-depth pick differs between pixels of a
+    // warp, and the branchy form (SSY/SYNC reconvergence) gave wrong,
+    // varying output on Maxwell for pixels that took neither branch.
+    float z = abs(texelFetch(uFullZ, ivec2(gl_FragCoord.xy), 0).x);
+    vec4 dz = abs(vec4(abs(texelFetch(uHalfZ, lo, 0).x), abs(texelFetch(uHalfZ, ivec2(hi.x, lo.y), 0).x),
+                       abs(texelFetch(uHalfZ, ivec2(lo.x, hi.y), 0).x), abs(texelFetch(uHalfZ, hi, 0).x)) - z);
+    // Selections are mix() with boolean selectors (component selects).
+    bool p1 = dz.y < dz.x;
+    vec4 pick = mix(t0, t1, bvec4(p1));
+    float best = mix(dz.x, dz.y, p1);
+    bool p2 = dz.z < best;
+    pick = mix(pick, t2, bvec4(p2));
+    best = mix(best, dz.z, p2);
+    pick = mix(pick, t3, bvec4(dz.w < best));
+    // Mode 2 (diagnostic): mark the pixels that took the nearest-depth texel.
+    pick = mix(pick, vec4(0.5, 0.0, 0.0, 0.5), bvec4(uLimit.z == 2));
+    // all(), not &&: a short-circuit && compiles to a branch.
+    bool nearest = all(bvec2(uLimit.z != 0, max(max(dz.x, dz.y), max(dz.z, dz.w)) > uTol.x * z));
+    outc = mix(outc, pick, bvec4(nearest));
     outColor = outc;
 }
 )GLSL";

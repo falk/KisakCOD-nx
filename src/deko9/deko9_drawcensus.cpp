@@ -77,7 +77,8 @@ void Device::SetDrawCensus(uint32_t mode, uint32_t passMask)
     m_censusPassMask = passMask;
 }
 
-void Device::CensusLabel(const char *material, const char *technique, const char *shader, const void *psObject)
+void Device::CensusLabel(const char *material, const char *technique, const char *shader, const char *vertexShader,
+                         const void *psObject)
 {
     // Two slots: the lit pass sets up the depth-prepass material right after
     // the lit one (rb_backend R_RenderDrawSurfListMaterial); the pixel shader
@@ -86,11 +87,11 @@ void Device::CensusLabel(const char *material, const char *technique, const char
     {
         if (l.ps == psObject)
         {
-            l = {material, technique, shader, psObject};
+            l = {material, technique, shader, vertexShader, psObject};
             return;
         }
     }
-    m_censusLabels[m_censusLabelNext] = {material, technique, shader, psObject};
+    m_censusLabels[m_censusLabelNext] = {material, technique, shader, vertexShader, psObject};
     m_censusLabelNext ^= 1;
 }
 
@@ -137,13 +138,14 @@ void Device::CensusAutoDraw(UINT primCount)
     const char *mat = label ? label->material : nullptr;
     const char *tech = label ? label->technique : nullptr;
     if (m_censusOpen && (pass != m_censusKeyPass || mat != m_censusKeyMat || tech != m_censusKeyTech ||
-                         m_ps != m_censusPs || m_psCompareMask != m_censusPsMask || m_psEarlyZ != m_censusPsEarlyZ ||
+                         m_ps != m_censusPs || m_vs != m_censusVs || m_psCompareMask != m_censusPsMask || m_psEarlyZ != m_censusPsEarlyZ ||
                          CensusBlendKey(m_rs) != m_censusBlend))
         CensusEnd();
     if (!m_censusOpen)
     {
         // Reports recorded here precede the draw PrepareDraw's caller records.
-        CensusBegin(mat ? mat : "-", tech ? tech : "-", label && label->shader ? label->shader : "-");
+        CensusBegin(mat ? mat : "-", tech ? tech : "-", label && label->shader ? label->shader : "-",
+                    label && label->vertexShader ? label->vertexShader : "-");
         if (!m_censusOpen)
             return; // ring full
         m_censusKeyMat = mat;
@@ -152,7 +154,7 @@ void Device::CensusAutoDraw(UINT primCount)
     CensusNoteDraw(primCount);
 }
 
-void Device::CensusBegin(const char *material, const char *technique, const char *shader)
+void Device::CensusBegin(const char *material, const char *technique, const char *shader, const char *vertexShader)
 {
     if (!m_censusMode || m_censusSlots.size() != kCensusSlots)
         return;
@@ -181,8 +183,10 @@ void Device::CensusBegin(const char *material, const char *technique, const char
     m_censusMaterial = material ? material : "?";
     m_censusTechnique = technique ? technique : "?";
     m_censusShader = shader ? shader : "?";
+    m_censusVertexShader = vertexShader ? vertexShader : "?";
     m_censusDraws = m_censusPrims = m_censusBlend = m_censusEzDraws = m_censusGpuDraws = 0;
     m_censusPs = nullptr;
+    m_censusVs = nullptr;
     m_censusPsMask = 0;
     m_censusPsEarlyZ = false;
 }
@@ -193,6 +197,7 @@ void Device::CensusNoteDraw(UINT primCount)
     ++m_censusGpuDraws;
     m_censusPrims += primCount;
     m_censusPs = m_ps;
+    m_censusVs = m_vs;
     m_censusPsMask = m_psCompareMask;
     m_censusPsEarlyZ = m_psEarlyZ;
     m_censusEzDraws += m_psEarlyZ;
@@ -219,11 +224,12 @@ void Device::CensusEnd()
         if (const ShaderVariant *variant = m_censusPs->shader.Variant(this, m_censusPsMask, {}, m_censusPsEarlyZ))
             ps = variant->stats;
     }
+    const uint64_t vsHash = m_censusVs ? m_censusVs->shader.Hash() : 0;
     char key[512];
     // Keyed by pass too (the same material in the lit and the lights pass
     // are separate rows).
-    std::snprintf(key, sizeof(key), "%s|%s|%016" PRIx64 "|%x|%u", m_censusMaterial, m_censusTechnique, psHash,
-                  (unsigned)m_censusBlend, (unsigned)m_censusKeyPass);
+    std::snprintf(key, sizeof(key), "%s|%s|%016" PRIx64 "|%016" PRIx64 "|%x|%u", m_censusMaterial, m_censusTechnique,
+                  psHash, vsHash, (unsigned)m_censusBlend, (unsigned)m_censusKeyPass);
     auto found = m_censusIndex.find(key);
     uint32_t entry;
     if (found == m_censusIndex.end())
@@ -234,6 +240,8 @@ void Device::CensusEnd()
         e.technique = m_censusTechnique;
         e.shader = m_censusShader;
         e.psHash = psHash;
+        e.vertexShader = m_censusVertexShader;
+        e.vsHash = vsHash;
         e.ps = ps;
         e.blend = m_censusBlend;
         e.pass = m_censusKeyPass;
@@ -399,9 +407,10 @@ void Device::CensusReport(const char *label, uint32_t width, uint32_t height)
             continue;
         const DrawCensusEntry &e = m_drawCensusEntries[order[r]];
         Log("dcensus label=%s rank=%u pass=%s mat=%s tech=%s psname=%s ps=%016" PRIx64 " gprs=%u instrs=%u "
+            "vsname=%s vs=%016" PRIx64 " "
             "blend=%s:%s:%s zw=%u at=%u draws=%.2f prims=%.1f px=%.0f fsinv=%.0f gpu_us=%.1f ez=%.2f mpxi=%.3f",
             label, r + 1, Deko9_GpuPassName(e.pass), e.material.c_str(), e.technique.c_str(), e.shader.c_str(),
-            e.psHash, (unsigned)e.ps.gprs, (unsigned)e.ps.instrs, (e.blend >> 16) ? "on" : "off",
+            e.psHash, (unsigned)e.ps.gprs, (unsigned)e.ps.instrs, e.vertexShader.c_str(), e.vsHash, (e.blend >> 16) ? "on" : "off",
             BlendName((e.blend >> 8) & 0x1f), BlendName((e.blend >> 3) & 0x1f), (unsigned)((e.blend >> 1) & 1),
             (unsigned)(e.blend & 1), e.draws / frames, e.prims / frames, e.samples / frames, e.fsInv / frames,
             e.ns / 1e3 / frames, e.ezDraws / frames, cost(e) / frames / 1e6);
@@ -432,11 +441,11 @@ void Deko9_SetDrawCensus(IDirect3DDevice9 *device, uint32_t mode, uint32_t passM
 }
 
 void Deko9_CensusLabel(IDirect3DDevice9 *device, const char *material, const char *technique, const char *shader,
-                       const void *pixelShader)
+                       const char *vertexShader, const void *pixelShader)
 {
     deko9::Device *d = static_cast<deko9::Device *>(device);
     deko9::DeviceLockGuard lock(d->Lock());
-    d->CensusLabel(material, technique, shader, pixelShader);
+    d->CensusLabel(material, technique, shader, vertexShader, pixelShader);
 }
 
 void Deko9_CensusLight(IDirect3DDevice9 *device, uint32_t lightIndex, uint32_t viewLights)

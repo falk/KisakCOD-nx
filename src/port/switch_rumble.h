@@ -279,10 +279,16 @@ static inline void Switch_RumbleExplosionEnvelope(float distance, float radius, 
 // Switch_QuickSaveRegisterDvars).
 void Switch_RumbleRegisterDvars(void);
 
-// Queues the corresponding envelope (weapClass: SwitchRumbleWeaponClass).
-void Switch_RumbleNotifyWeaponFire(int32_t weapClass);
+// Queues the corresponding effect (weapClass: SwitchRumbleWeaponClass;
+// boltAction picks the sniper thump for rifles).
+void Switch_RumbleNotifyWeaponFire(int32_t weapClass, int32_t boltAction);
 // damage: playerState_s.damageCount (0..100-ish, not pre-clamped).
 void Switch_RumbleNotifyDamage(int32_t damage);
+// side: -1 hit from the player's left .. +1 from the right.
+void Switch_RumbleNotifyDamageFrom(int32_t damage, float side);
+void Switch_RumbleNotifyMelee(void);
+// hard: landing that hurts.
+void Switch_RumbleNotifyLand(int32_t hard);
 // distance/radius: local-player distance from the blast origin and the
 // weapon's iExplosionRadius, both in map units.
 void Switch_RumbleNotifyExplosion(float distance, float radius);

@@ -1,5 +1,5 @@
 # Host tests for the KisakCOD Switch port, migrated from the hand-written
-# g++/gcc/python3 command lines in `./test`.  Coverage today (task/ctest, in progress):
+# g++/gcc/python3 command lines in `./test`.  Coverage today (a growing subset):
 #
 #   - Every `./test host` source gate (the maintainers' local Python
 #     scripts) as a plain ctest test: LABELS core;gate. Registered only when

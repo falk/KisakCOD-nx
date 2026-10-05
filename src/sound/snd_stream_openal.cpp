@@ -8,6 +8,7 @@
 #ifdef KISAK_SND_STREAM_HOST_TEST
 #include "snd_stream_host_fakes.h"
 #else
+#include <platform/switch/switch_watchdog.h>
 #include <universal/q_shared.h>
 #include <qcommon/qcommon.h>
 #include <universal/com_files.h>
@@ -536,6 +537,9 @@ void StreamThreadMain(void *)
                 s_perf.maxTickGapMs = gapMs;
         }
         lastTick = now;
+#ifndef KISAK_SND_STREAM_HOST_TEST
+        Watchdog_Crumb(CRUMB_STREAM);
+#endif
         ProcessCommands();
         for (int c = kFirstStream; c < kMaxChannels; ++c)
             if (s_cur[c])

@@ -203,7 +203,7 @@ void __cdecl R_CreateDynamicBuffers()
         R_InitDynamicVertexBufferState(&gfxBuf.dynamicVertexBufferPool[bufferIter], 0x100000);
 #endif
     gfxBuf.dynamicVertexBuffer = gfxBuf.dynamicVertexBufferPool;
-    for (bufferItera = 0; bufferItera != 2; ++bufferItera)
+    for (bufferItera = 0; bufferItera != ARRAY_COUNT(gfxBuf.skinnedCacheVbPool); ++bufferItera)
         R_InitDynamicVertexBufferState(&gfxBuf.skinnedCacheVbPool[bufferItera], 0x480000);
     R_InitTempSkinBuf();
     for (bufferIterb = 0; bufferIterb != 1; ++bufferIterb)
@@ -503,7 +503,7 @@ void __cdecl R_DestroyDynamicBuffers()
             } while (alwaysfails);
         }
     }
-    for (bufferIterb = 0; bufferIterb != 2; ++bufferIterb)
+    for (bufferIterb = 0; bufferIterb != ARRAY_COUNT(gfxBuf.skinnedCacheVbPool); ++bufferIterb)
     {
         if (gfxBuf.skinnedCacheVbPool[bufferIterb].buffer)
         {

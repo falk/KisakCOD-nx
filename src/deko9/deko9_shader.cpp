@@ -84,12 +84,116 @@ const char kD3D9MathPrelude[] =
     "vec2 deko9_nrm(vec2 v) { return v * min(inversesqrt(dot(v, v)), 1e38); }\n"
     "vec3 deko9_nrm(vec3 v) { return v * min(inversesqrt(dot(v, v)), 1e38); }\n"
     "vec4 deko9_nrm(vec4 v) { return v * min(inversesqrt(dot(v, v)), 1e38); }\n"
-    "float deko9_pow(float a, float b) { return exp2(b == 0.0 ? 0.0 : b * log2(a)); }\n"
     "vec2 deko9_pow(vec2 a, vec2 b) { return exp2(mix(b * log2(a), vec2(0.0), equal(b, vec2(0.0)))); }\n"
     "vec3 deko9_pow(vec3 a, vec3 b) { return exp2(mix(b * log2(a), vec3(0.0), equal(b, vec3(0.0)))); }\n"
     "vec4 deko9_pow(vec4 a, vec4 b) { return exp2(mix(b * log2(a), vec4(0.0), equal(b, vec4(0.0)))); }\n"
     "float deko9_rsq(float x) { return min(inversesqrt(x), 1e38); }\n"
     "float deko9_rcp(float x) { return clamp(1.0 / x, -1e38, 1e38); }\n";
+// The scalar pow select is the one guard form that differs: the ternary
+// compiles to a predicated diamond, the bool mix to a select.
+const char kD3D9PowTernary[] = "float deko9_pow(float a, float b) { return exp2(b == 0.0 ? 0.0 : b * log2(a)); }\n";
+const char kD3D9PowSelect[] = "float deko9_pow(float a, float b) { return exp2(mix(b * log2(a), 0.0, b == 0.0)); }\n";
+// cmp/cnd (DEKO9_SHADER_OPT_GUARDS): `(c >= 0) ? a : b` as selects.
+const char kD3D9SelectPrelude[] =
+    "float deko9_cmp(float c, float a, float b) { return mix(b, a, c >= 0.0); }\n"
+    "vec2 deko9_cmp(float c, vec2 a, vec2 b) { return mix(b, a, bvec2(c >= 0.0)); }\n"
+    "vec3 deko9_cmp(float c, vec3 a, vec3 b) { return mix(b, a, bvec3(c >= 0.0)); }\n"
+    "vec4 deko9_cmp(float c, vec4 a, vec4 b) { return mix(b, a, bvec4(c >= 0.0)); }\n"
+    "float deko9_cnd(float c, float a, float b) { return mix(b, a, c > 0.5); }\n"
+    "vec2 deko9_cnd(float c, vec2 a, vec2 b) { return mix(b, a, bvec2(c > 0.5)); }\n"
+    "vec3 deko9_cnd(float c, vec3 a, vec3 b) { return mix(b, a, bvec3(c > 0.5)); }\n"
+    "vec4 deko9_cnd(float c, vec4 a, vec4 b) { return mix(b, a, bvec4(c > 0.5)); }\n";
+
+// Index of the parenthesis matching the one at `open`, or npos.
+size_t MatchParen(const std::string &line, size_t open)
+{
+    int depth = 0;
+    for (size_t i = open; i < line.size(); ++i)
+    {
+        if (line[i] == '(')
+            ++depth;
+        else if (line[i] == ')' && --depth == 0)
+            return i;
+    }
+    return std::string::npos;
+}
+
+// Rewrites every MojoShader ternary `( (COND) ? A : B )` on the line:
+// rcp/rsq zero tests (`X == 0.0`, A = FLT_MAX) become the clamped helper
+// alone (the clamp already keeps a zero or flushed operand finite),
+// cmp/cnd (`X >= 0.0`, `X > 0.5`) become deko9_cmp/deko9_cnd. The ternary
+// sits inside an enclosing parenthesis (its own, or a vecN cast's); its
+// whole content is replaced. Returns false on a form it cannot parse.
+bool RewriteTernaries(std::string *line)
+{
+    for (size_t q; (q = line->find(") ? ")) != std::string::npos;)
+    {
+        // The condition's parentheses.
+        size_t condOpen = std::string::npos;
+        for (int depth = 0, i = (int)q; i >= 0; --i)
+        {
+            if ((*line)[(size_t)i] == ')')
+                ++depth;
+            else if ((*line)[(size_t)i] == '(' && --depth == 0)
+            {
+                condOpen = (size_t)i;
+                break;
+            }
+        }
+        if (condOpen == std::string::npos || condOpen == 0 || (*line)[condOpen - 1] != '(')
+            return false;
+        const size_t outerOpen = condOpen - 1;
+        const size_t outerClose = MatchParen(*line, outerOpen);
+        if (outerClose == std::string::npos)
+            return false;
+        const std::string cond = line->substr(condOpen + 1, q - condOpen - 1);
+        // A ends at the first depth-0 " : " after "? ".
+        size_t aBegin = q + 4, colon = std::string::npos;
+        for (size_t i = aBegin, depth = 0; i + 3 <= outerClose; ++i)
+        {
+            if ((*line)[i] == '(')
+                ++depth;
+            else if ((*line)[i] == ')')
+            {
+                if (!depth)
+                    break;
+                --depth;
+            }
+            else if (!depth && !line->compare(i, 3, " : "))
+            {
+                colon = i;
+                break;
+            }
+        }
+        if (colon == std::string::npos)
+            return false;
+        const std::string a = line->substr(aBegin, colon - aBegin);
+        const std::string b = line->substr(colon + 3, outerClose - colon - 3);
+        std::string to;
+        const char *op = nullptr;
+        size_t opAt;
+        if ((opAt = cond.rfind(" == 0.0")) != std::string::npos && opAt + 7 == cond.size() && a == "FLT_MAX")
+        {
+            const std::string x = cond.substr(0, opAt);
+            if (b == "1.0 / " + x)
+                to = "deko9_rcp(" + x + ")";
+            else if (b == "inversesqrt(abs(" + x + "))")
+                to = "deko9_rsq(abs(" + x + "))";
+            else
+                return false;
+        }
+        else if ((opAt = cond.rfind(" >= 0.0")) != std::string::npos && opAt + 7 == cond.size())
+            op = "deko9_cmp(";
+        else if ((opAt = cond.rfind(" > 0.5")) != std::string::npos && opAt + 6 == cond.size())
+            op = "deko9_cnd(";
+        else
+            return false;
+        if (op)
+            to = op + cond.substr(0, opAt) + ", " + a + ", " + b + ")";
+        line->replace(outerOpen + 1, outerClose - outerOpen - 1, to);
+    }
+    return true;
+}
 
 void RewriteD3D9Math(std::string *line)
 {
@@ -426,10 +530,13 @@ uint64_t Deko9_HashBytecode(const void *bytecode, size_t bytes)
 bool Deko9_TranslateShader(const void *bytecode, size_t bytes, uint32_t shadowSamplerMask,
                            std::string *glsl, Deko9ShaderInfo *info, std::string *error,
                            const uint8_t *instanceRegs, uint32_t instanceRegCount, bool earlyFragmentTests,
-                           uint32_t shadowFilter)
+                           uint32_t shadowFilter, uint32_t shaderOpt)
 {
     if (shadowFilter >= DEKO9_SHADOW_FILTER_MODES)
         return Fail(error, "shadow filter mode %u", shadowFilter);
+    if (shaderOpt & ~DEKO9_SHADER_OPT_ALL)
+        return Fail(error, "shader options 0x%x", shaderOpt);
+    const bool optGuards = (shaderOpt & DEKO9_SHADER_OPT_GUARDS) != 0;
     if (instanceRegCount > DEKO9_MAX_INSTANCE_REGS || (instanceRegCount && !instanceRegs))
         return Fail(error, "instance layout of %u registers", instanceRegCount);
     *info = Deko9ShaderInfo{};
@@ -549,6 +656,9 @@ bool Deko9_TranslateShader(const void *bytecode, size_t bytes, uint32_t shadowSa
         {
             out += "#version 460\n";
             out += kD3D9MathPrelude;
+            out += optGuards ? kD3D9PowSelect : kD3D9PowTernary;
+            if (optGuards)
+                out += kD3D9SelectPrelude;
             // D3D9 guarantees that the same position math yields the same
             // depth in every shader (depth prepass, then LEQUAL/EQUAL lit
             // and light passes); DXVK declares position invariant for this.
@@ -693,6 +803,8 @@ bool Deko9_TranslateShader(const void *bytecode, size_t bytes, uint32_t shadowSa
             if (!RewriteShadowCalls(&line, sampler, error))
                 return false;
         }
+        if (optGuards && !RewriteTernaries(&line))
+            return Fail(error, "unparsed select: %s", line.c_str());
         RewriteD3D9Math(&line);
         out += line;
         out += '\n';
@@ -848,6 +960,8 @@ bool Deko9_DkshStats(const uint8_t *dksh, size_t size, Deko9DkshStats *out)
             ++out->ipa; // IPA (0xe0xx; the branch/exit forms are 0xe2xx/0xe3xx)
         else if ((top & 0xfff8) == 0x5080)
             ++out->mufu; // MUFU
+        else if ((top & 0xfff0) == 0xe240 || (top & 0xfff0) == 0xe290 || (top & 0xfff8) == 0xf0f8)
+            ++out->branches; // BRA, SSY, SYNC
         else if ((top & 0xfe00) == 0xd800 || (top & 0xfe00) == 0xda00 || // TEXS, TLDS
                  (top & 0xffc0) == 0xdf00 ||                             // TLD4S
                  (top & 0xffc0) == 0x0380 || (top & 0xfff8) == 0xdeb8 || // TEX

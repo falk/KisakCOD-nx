@@ -17,7 +17,9 @@
 //
 // r_halfResParticles 0 off, 1 half resolution, 2 full resolution (every
 // pass runs at scale 1: the image must match 0 within rounding, the
-// plumbing proof).
+// plumbing proof), 3 auto: half resolution only while the measured GPU cost
+// of the emissive (+ off-screen) passes stays above r_halfResParticlesAutoOnMs
+// (off again below r_halfResParticlesAutoOffMs), switched at frame starts.
 
 #include <cstdint>
 
@@ -31,6 +33,10 @@ struct Material;
 // through RB_HrpRemapStateBits0.
 extern bool g_hrpRedirecting;
 
+// Once per frame before any draw: advances the auto mode (3).
+void RB_HrpFrameUpdate();
+// The auto mode needs the per-pass GPU timers.
+bool RB_HrpWantsGpuPasses();
 // R_DrawEmissive, around its draw call.
 void RB_HrpBeginView(const GfxViewInfo *viewInfo);
 void RB_HrpEndView();

@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-#if defined(__SWITCH__)
+#if defined(__SWITCH__) && !defined(KISAK_SWITCH_INPUT_PROOF_HOST)
 #include <switch.h>
 #endif
 
@@ -50,9 +50,12 @@ enum
 #define SWITCH_INPUT_AXIS_COUNT 4
 /* Gameplay buttons wired to existing SP usercmd buttons by CL_GamepadMove
  * (the retail console layout): ZR -> fire, ZL -> aim down sights, A -> jump,
- * B -> crouch (held), X -> use/reload, Y -> next weapon, R -> frag,
+ * B -> stance (tap crouch, hold prone), Y -> use/reload, X -> next weapon,
+ * R -> frag,
  * L -> special grenade, right stick click -> melee, left stick click ->
- * sprint.  Digital menu bindings stay in the Switch_InputTranslate path;
+ * sprint (hold breath while aiming), d-pad -> action slots 1..4, - -> tap
+ * quicksave / hold objectives.  Digital menu bindings stay in the
+ * Switch_InputTranslate path;
  * the A/B menu keys are suppressed while gameplayActive is set (see
  * SwitchInputState) so crouching does not also open the pause menu, which
  * is + (K_ESCAPE) in gameplay. */
@@ -88,7 +91,7 @@ typedef struct
      * catcher): the face buttons then belong to the usercmd, and the
      * menu-only key translations (A -> ENTER, B -> ESCAPE) are withheld. */
     int gameplayActive;
-#if defined(__SWITCH__)
+#if defined(__SWITCH__) && !defined(KISAK_SWITCH_INPUT_PROOF_HOST)
     PadState pad;
 #endif
 } SwitchInputState;
@@ -138,11 +141,14 @@ void Switch_InputBuildGameplay(const SwitchInputState *state, int invertPitch,
  * [{+usereload}] to ..." string would otherwise show the keyboard default
  * (F, R, ...) or KEY_UNBOUND.  Returns the SWITCH_INPUT_BUTTON_* bit that
  * performs COMMAND (case-insensitive), or 0 when the pad has no fixed button
- * for it and the binding table stays authoritative. */
+ * for it. Legacy combined melee/breath has no single pad equivalent. */
 uint64_t Switch_InputPadButtonForCommand(const char *command);
 /* Printable label of one SWITCH_INPUT_BUTTON_* bit ("Y", "ZR", "R Stick"),
  * or NULL for an unknown/multi-bit value. */
 const char *Switch_InputPadButtonName(uint64_t button);
+/* Label of the physical control for a gameplay command, including stick
+ * axes. NULL means the controller does not perform that command. */
+const char *Switch_InputPadBindingName(const char *command);
 #ifdef __cplusplus
 }
 #endif

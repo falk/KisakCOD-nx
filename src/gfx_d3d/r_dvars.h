@@ -126,13 +126,6 @@ extern const dvar_t *r_streamFakeLagMsec;
 extern const dvar_t *r_lockPvs;
 extern const dvar_t *r_detail;
 extern const dvar_t *r_lightMap;
-// TEMP diagnostic (wallissue.md): force depth test ALWAYS for the first-BSP-frame
-// diagnostic, to separate "fragments rejected by depth" from "no fragments at all".
-// TEMP diagnostic (wallissue.md): per-surface colour attribution for BSP draws.
-// All r_killhouse* diagnostics are DVAR_NOFLAG: they are set per run from the
-// +exec diagnostic config and must never persist into config.cfg.
-// TEMP diagnostic (wallissue.md): force cull none on every pass. Opt-in, so a
-// culling experiment (and its control run) actually measures culling.
 extern const dvar_t *sm_fastSunShadow;
 extern const dvar_t *r_envMapSpecular;
 extern const dvar_t *sc_wantCount;
@@ -225,18 +218,22 @@ extern const dvar_t *r_renderResolution;
 extern const dvar_t *r_fsrSharpness;
 extern const dvar_t *r_fsrMode;
 extern const dvar_t *r_dynres;
-extern const dvar_t *r_dynresBudgetMs;
 extern const dvar_t *r_dynresMin;
 extern const dvar_t *r_dynresMax;
-extern const dvar_t *r_dynresForceScale;
+extern const dvar_t *r_renderScale;
 extern const dvar_t *r_dynresFakeGpuMs;
 extern const dvar_t *r_dynresFakeWave;
 extern const dvar_t *r_deko9GpuPasses;
 extern const dvar_t *r_deko9RtCompression;
 extern const dvar_t *r_deko9LightBarriers;
+extern const dvar_t *r_deko9TiledCache;
 extern const dvar_t *r_deko9NativeFloatZ;
 extern const dvar_t *r_halfResParticles;
 extern const dvar_t *r_halfResParticlesUpsample;
+extern const dvar_t *r_halfResParticlesAutoOnMs;
+extern const dvar_t *r_halfResParticlesAutoOffMs;
+extern const dvar_t *r_deko9DrawProbe;
+extern const dvar_t *r_deko9DrawSplit;
 extern const dvar_t *r_halfResParticlesDepthTol;
 extern const dvar_t *r_halfResParticlesStats;
 extern const dvar_t *r_halfResParticlesOrder;
@@ -244,6 +241,8 @@ extern const dvar_t *r_halfResParticlesDebug;
 extern const dvar_t *r_halfResParticlesHw;
 extern const dvar_t *r_deko9ZcullStats;
 extern const dvar_t *r_shadowFilter;
+extern const dvar_t *r_deko9ShaderOpt;
+extern const dvar_t *r_deko9Prebake;
 extern const dvar_t *r_deko9Census;
 extern const dvar_t *r_deko9FaultTrace;
 extern const dvar_t *r_deko9GpuMap;

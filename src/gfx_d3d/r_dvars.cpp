@@ -208,17 +208,21 @@
   const dvar_t *r_fsrSharpness;
   const dvar_t *r_fsrMode;
   const dvar_t *r_dynres;
-  const dvar_t *r_dynresBudgetMs;
   const dvar_t *r_dynresMin;
   const dvar_t *r_dynresMax;
-  const dvar_t *r_dynresForceScale;
+  const dvar_t *r_renderScale;
   const dvar_t *r_dynresFakeGpuMs;
   const dvar_t *r_dynresFakeWave;
   const dvar_t *r_deko9GpuPasses;
   const dvar_t *r_deko9RtCompression;
   const dvar_t *r_deko9LightBarriers;
+  const dvar_t *r_deko9TiledCache;
   const dvar_t *r_halfResParticles;
   const dvar_t *r_halfResParticlesUpsample;
+  const dvar_t *r_halfResParticlesAutoOnMs;
+  const dvar_t *r_halfResParticlesAutoOffMs;
+  const dvar_t *r_deko9DrawProbe;
+  const dvar_t *r_deko9DrawSplit;
   const dvar_t *r_halfResParticlesDepthTol;
   const dvar_t *r_halfResParticlesStats;
   const dvar_t *r_halfResParticlesOrder;
@@ -227,6 +231,8 @@
   const dvar_t *r_deko9NativeFloatZ;
   const dvar_t *r_deko9ZcullStats;
   const dvar_t *r_shadowFilter;
+  const dvar_t *r_deko9ShaderOpt;
+  const dvar_t *r_deko9Prebake;
   const dvar_t *r_deko9Census;
   const dvar_t *r_deko9FaultTrace;
   const dvar_t *r_deko9GpuMap;
@@ -282,12 +288,6 @@
 #ifdef __SWITCH__
  const dvar_t *r_smc_admitUnlinked;
 #endif
-// staticissue.md test 3 (killhouse static-model pile): force every static
-// model through the skinned funnel, which draws the validated CPU
-// xsurf->verts0/triIndices through the engine's dynamic buffers instead of
-// the per-zone block-7/8 GPU buffers. Diagnostic only: if the pile
-// disappears, the zone geometry buffer upload/offset association is wrong;
-// if it remains, the decode/draw association is wrong.
  const dvar_t *r_pretess;
  const dvar_t *r_picmip_manual;
  const dvar_t *r_picmip;
@@ -1032,7 +1032,7 @@
               fsrLimits,
               DVAR_ARCHIVE,
               "deko3d renderer: RCAS sharpening of r_fsrMode bilinear_rcas in stops below maximum (0 = "
-              "sharpest, each +1 halves it); only used when r_renderResolution is below the display size");
+              "sharpest, each +1 halves it); only used when r_fsrMode upscales");
           // Present upscaler (src/deko9/deko9_fsr.h); order = deko9::UpscaleMode.
           // Applies at the next present.
           static const char *fsrModeNames[] = {"sgsr", "bilinear_rcas", "bilinear", nullptr};
@@ -1041,57 +1041,53 @@
               fsrModeNames,
               0,
               DVAR_ARCHIVE,
-              "deko3d renderer: upscaler when r_renderResolution is below the display size: sgsr (Snapdragon "
+              "deko3d renderer: upscaler when r_renderResolution is below the display size, and for the scene "
+              "below r_renderScale 1 or under r_dynres with r_taau 0: sgsr (Snapdragon "
               "GSR 1, edge-directed with sharpening), bilinear_rcas (bilinear + FSR 1 RCAS, r_fsrSharpness), "
               "bilinear");
-          // Dynamic render resolution (r_dynres.cpp
-          // section 10). The layout (scene targets allocated at the output
-          // size, the scene upscaled into the back buffer before the 2D
-          // pass, HUD at the output size) needs a device restart; everything
-          // else applies per frame.
+          // Scene render scale (r_dynres.cpp, r_render_scale.h). The scene
+          // layout (scene targets allocated at the output size, the scene
+          // resolved into the back buffer before the 2D pass, HUD at the
+          // output size) is chosen when the targets are created; the scale
+          // itself applies per frame.
+          //   native   r_renderScale 1, r_dynres 0 (the defaults)
+          //   fixed    r_renderScale S < 1, r_dynres 0
+          //   adaptive r_dynres 1 (r_dynresMin..r_dynresMax; r_renderScale unused)
+          DvarLimits scaleLimits;
+          scaleLimits.value.min = 0.25f;
+          scaleLimits.value.max = 1.0f;
+          r_renderScale = Dvar_RegisterFloat(
+              "r_renderScale",
+              1.0f,
+              scaleLimits,
+              DVAR_ARCHIVE,
+              "deko3d renderer: 3D scene scale per axis of the 1280x720 output (0.25..1, quantised to 16x8 px); "
+              "below 1 the scene renders into its own target and is resolved with r_taau (else r_fsrMode) "
+              "before the HUD, which draws at 1280x720. 1 = native. Starting below 1 creates that layout "
+              "(replaces r_renderResolution); on it a new value applies the next frame, started at 1 it "
+              "waits for vid_restart. Ignored while r_dynres drives the scale");
           r_dynres = Dvar_RegisterBool(
               "r_dynres",
               0,
               DVAR_ARCHIVE | DVAR_LATCH,
-              "deko3d renderer: dynamic render resolution: the 3D scene renders at a size between r_dynresMin "
-              "and r_dynresMax of the 1280x720 output chosen per frame from the GPU frame time "
-              "(r_dynresBudgetMs), is upscaled with r_fsrMode before the HUD, which draws at 1280x720 "
-              "(replaces r_renderResolution; applies at startup)");
-          DvarLimits budgetLimits;
-          budgetLimits.value.min = 4.0f;
-          budgetLimits.value.max = 100.0f;
-          r_dynresBudgetMs = Dvar_RegisterFloat(
-              "r_dynresBudgetMs",
-              15.5f,
-              budgetLimits,
-              DVAR_ARCHIVE,
-              "deko3d renderer: r_dynres GPU frame-time budget in ms; over it the scene size drops at once, "
-              "well under it (predicted at the next size) it rises slowly");
-          DvarLimits scaleLimits;
-          scaleLimits.value.min = 0.25f;
-          scaleLimits.value.max = 1.0f;
+              "deko3d renderer: dynamic render resolution: a controller drives the 3D scene scale between "
+              "r_dynresMin and r_dynresMax per frame from the GPU frame time (budget from the frame cap) "
+              "instead of r_renderScale; the scene is resolved as with r_renderScale below 1 (applies at "
+              "startup)");
           r_dynresMin = Dvar_RegisterFloat(
               "r_dynresMin",
-              0.75f,
+              // Low enough for the temporal upscaler (r_taau, the default) to hold its budget on heavy maps;
+              // its reconstruction hides the smaller scene.
+              0.67f,
               scaleLimits,
               DVAR_ARCHIVE,
-              "deko3d renderer: r_dynres smallest scene scale per axis (0.75 = 960x544 of 1280x720)");
+              "deko3d renderer: r_dynres smallest scene scale per axis (0.67 = 858x482 of 1280x720)");
           r_dynresMax = Dvar_RegisterFloat(
               "r_dynresMax",
               1.0f,
               scaleLimits,
               DVAR_ARCHIVE,
               "deko3d renderer: r_dynres largest scene scale per axis (1.0 = 1280x720, no upscale)");
-          DvarLimits forceLimits;
-          forceLimits.value.min = 0.0f;
-          forceLimits.value.max = 1.0f;
-          r_dynresForceScale = Dvar_RegisterFloat(
-              "r_dynresForceScale",
-              0.0f,
-              forceLimits,
-              DVAR_NOFLAG,
-              "deko3d renderer: with r_dynres, a fixed scene scale per axis (0.25..1, quantised to 16x8 px) "
-              "instead of the controller; 0 = controller");
           DvarLimits fakeLimits;
           fakeLimits.value.min = 0.0f;
           fakeLimits.value.max = 100.0f;
@@ -1109,6 +1105,8 @@
               DVAR_NOFLAG,
               "deko3d renderer: with r_dynresFakeGpuMs, alternate every this many frames between the full fake "
               "time and 60% of it (0 = constant), so the controller keeps changing size");
+          void R_TaauRegisterDvars(); // r_taau.cpp
+          R_TaauRegisterDvars();
       }
       r_deko9GpuPasses = Dvar_RegisterBool(
           "r_deko9GpuPasses",
@@ -1131,17 +1129,61 @@
           DVAR_NOFLAG,
           "deko3d renderer: barrier for render->sample hazards inside the 3D pipe: 0 full barrier + L2 flush, "
           "1 DkBarrier_Primitives, 2 DkBarrier_Fragments (copy/2D-engine hazards stay full)");
-      // Off-screen soft particles (zfeather* over/additive
-      // sprites) drawn into an off-screen premultiplied target and
-      // composited once per run.
-      r_halfResParticles = Dvar_RegisterInt(
-          "r_halfResParticles",
+      // Off: binned rasterization adds to the frame time on this GPU.
+      r_deko9TiledCache = Dvar_RegisterInt(
+          "r_deko9TiledCache",
           0,
           0,
           2,
           DVAR_NOFLAG,
+          "deko3d renderer: Maxwell tiled caching (binned rasterization in the L2): 0 off, 1 on with 128x128 "
+          "tiles, 2 on with 64x64 tiles; takes effect at the next command list and flushes before every "
+          "barrier, render-target change and submit");
+      // Off-screen soft particles (zfeather* over/additive
+      // sprites) drawn into an off-screen premultiplied target and
+      // composited once per run.
+      // Correct on hardware but off: the pass costs a fixed ~2 ms, which loses on low-particle maps until the
+      // enable is adaptive to the particle load.
+      r_halfResParticles = Dvar_RegisterInt(
+          "r_halfResParticles",
+          0,
+          0,
+          3,
+          DVAR_NOFLAG,
           "deko3d renderer: soft particles into an off-screen target composited over the scene: 0 off, "
-          "1 half resolution, 2 full resolution (the plumbing proof: ~identical to 0)");
+          "1 half resolution, 2 full resolution (the plumbing proof: ~identical to 0), 3 auto (half resolution "
+          "while the emissive passes' GPU cost is high)");
+      r_halfResParticlesAutoOnMs = Dvar_RegisterFloat(
+          "r_halfResParticlesAutoOnMs",
+          3.5f,
+          0.0f,
+          50.0f,
+          DVAR_NOFLAG,
+          "deko3d renderer: r_halfResParticles 3 turns the off-screen path on above this average emissive-pass GPU ms");
+      r_halfResParticlesAutoOffMs = Dvar_RegisterFloat(
+          "r_halfResParticlesAutoOffMs",
+          2.4f,
+          0.0f,
+          50.0f,
+          DVAR_NOFLAG,
+          "deko3d renderer: r_halfResParticles 3 turns it off below this average emissive + off-screen GPU ms");
+      r_deko9DrawProbe = Dvar_RegisterInt(
+          "r_deko9DrawProbe",
+          0,
+          0,
+          15,
+          DVAR_NOFLAG,
+          "deko3d renderer, GPU per-draw cost probe (pixels unchanged): bit 1 re-push all shader constants every "
+          "draw, 2 re-resolve textures/samplers every draw, 4 re-bind vertex streams and index buffer every "
+          "draw, 8 each r_deko9DrawSplit sub-draw also re-pushes constants");
+      r_deko9DrawSplit = Dvar_RegisterInt(
+          "r_deko9DrawSplit",
+          1,
+          1,
+          16,
+          DVAR_NOFLAG,
+          "deko3d renderer, GPU per-draw cost probe: issue every triangle-list draw as this many consecutive "
+          "draws of the same triangles (identical pixels, more GPU draws)");
       r_halfResParticlesUpsample = Dvar_RegisterInt(
           "r_halfResParticlesUpsample",
           1,
@@ -1165,11 +1207,15 @@
           "r_halfResParticlesDebug",
           0,
           0,
-          15,
+          127,
           DVAR_NOFLAG,
           "deko3d renderer: r_halfResParticles bisection bits: 1 = at factor 1 (r_halfResParticles 2) use the "
           "scene depth and float-Z instead of the depth pass's copies, 2 = only the depth, 4 = only the float-Z, "
-          "8 = (any factor) never composite: the off-screen content is dropped, everything else runs");
+          "8 = (any factor) never composite: the off-screen content is dropped, everything else runs, "
+          "16 = a full barrier with every cache invalidate (texture, shader, descriptors, zcull, L2) at every "
+          "off-screen edge, beside the hazard tracker's, 32 = off-screen runs bind no depth-stencil (no depth "
+          "test, so no early-Z, against the depth pass's output), 64 = probe: three times, read the off-screen and scene "
+          "float-Z, the off-screen colour and the passes' constants back, log HRP_PROBE and dump them to the SD card");
       r_halfResParticlesHw = Dvar_RegisterInt(
           "r_halfResParticlesHw",
           3,
@@ -1212,6 +1258,20 @@
           "deko3d renderer: log a 'DEKO9 zcull' block every 60 frames: per pass depth-tested draws, draws while "
           "the zcull region is invalidated, depth-target switches, depth clears, compare-direction flips, and "
           "with r_deko9GpuPasses the hardware zcull counters");
+      r_deko9ShaderOpt = Dvar_RegisterInt(
+          "r_deko9ShaderOpt",
+          0,
+          0,
+          1,
+          DVAR_NOFLAG,
+          "deko3d renderer: shader translation options, bit 1 branch-free D3D9 math guards (rcp/rsq/pow/cmp as "
+          "clamps and selects instead of branches); 0 the retail-faithful ternaries; changes the shader translation");
+      r_deko9Prebake = Dvar_RegisterBool(
+          "r_deko9Prebake",
+          1,
+          DVAR_NOFLAG,
+          "deko3d renderer: build every shader variant a zone's materials can select while the zone loads; 0 "
+          "skips that load-time build and each variant is built at its first draw instead");
       r_shadowFilter = Dvar_RegisterInt(
           "r_shadowFilter",
           0,
@@ -1987,10 +2047,6 @@
          false,
          DVAR_NOFLAG,
          "Dump static model info for the next frame.");
-     // Diagnostic: stamp model-lighting samples with their depth-slice
-     // index so the host can locate each slice. Non-archived, non-cheat.
-     Dvar_RegisterBool("r_killhouseMLSentinel", false, 0,
-                       "Stamp model lighting samples with their slice index");
      r_altModelLightingUpdate = Dvar_RegisterBool(
          "r_altModelLightingUpdate",
          true,

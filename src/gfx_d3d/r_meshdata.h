@@ -8,7 +8,7 @@ struct GfxMeshGlobals // sizeof=0x180
     GfxMeshData spotShadowClearMeshData[4]; // ...
     GfxMeshData sunShadowClearMeshData[2]; // ...
     // Second bank of fullSceneViewMesh for the odd SMP frame: the scene
-    // viewport changes size with r_dynres, and the front end must not
+    // viewport changes size with r_renderScale, and the front end must not
     // rewrite a quad the back end is still drawing (which cost an
     // R_SyncRenderThread per change). R_SetFullSceneViewMesh picks the bank.
     GfxQuadMeshData fullSceneViewMeshOdd[4];

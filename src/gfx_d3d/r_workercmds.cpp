@@ -1,3 +1,4 @@
+#include <platform/switch/switch_watchdog.h>
 #include <universal/q_shared.h>
 #include "r_workercmds.h"
 #include <qcommon/mem_track.h>
@@ -143,7 +144,10 @@ void __cdecl R_ProcessWorkerCmdsWithTimeout(int(__cdecl *timeout)(), int forever
     {
         PROF_SCOPED("WaitForWorkerCmd");
         InterlockedIncrement(&g_workerCmdWaitCount);
-        Sys_WaitForWorkerCmd();
+        {
+            SwitchPerfWorkerIdleScope perfIdle;
+            Sys_WaitForWorkerCmd();
+        }
         if (timeout())
         {
             InterlockedDecrement(&g_workerCmdWaitCount);
@@ -159,6 +163,7 @@ void __cdecl R_WaitWorkerCmdsOfType(WorkerCmdType type)
     g_waitTypeMainThread = type;
     if (!R_WorkerCmdsFinished())
     {
+        SwitchPerfWorkerWaitScope perfWait(type);
         R_NotifyWorkerCmdType(type);
         KISAK_NULLSUB();
         R_ProcessWorkerCmdsWithTimeout(R_WorkerCmdsFinished, 1);
@@ -310,6 +315,8 @@ int __cdecl R_ProcessWorkerCmd(WorkerCmdType type)
 
 void __cdecl R_ProcessWorkerCmdInternal(WorkerCmdType type, void *data)
 {
+    // Exclusive service time per command type, main thread vs worker.
+    SwitchPerfWorkerCmdScope perfCmd(type);
     R_NotifyWorkerCmdType(type);
     // count the DPVS/skin command as executed, whichever path ran it
     // (inline synchronous fallback or a real worker thread).
@@ -338,14 +345,10 @@ void __cdecl R_ProcessWorkerCmdInternal(WorkerCmdType type, void *data)
         R_AddCellDynBrushSurfacesInFrustumCmd((const DpvsDynamicCellCmd *)data);
         break;
     case WRKCMD_DPVS_ENTITY:
-#ifdef __SWITCH__
     {
         SWITCH_PERF_THREAD_SCOPE(SWITCH_PERF_SCENE_DOBJ_CULL);
-#endif
         R_AddEntitySurfacesInFrustumCmd((const DpvsEntityCmd *)data);
-#ifdef __SWITCH__
     }
-#endif
         break;
     case WRKCMD_ADD_SCENE_ENT:
         R_AddAllSceneEntSurfacesCamera(*(const GfxViewInfo **)data);
@@ -357,24 +360,16 @@ void __cdecl R_ProcessWorkerCmdInternal(WorkerCmdType type, void *data)
         R_GenerateShadowCookiesCmd((ShadowCookieCmd *)data);
         break;
     case WRKCMD_BOUNDS_ENT_DELAYED:
-#ifdef __SWITCH__
     {
         SWITCH_PERF_THREAD_SCOPE(SWITCH_PERF_ENTS_PRED_BOUNDS);
-#endif
         R_UpdateGfxEntityBoundsCmd((GfxSceneEntity **)data);
-#ifdef __SWITCH__
     }
-#endif
         break;
     case WRKCMD_SKIN_ENT_DELAYED:
-#ifdef __SWITCH__
     {
         SWITCH_PERF_THREAD_SCOPE(SWITCH_PERF_ENTS_PRED_SKIN);
-#endif
         R_SkinGfxEntityCmd((GfxSceneEntity **)data);
-#ifdef __SWITCH__
     }
-#endif
         break;
     case WRKCMD_GENERATE_FX_VERTS:
         if (!dx.deviceLost)
@@ -388,14 +383,10 @@ void __cdecl R_ProcessWorkerCmdInternal(WorkerCmdType type, void *data)
         R_SkinCachedStaticModelCmd((SkinCachedStaticModelCmd *)data);
         break;
     case WRKCMD_SKIN_XMODEL:
-#ifdef __SWITCH__
     {
         SWITCH_PERF_THREAD_SCOPE(SWITCH_PERF_SCENE_XMODEL_SKIN);
-#endif
         R_SkinXModelCmd((WORD*)data);
-#ifdef __SWITCH__
     }
-#endif
         break;
     default:
         if (!alwaysfails)
@@ -435,8 +426,17 @@ void R_InitWorkerThreads()
     g_workerCmds[type].bufSize = sizeof(array);                                   \
     g_workerCmds[type].dataSize = sizeof((array)[0])
 
+// SWITCH_PERF wrkcmd/wrkwait/wrkcount field names, indexed by WorkerCmdType.
+static const char *const s_workerCmdPerfNames[WRKCMD_COUNT] = {
+    "fxspot",   "fxnondep", "fxremain", "cellstat", "cellent",  "celldynm",
+    "celldynb", "dpvsent",  "addent",   "spotshad", "cookie",   "boundent",
+    "skinent",  "fxverts",  "markvert", "skinsm",   "skinxm",
+};
+static_assert(WRKCMD_COUNT <= SWITCH_PERF_WRKCMD_SLOTS, "SWITCH_PERF worker-command slots too few");
+
 int R_InitWorkerCmds()
 {
+    SwitchPerf_SetWorkerCmdNames(s_workerCmdPerfNames, WRKCMD_COUNT);
     R_WORKER_CMD_QUEUE(WRKCMD_UPDATE_FX_SPOT_LIGHT, g_UpdateFxSpotLightBuf);
     R_WORKER_CMD_QUEUE(WRKCMD_UPDATE_FX_NON_DEPENDENT, g_UpdateFxNonDependentBuf);
     R_WORKER_CMD_QUEUE(WRKCMD_UPDATE_FX_REMAINING, g_UpdateFxRemainingBuf);
@@ -495,29 +495,25 @@ void __cdecl  R_WorkerThread()
     if (setjmp(*(jmp_buf *)Value))
         Com_ErrorAbort();
     Profile_Guard(1);
-#ifdef __SWITCH__
     SwitchPerf_MarkWorkerThread();
     const int perfWorker = Sys_GetCurrentThreadId() == threadId[THREAD_CONTEXT_WORKER1] ? 1 : 0;
-#endif
 
     while (1)
     {
+        Watchdog_Crumb(Sys_GetCurrentThreadId() == threadId[THREAD_CONTEXT_WORKER1] ? CRUMB_WORKER1 : CRUMB_WORKER0, 1);
         {
             PROF_SCOPED("WaitForWorkerCmd");
             InterlockedIncrement(&g_workerCmdWaitCount);
             Sys_WaitForWorkerCmd();
             InterlockedDecrement(&g_workerCmdWaitCount);
         }
+        Watchdog_Crumb(Sys_GetCurrentThreadId() == threadId[THREAD_CONTEXT_WORKER1] ? CRUMB_WORKER1 : CRUMB_WORKER0, 2);
         {
             PROF_SCOPED("WorkerThread");
-#ifdef __SWITCH__
-            const uint64_t perfStart = SwitchPerf_g_enabled ? SwitchPerf_NowTicks() : 0;
+            const uint64_t perfStart = KISAK_PERF_ACTIVE ? SwitchPerf_NowTicks() : 0;
             R_ProcessWorkerCmds();
             if (perfStart)
                 SwitchPerf_AddWorkerTicks(perfWorker, SwitchPerf_NowTicks() - perfStart);
-#else
-            R_ProcessWorkerCmds();
-#endif
         }
     }
 }
@@ -614,6 +610,7 @@ void __cdecl R_WaitFrontendWorkerCmds()
 
     PROF_SCOPED("R_WaitFrontendWorkerCmds");
     //KISAK_NULLSUB();
+    SwitchPerfWorkerWaitScope perfWait(SWITCH_PERF_WRKWAIT_FRONT, KISAK_PERF_ACTIVE && !R_FinishedWorkerCmds());
 
     R_ProcessWorkerCmdsWithTimeout(R_FinishedWorkerCmds, 1);
 }
@@ -638,6 +635,7 @@ void __cdecl R_WaitWorkerCmds()
 
     PROF_SCOPED("R_WaitWorkerCmds");
     //KISAK_NULLSUB();
+    SwitchPerfWorkerWaitScope perfWait(SWITCH_PERF_WRKWAIT_ALL, KISAK_PERF_ACTIVE && !R_FinishedWorkerCmds());
 
     R_ProcessWorkerCmdsWithTimeout(R_FinishedWorkerCmds, 1);
 }

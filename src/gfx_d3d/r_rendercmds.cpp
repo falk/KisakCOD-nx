@@ -300,16 +300,12 @@ void __cdecl R_IssueRenderCommands(uint32_t type)
         if (!R_HandOffToBackend(type))
         {
             {
-#ifdef __SWITCH__
                 SWITCH_PERF_SCOPE(SWITCH_PERF_ISSUE_PREP);
-#endif
                 if ((type & 2) != 0)
                     R_PerformanceCounters();
                 if (Sys_IsMainThread())
                 {
-#ifdef __SWITCH__
                     SWITCH_PERF_SCOPE(SWITCH_PERF_ISSUE_WAITFRONTEND);
-#endif
                     R_WaitFrontendWorkerCmds();
                 }
                 R_UpdateSkinCacheUsage();
@@ -447,9 +443,7 @@ char __cdecl R_HandOffToBackend(char type)
 {
     bool v2; // [esp+3h] [ebp-1h]
 
-#ifdef __SWITCH__
     SWITCH_PERF_SCOPE(SWITCH_PERF_ISSUE_HANDOFF);
-#endif
     if (r_smp_backend->current.enabled)
         v2 = sys_smp_allowed->current.enabled && !r_glob.isRenderingRemoteUpdate;
     else
@@ -600,7 +594,7 @@ DebugGlobals *R_ToggleSmpFrame()
         CG_CalculateFPS();
     s_smpFrame = (s_smpFrame + 1) % 2;
     ++rg.frontEndFrameCount;
-    gfxBuf.dynamicBufferFrame = (gfxBuf.dynamicBufferFrame + 1) % 2;
+    gfxBuf.dynamicBufferFrame = (gfxBuf.dynamicBufferFrame + 1) % ARRAY_COUNT(gfxBuf.skinnedCacheVbPool);
     gfxBuf.preTessBufferFrame = (gfxBuf.preTessBufferFrame + 1) % 2;
     frontEndDataOut = &s_backEndData[s_smpFrame];
     iassert( rg.frontEndFrameCount > 0 );

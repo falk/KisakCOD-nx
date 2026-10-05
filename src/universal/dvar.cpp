@@ -134,6 +134,10 @@ void __cdecl Dvar_WriteSingleVariable(const dvar_s *dvar, int *userData)
         {
             f = *userData;
             v2 = Dvar_DisplayableLatchedValue(dvar);
+#ifdef __SWITCH__
+            const char *Switch_CmdlineDvarPersistValue(const dvar_s *dvar, const char *current);
+            v2 = Switch_CmdlineDvarPersistValue(dvar, v2);
+#endif
             FS_Printf(f, "seta %s \"%s\"\n", dvar->name, v2);
         }
     }

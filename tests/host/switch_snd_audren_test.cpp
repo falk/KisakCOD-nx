@@ -6,9 +6,8 @@
 //    configuration (AL_NONE distance model, listener at the origin, stereo
 //    output) and compares every case with SndAr_ComputeMix.  This is the only
 //    check of the pan law against openal-soft: the Switch build no longer
-//    links openal-soft at all (task/remove-openal-switch removed the
-//    on-device `snd_audrenSelftest 1` that used to compare against the
-//    linked portlib), so this host cross-check is now the sole verifier.
+//    links openal-soft at all (there is no on-device comparison against a
+//    linked portlib), so this host cross-check is the sole verifier.
 // 2. Voice bookkeeping: drives the OpenAL-subset model against a fake
 //    renderer that follows libnx's audrv wave-buffer rules (a voice plays its
 //    wave buffers in order, a looping one never finishes, stop marks every

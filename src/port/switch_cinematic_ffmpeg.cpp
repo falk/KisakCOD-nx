@@ -21,6 +21,7 @@
 #include <platform/switch/switch_platform.h>
 #include <qcommon/qcommon.h>
 #include "gfx_d3d/r_cinematic.h"
+#include "switch_cinematic_plane.h"
 #include "gfx_d3d/rb_state.h"
 #include "gfx_d3d/r_init.h"
 #include "gfx_d3d/r_image.h"
@@ -817,7 +818,10 @@ void __cdecl R_Cinematic_DrawStretchPic_Letterboxed()
     float color[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     R_AddCmdDrawStretchPic(0.0f, 0.0f, width, letterboxHalfHeight, 0.0f, 0.0f, 1.0f, 1.0f, color, rgp.whiteMaterial);
     R_AddCmdDrawStretchPic(0.0f, height - letterboxHalfHeight, width, letterboxHalfHeight, 0.0f, 0.0f, 1.0f, 1.0f, color, rgp.whiteMaterial);
-    R_AddCmdDrawStretchPic(0.0f, letterboxHalfHeight, width, movieHeight, 0.0f, 0.0f, 1.0f, 1.0f, colorWhite, rgp.cinematicMaterial);
+    const CinematicPlaneDraw plane = Cinematic_MoviePlaneDraw(
+        cinematicGlob.activeImageFrame != CINEMATIC_INVALID_IMAGE_FRAME, rgp.cinematicMaterial, rgp.whiteMaterial,
+        color, colorWhite);
+    R_AddCmdDrawStretchPic(0.0f, letterboxHalfHeight, width, movieHeight, 0.0f, 0.0f, 1.0f, 1.0f, plane.color, plane.material);
 }
 
 #endif // __SWITCH__

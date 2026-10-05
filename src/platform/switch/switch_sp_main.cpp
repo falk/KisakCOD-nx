@@ -54,6 +54,8 @@
 #include <universal/q_parse.h>
 #include <platform/switch/switch_critical_section.h>
 #include <platform/switch/switch_platform.h>
+#include <platform/switch/switch_port_log.h>
+#include <platform/switch/switch_watchdog.h>
 #include <platform/switch/switch_thread.h>
 #include <port/switch_pcsample.h>
 #include <port/switch_heapcheck.h>
@@ -118,6 +120,7 @@ static void Switch_NxlinkExit()
 {
     std::fflush(stdout);
     std::fflush(stderr);
+    Port_LogShutdown();
     if (s_nxlinkSocket >= 0)
     {
         close(s_nxlinkSocket);
@@ -159,6 +162,14 @@ static void Switch_NxlinkInit()
         static const char kConnectFailed[] = "NXLINK: callback connection failed\n";
         svcOutputDebugString(kConnectFailed, sizeof(kConnectFailed) - 1);
     }
+}
+
+// Runs once nxlink (if any) is connected: from here a stalled link can only
+// drop log lines, never block a thread that prints.
+static void Switch_LogStart()
+{
+    Port_LogStart(s_nxlinkSocket);
+    Switch_WatchdogStart();
 }
 
 // The critical-section and sys-event Switch ports abort() on misuse with no
@@ -212,6 +223,7 @@ int main(int argc, char **argv)
 {
     std::atexit(Switch_NxlinkExit);
     Switch_NxlinkInit();
+    Switch_LogStart();
 
     Switch_CriticalSectionSetFailureHook(Switch_CriticalSectionFailedHook, nullptr);
     Switch_SysEventSetFailureHook(Switch_SysEventFailedHook, nullptr);

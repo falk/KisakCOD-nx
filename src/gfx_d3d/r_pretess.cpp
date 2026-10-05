@@ -162,19 +162,15 @@ uint16_t *__cdecl R_AllocPreTessIndices(int count)
     iassert( count );
     if (count + gfxBuf.preTessIndexBuffer->used > gfxBuf.preTessIndexBuffer->total)
     {
-#ifdef __SWITCH__
         // A full buffer silently sends the caller to one draw per surface.
-        if (SwitchPerf_g_enabled)
+        if (KISAK_PERF_ACTIVE)
             SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_ALLOC_FAIL, 1);
-#endif
         return 0;
     }
     indices = &gfxBuf.preTessIndexBuffer->indices[gfxBuf.preTessIndexBuffer->used];
     gfxBuf.preTessIndexBuffer->used += count;
-#ifdef __SWITCH__
-    if (SwitchPerf_g_enabled)
+    if (KISAK_PERF_ACTIVE)
         SwitchPerf_NotePreTessUsed(gfxBuf.preTessIndexBuffer->used, gfxBuf.preTessIndexBuffer->total);
-#endif
     return indices;
 }
 

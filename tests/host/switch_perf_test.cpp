@@ -18,14 +18,23 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <thread>
 
 static int s_lines = 0;
+static unsigned s_overflow_events;
+static unsigned s_period_records;
 static char s_all[16384];
 
 static void sink(const char *line)
 {
-    ++s_lines;
+    if (std::strstr(line, "\"name\":\"sample_overflow\"")) ++s_overflow_events;
+    if (std::strstr(line, "\"stream\":\"cpu.frame.period\"")) ++s_period_records;
+    if (const char *capture = std::getenv("KISAK_PERF_CAPTURE")) {
+        FILE *file = std::fopen(capture, "a");
+        if (file) { std::fprintf(file, "%s\n", line); std::fclose(file); }
+    }
+    if (std::strncmp(line, "KPERF ", 6) != 0) ++s_lines;
     const size_t used = strlen(s_all);
     if (used + strlen(line) + 2 < sizeof(s_all))
     {
@@ -33,6 +42,17 @@ static void sink(const char *line)
         s_all[used + strlen(line)] = '\n';
         s_all[used + strlen(line) + 1] = '\0';
     }
+}
+
+static bool record_has(const char *stream, const char *field)
+{
+    char target[128];
+    std::snprintf(target, sizeof(target), "\"stream\":\"%s\"", stream);
+    const char *line = std::strstr(s_all, target);
+    if (!line) return false;
+    const char *found = std::strstr(line, field);
+    const char *end = std::strchr(line, '\n');
+    return found && (!end || found < end);
 }
 
 #define CHECK(cond) \
@@ -49,6 +69,9 @@ int main()
 {
     SwitchPerf_Init();
     SwitchPerf_SetPrintSink(sink);
+    // Slow-frame lines are proven in section 9; keep sanitizer-slow frames
+    // in the earlier sections from printing one.
+    SwitchPerf_SetSlowFrameThresholds(0, 0);
 
     // 1. Disabled: a scope adds nothing, and the host clock is ns (freq 1e9).
     SwitchPerf_SetEnabled(0);
@@ -99,7 +122,7 @@ int main()
     s_lines = 0;
     s_all[0] = '\0';
     SwitchPerf_ReportNow();
-    CHECK(s_lines == (int)G_COUNT + 2); // groups + worker + pretess
+    CHECK(s_lines == (int)G_COUNT + 5); // groups + worker + pretess + wrkcmd/wrkwait/wrkcount
     CHECK(strstr(s_all, "SWITCH_PERF frame fps=") != 0);
     CHECK(strstr(s_all, "SWITCH_PERF worker w0=") != 0);
     CHECK(strstr(s_all, "SWITCH_PERF render") != 0);
@@ -135,7 +158,7 @@ int main()
         // The counter must have appeared in one of the group lines.
         // We cannot read its name here, so assert the report still emitted all
         // groups and that a counter value is present.
-        CHECK(s_lines == (int)G_COUNT + 2); // groups + worker + pretess
+        CHECK(s_lines == (int)G_COUNT + 5); // groups + worker + pretess + wrkcmd/wrkwait/wrkcount
         SwitchPerf_SetEnabled(0);
     }
 
@@ -200,6 +223,270 @@ int main()
     CHECK(strstr(s_all, "SWITCH_PERF pretess batches=0.0 surfs=0.0 draws=0.0") != 0);
     CHECK(strstr(s_all, "used_peak=0 cap=1048576") != 0);
     SwitchPerf_SetEnabled(0);
+
+    // Large absolute host ticks convert without multiplying the whole value.
+    CHECK(SwitchPerf_TicksToUs(20000000000000ull) == 20000000000ull);
+    SwitchPerf_SetStructured(1);
+    SwitchPerf_SetEnabled(1);
+    s_lines = 0; s_all[0] = '\0';
+    SwitchPerf_ReportNow();
+    CHECK(strstr(s_all, "KPERF ") == 0); // A zero-frame window invents no samples.
+    s_all[0] = '\0';
+    for (int i = 0; i < 3; ++i) {
+        SwitchPerf_BeginFrame();
+        SwitchPerf_AddTicks(SWITCH_PERF_FRAME_TOTAL, 1000);
+        SwitchPerf_AddThreadTicks(SWITCH_PERF_SCENE_DPVS, 1000);
+        SwitchPerf_EndFrame();
+    }
+    SwitchPerf_ReportNow();
+    CHECK(strstr(s_all, "\"stream\":\"cpu.main.frame\"") != 0);
+    CHECK(strstr(s_all, "\"stream\":\"cpu.frame.wall\"") != 0);
+    CHECK(strstr(s_all, "\"stream\":\"cpu.frame.period\"") != 0);
+    CHECK(strstr(s_all, "\"alignment\":\"asynchronous_main_denominator\"") != 0);
+    const char *mainGroups[] = {"frame", "render", "issue", "scene", "cgame", "other", "ents", "snap", "game"};
+    for (const char *group : mainGroups) {
+        char stream[96]; std::snprintf(stream, sizeof(stream), "cpu.main.%s", group);
+        CHECK(record_has(stream, "\"seq\":1"));
+    }
+    CHECK(record_has("cpu.backend.backend", "\"seq\":1"));
+    CHECK(record_has("cpu.worker_busy", "\"seq\":1"));
+    CHECK(!record_has("cpu.worker.scene", "\"seq\":"));
+    CHECK(!record_has("cpu.backend.scene", "\"seq\":"));
+    CHECK(!record_has("cpu.worker.other", "\"seq\":"));
+    CHECK(!record_has("cpu.backend.other", "\"seq\":"));
+
+    s_all[0] = '\0';
+    SwitchPerf_BeginFrame();
+    std::thread activeWorker([] {
+        SwitchPerf_MarkWorkerThread();
+        SwitchPerf_AddThreadTicks(SWITCH_PERF_SCENE_DPVS, 10000);
+    });
+    activeWorker.join();
+    SwitchPerf_AddBackendTicks(SWITCH_PERF_SCENE_DPVS, 20000);
+    SwitchPerf_EndFrame(); SwitchPerf_ReportNow();
+    CHECK(record_has("cpu.worker.scene", "\"seq\":1"));
+    CHECK(record_has("cpu.worker.scene", "\"dpvs\":10.000"));
+    CHECK(record_has("cpu.backend.scene", "\"seq\":1"));
+    CHECK(record_has("cpu.backend.scene", "\"dpvs\":20.000"));
+    CHECK(!record_has("cpu.worker.other", "\"seq\":"));
+    CHECK(!record_has("cpu.backend.other", "\"seq\":"));
+
+    SwitchPerf_SetEnabled(0); SwitchPerf_SetEnabled(1);
+    SwitchPerf_SetStructured(0); SwitchPerf_SetStructured(1);
+    s_all[0] = '\0';
+    const unsigned oldPeriods = s_period_records;
+    SwitchPerf_BeginFrame(); SwitchPerf_EndFrame(); SwitchPerf_ReportNow();
+    CHECK(s_period_records == oldPeriods); // Disabled interval is not a frame period.
+    CHECK(record_has("cpu.worker.scene", "\"seq\":2"));
+    CHECK(record_has("cpu.worker.scene", "\"dpvs\":0.000"));
+    CHECK(record_has("cpu.backend.scene", "\"seq\":2"));
+    CHECK(record_has("cpu.backend.scene", "\"dpvs\":0.000"));
+    CHECK(record_has("cpu.backend.backend", "\"seq\":3"));
+    CHECK(record_has("cpu.worker_busy", "\"seq\":3"));
+    for (int i = 0; i < 130; ++i) { SwitchPerf_BeginFrame(); SwitchPerf_EndFrame(); }
+    SwitchPerf_ReportNow();
+    CHECK(s_overflow_events == 1);
+    // The bounded batches never print a truncated JSON line.
+    // Capture retains all lines even when the test's small display buffer fills.
+    SwitchPerf_SetEnabled(0);
+
+    // 8. Worker-command accounting: exclusive per-type time split by thread
+    //    kind, pure idle apart from executed commands, inclusive waits, the
+    //    scene residual, and the entity-skin event names.
+    {
+        static const char *const names[] = {"fxspot", "dpvsent", "skinxmodel"};
+        SwitchPerf_SetWorkerCmdNames(names, 3);
+        SwitchPerf_SetEnabled(0);
+        {
+            SwitchPerfWorkerCmdScope off(0);
+            SwitchPerfWorkerIdleScope idleOff;
+            SwitchPerfWorkerWaitScope waitOff(0);
+        }
+        CHECK(SwitchPerf_WindowWorkerCmdCount(0, 0) == 0);
+        CHECK(SwitchPerf_WindowWorkerCmdIdleTicks(0) == 0);
+        CHECK(SwitchPerf_WindowWorkerCmdWaitTicks(0) == 0);
+
+        SwitchPerf_SetEnabled(1);
+        SwitchPerf_ReportNow();
+        auto spin = [](uint64_t n) {
+            volatile uint64_t v = 0;
+            for (uint64_t i = 0; i < n; ++i)
+                v += i;
+            (void)v;
+        };
+        const uint64_t t0 = SwitchPerf_NowTicks();
+        {
+            SwitchPerfWorkerWaitScope wait(1);
+            SwitchPerfWorkerCmdScope outer(0);
+            spin(200000);
+            {
+                SwitchPerfWorkerCmdScope inner(1);
+                spin(200000);
+            }
+            {
+                SwitchPerfWorkerIdleScope idle;
+                spin(200000);
+            }
+        }
+        const uint64_t elapsed = SwitchPerf_NowTicks() - t0;
+        const uint64_t outerTicks = SwitchPerf_WindowWorkerCmdTicks(0, 0);
+        const uint64_t innerTicks = SwitchPerf_WindowWorkerCmdTicks(1, 0);
+        const uint64_t idleTicks = SwitchPerf_WindowWorkerCmdIdleTicks(0);
+        CHECK(SwitchPerf_WindowWorkerCmdCount(0, 0) == 1);
+        CHECK(SwitchPerf_WindowWorkerCmdCount(1, 0) == 1);
+        CHECK(outerTicks > 0 && innerTicks > 0 && idleTicks > 0);
+        // Exclusive: the parts never add up to more than the wall time.
+        CHECK(outerTicks + innerTicks + idleTicks <= elapsed);
+        CHECK(SwitchPerf_WindowWorkerCmdWaitTicks(1) >= outerTicks + innerTicks + idleTicks);
+        CHECK(SwitchPerf_WindowWorkerCmdWaitTicks(1) <= elapsed);
+        CHECK(SwitchPerf_t_wrkChildTicks >= outerTicks + innerTicks + idleTicks);
+        {
+            SwitchPerfWorkerWaitScope finished(2, false); // already finished
+        }
+        CHECK(SwitchPerf_WindowWorkerCmdWaitTicks(2) == 0);
+        std::thread wrk([] {
+            SwitchPerf_MarkWorkerThread();
+            SwitchPerfWorkerCmdScope cmd(2);
+        });
+        wrk.join();
+        CHECK(SwitchPerf_WindowWorkerCmdCount(2, 1) == 1);
+        CHECK(SwitchPerf_WindowWorkerCmdCount(2, 0) == 0);
+        SwitchPerf_AddWorkerCmd(SWITCH_PERF_WRKCMD_SLOTS, 0, 1); // out of range: ignored
+        SwitchPerf_AddWorkerCmdWait(-1, 1);
+
+        // Deterministic report formats (one-frame window, host 1 GHz clock).
+        SwitchPerf_ReportNow();
+        SwitchPerf_AddWorkerCmd(0, 0, 2000000);  // 2 ms on main
+        SwitchPerf_AddWorkerCmd(1, 1, 3000000);  // 3 ms on a worker
+        SwitchPerf_AddWorkerCmd(1, 1, 1000000);
+        SwitchPerf_AddWorkerCmdIdle(0, 500000);
+        SwitchPerf_AddWorkerCmdWait(1, 4000000);
+        SwitchPerf_AddWorkerCmdWait(SWITCH_PERF_WRKWAIT_FRONT, 700000);
+        SwitchPerf_AddWorkerCmd(5, 0, 1000000);  // unnamed type prints as c5
+        SwitchPerf_AddTicks(SWITCH_PERF_SCENE_TOTAL, 10000000);
+        SwitchPerf_AddTicks(SWITCH_PERF_SCENE_SETUP, 3000000);
+        SwitchPerf_AddTicks(SWITCH_PERF_SCENE_WAIT, 2000000);
+        SwitchPerf_AddTicks(SWITCH_PERF_SCENE_PORTALWALK, 4000000); // nested in dpvs: not subtracted
+        SwitchPerf_AddEvent(SWITCH_PERF_EV_ENT_TESTED, 12);
+        SwitchPerf_AddEvent(SWITCH_PERF_EV_ENT_SKIN_VERTS, 900);
+        SwitchPerf_BeginFrame();
+        SwitchPerf_EndFrame(); // one frame, so the structured records print too
+        s_lines = 0;
+        s_all[0] = '\0';
+        SwitchPerf_ReportNow();
+        CHECK(strstr(s_all, " misc=0 resid=5000\n") != 0);
+        CHECK(strstr(s_all, "SWITCH_PERF wrkcmd idle.m=500 idle.w=0 m.fxspot=2000 w.fxspot=0 m.dpvsent=0 w.dpvsent=4000 "
+                            "m.skinxmodel=0 w.skinxmodel=0 m.c3=0 w.c3=0 m.c4=0 w.c4=0 m.c5=1000 w.c5=0\n") != 0);
+        CHECK(strstr(s_all, "SWITCH_PERF wrkwait front=700 all=0 fxspot=0 dpvsent=4000 skinxmodel=0 c3=0 c4=0 c5=0\n") != 0);
+        CHECK(strstr(s_all, "SWITCH_PERF wrkcount idle.m=1.0 idle.w=0.0 wait.front=1.0 wait.all=0.0 m.fxspot=1.0 w.fxspot=0.0 "
+                            "wait.fxspot=0.0 m.dpvsent=0.0 w.dpvsent=2.0 wait.dpvsent=1.0") != 0);
+        CHECK(strstr(s_all, " ent_tested=12.0 ent_culled=0.0 ent_vis_cam=0.0 ent_vis_shadow=0.0 ent_skinned=0.0 "
+                            "ent_skin_verts=900.0 ent_skin_cam=0.0 ent_skin_shadow=0.0 skincache_skip=0.0 used_peak=") != 0);
+        CHECK(record_has("cpu.main.scene", "\"resid\":5000.000"));
+        CHECK(record_has("cpu.wrkcmd.main", "\"fxspot\":2000.000"));
+        CHECK(record_has("cpu.wrkcmd.main", "\"idle\":500.000"));
+        CHECK(record_has("cpu.wrkcmd.worker", "\"dpvsent\":4000.000"));
+        CHECK(record_has("cpu.wrkwait", "\"front\":700.000"));
+        // The window resets.
+        CHECK(SwitchPerf_WindowWorkerCmdCount(0, 0) == 0);
+        s_all[0] = '\0';
+        SwitchPerf_ReportNow();
+        CHECK(strstr(s_all, "SWITCH_PERF wrkcmd idle.m=0 idle.w=0 m.fxspot=0 w.fxspot=0 m.dpvsent=0 w.dpvsent=0 "
+                            "m.skinxmodel=0 w.skinxmodel=0\n") != 0);
+        SwitchPerf_SetEnabled(0);
+        SwitchPerf_SetStructured(0);
+    }
+
+    // 9. Slow-frame capture: one frame over the wall threshold prints its own
+    //    deltas (top counters, worker idle, extras); the GPU extra triggers
+    //    alone; the per-window budget is four lines, the rest are counted.
+    {
+        SwitchPerf_SetEnabled(1);
+        SwitchPerf_ReportNow();
+        const int gpu = SwitchPerf_RegisterFrameExtra("gpu");
+        const int lockwait = SwitchPerf_RegisterFrameExtra("lockwait");
+        CHECK(gpu >= 0 && lockwait >= 0 && gpu != lockwait);
+        CHECK(SwitchPerf_RegisterFrameExtra("gpu") == gpu);
+        SwitchPerf_AddFrameExtra(lockwait, 50000000); // before the frame: not in its delta
+        SwitchPerf_AddTicks(SWITCH_PERF_SCENE_SETUP, 90000000);
+        SwitchPerf_SetSlowFrameThresholds(1000, 0);
+        s_all[0] = '\0';
+        SwitchPerf_BeginFrame();
+        SwitchPerf_AddTicks(SWITCH_PERF_SCENE_TOTAL, 9000000);
+        SwitchPerf_AddTicks(SWITCH_PERF_SCENE_WAIT, 4000000);
+        SwitchPerf_AddTicks(SWITCH_PERF_FRAME_EVENTLOOP, 2500000);
+        SwitchPerf_AddWorkerCmdIdle(0, 3000000);
+        SwitchPerf_AddWorkerCmd(1, 0, 700000);
+        SwitchPerf_AddFrameExtra(lockwait, 1500000);
+        SwitchPerf_AddFrameExtra(gpu, 12000000);
+        {
+            const uint64_t until = SwitchPerf_NowTicks() + 2000000; // 2 ms wall
+            while (SwitchPerf_NowTicks() < until)
+            {
+            }
+        }
+        SwitchPerf_EndFrame();
+        CHECK(strstr(s_all, "SWITCH_PERF slowframe frame=") != 0);
+        CHECK(strstr(s_all, " trigger=wall wall=") != 0);
+        CHECK(strstr(s_all, " idle.m=3000 wrk.m=700 resid=5000 scene.total=9000 scene.wait=4000 frame.eventloop=2500 "
+                            "x.gpu=12000 x.lockwait=1500\n") != 0);
+        CHECK(strstr(s_all, "scene.setup") == 0); // added before the frame began
+        SwitchPerf_SetSlowFrameThresholds(0, 5000);
+        s_all[0] = '\0';
+        SwitchPerf_BeginFrame();
+        SwitchPerf_EndFrame();
+        CHECK(strstr(s_all, "slowframe") == 0); // under both thresholds
+        SwitchPerf_BeginFrame();
+        SwitchPerf_AddFrameExtra(gpu, 6000000);
+        SwitchPerf_EndFrame();
+        CHECK(strstr(s_all, " trigger=gpu ") != 0);
+        for (int i = 0; i < 4; ++i)
+        {
+            SwitchPerf_BeginFrame();
+            SwitchPerf_AddFrameExtra(gpu, 6000000);
+            SwitchPerf_EndFrame();
+        }
+        s_all[0] = '\0';
+        SwitchPerf_ReportNow();
+        // 6 slow frames in a 7-frame window: 4 logged (one wall, three gpu), 2 counted.
+        CHECK(strstr(s_all, " slow_frames=0.9 slow_unlogged=0.3 ") != 0);
+        SwitchPerf_SetSlowFrameThresholds(0, 0);
+        SwitchPerf_SetEnabled(0);
+    }
+
+    // 10. switch_perfSlowMs: one threshold in ms for both triggers; 0 is off.
+    {
+        SwitchPerf_SetEnabled(1);
+        SwitchPerf_ReportNow();
+        const int gpu = SwitchPerf_RegisterFrameExtra("gpu");
+        auto frame = [&](uint64_t wallTicks, uint64_t gpuNs) -> bool {
+            s_all[0] = '\0';
+            SwitchPerf_BeginFrame();
+            SwitchPerf_AddFrameExtra(gpu, gpuNs);
+            const uint64_t until = SwitchPerf_NowTicks() + wallTicks;
+            while (SwitchPerf_NowTicks() < until)
+            {
+            }
+            SwitchPerf_EndFrame();
+            return strstr(s_all, "SWITCH_PERF slowframe") != 0;
+        };
+        SwitchPerf_ReportNow(); // fresh per-window line budget
+        SwitchPerf_SetSlowFrameMs(1);
+        CHECK(frame(2000000, 0));          // 2 ms wall >= 1 ms
+        CHECK(strstr(s_all, " trigger=wall ") != 0);
+        CHECK(frame(0, 1500000));          // 1.5 ms GPU >= 1 ms
+        CHECK(strstr(s_all, " trigger=gpu ") != 0);
+        SwitchPerf_ReportNow();
+        SwitchPerf_SetSlowFrameMs(20);     // the default: neither is slow
+        CHECK(!frame(2000000, 1500000));
+        CHECK(frame(0, 25000000));         // 25 ms GPU >= 20 ms
+        SwitchPerf_SetSlowFrameMs(0);      // off
+        CHECK(!frame(2000000, 25000000));
+        SwitchPerf_SetSlowFrameMs(-5);     // negative clamps to off
+        CHECK(!frame(2000000, 25000000));
+        SwitchPerf_SetSlowFrameThresholds(0, 0);
+        SwitchPerf_SetEnabled(0);
+    }
 
     printf("PASS:SWITCH_PERF groups=%d counters=%d frames=%d\n",
            (int)G_COUNT, (int)SWITCH_PERF_COUNTER_COUNT, kFrames);

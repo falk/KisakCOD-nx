@@ -6,14 +6,9 @@
 // hardware sensor read/handle lifecycle lives in switch_gyro.cpp, guarded by
 // `#if defined(__SWITCH__)`, and calls only into the functions below.
 //
-// Unit assumption (report in the hardware test note): libnx's
-// HidSixAxisSensorState.angular_velocity is taken as radians/second, the
-// documented convention for Nintendo's six-axis HID reports and the value
-// every public libnx gyro-aim homebrew (e.g. Nintendo's own samples,
-// community gyro patches) treats it as. Some emulators do not emulate motion
-// controls, so this cannot be confirmed there; the hardware test note asks
-// for a sanity check of the physical rotation-to-turn-rate feel on a Switch
-// and Pro Controller.
+// Units: libnx's HidSixAxisSensorState.angular_velocity is in rotations per
+// second; switch_gyro.cpp converts it to radians/second at the sample site,
+// and everything here works in rad/s. gyro_debug prints the raw values.
 
 #include <stdint.h>
 #include <stddef.h>

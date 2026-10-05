@@ -233,7 +233,11 @@ int __cdecl SV_ProcessPendingSave(PendingSave *pendingSave)
     if (!pendingSave)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\server\\sv_main.cpp", 292, 0, "%s", "pendingSave");
     checksum = SV_GetCheckSum();
-    result = G_SaveGame(pendingSave, checksum);
+    SwitchPerfStage stage("save_total");
+    {
+        SWITCH_PERF_SCOPE_IF(SWITCH_PERF_SAVE_GAME, Sys_IsMainThread());
+        result = G_SaveGame(pendingSave, checksum);
+    }
     
     if (!pendingSave)
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\server\\sv_main.cpp", 191, 0, "%s", "filename");
@@ -839,6 +843,7 @@ void __cdecl SV_WaitSaveGame()
     if (sv.requestSaveGame)
     {
         sv.requestSaveGame = 0;
+        SWITCH_PERF_SCOPE(SWITCH_PERF_SAVE_WAIT);
         //__lwsync();
         sv.savingGame = 1;
         do

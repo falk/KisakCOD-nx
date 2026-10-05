@@ -40,8 +40,8 @@ namespace deko9
 // Bump whenever the translator output, its preludes, or the MojoShader/UAM
 // pins change: a pack from another version (or built by another pin) must
 // never be loaded. Kept in lockstep with deko9_resources.cpp's
-// kCacheVersion (bumped to 5 for this slice).
-constexpr uint32_t kShaderPackVersion = 5;
+// kCacheVersion.
+constexpr uint32_t kShaderPackVersion = 6;
 // Free-form identifiers for the vendored translator/compiler. There is no
 // upstream version macro to key off, so these are bumped by hand alongside
 // kShaderPackVersion whenever MojoShader or UAM is upgraded; a stale pack
@@ -59,13 +59,16 @@ struct ShaderVariantKey
     uint64_t instanceHash = 0;       // InstanceLayout::Hash(); 0 = not instanced
     uint32_t shadowFilter = 0;       // 0 = retail translation
     uint32_t shadowFilterVersion = 0; // DEKO9_SHADOW_FILTER_VERSION when shadowFilter != 0, else 0
+    uint32_t shaderOpt = 0;           // r_deko9ShaderOpt bits
+    uint32_t shaderOptVersion = 0;    // DEKO9_SHADER_OPT_VERSION when shaderOpt != 0, else 0
     uint8_t earlyZ = 0;
 
     bool operator==(const ShaderVariantKey &o) const
     {
         return bytecodeHash == o.bytecodeHash && shadowMask == o.shadowMask &&
                instanceHash == o.instanceHash && shadowFilter == o.shadowFilter &&
-               shadowFilterVersion == o.shadowFilterVersion && earlyZ == o.earlyZ;
+               shadowFilterVersion == o.shadowFilterVersion && shaderOpt == o.shaderOpt &&
+               shaderOptVersion == o.shaderOptVersion && earlyZ == o.earlyZ;
     }
     bool operator<(const ShaderVariantKey &o) const
     {
@@ -79,6 +82,10 @@ struct ShaderVariantKey
             return shadowFilter < o.shadowFilter;
         if (shadowFilterVersion != o.shadowFilterVersion)
             return shadowFilterVersion < o.shadowFilterVersion;
+        if (shaderOpt != o.shaderOpt)
+            return shaderOpt < o.shaderOpt;
+        if (shaderOptVersion != o.shaderOptVersion)
+            return shaderOptVersion < o.shaderOptVersion;
         return earlyZ < o.earlyZ;
     }
 };

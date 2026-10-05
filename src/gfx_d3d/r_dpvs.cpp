@@ -2850,9 +2850,7 @@ void __cdecl R_AddWorldSurfacesPortalWalk(int cameraCellIndex)
 
     iassert( Sys_IsMainThread() );
     iassert( rgp.world->dpvsPlanes.cellCount );
-#ifdef __SWITCH__
     SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_PORTALWALK);
-#endif
     memset((uint8_t *)dpvsGlob.cellVisibleBits, 0, 4 * ((rgp.world->dpvsPlanes.cellCount + 31) >> 5));
     dpvsGlob.cellBits = dpvsGlob.cellVisibleBits;
     if (!r_skipPvs->current.enabled)

@@ -90,7 +90,7 @@ void Device::ApplyRenderTargets()
     DkImageView depth;
     if (m_depthStencil)
         m_depthStencil->MakeView(&depth);
-    dkCmdBufBindRenderTargets(m_cmd, colors, count, m_depthStencil ? &depth : nullptr);
+    CmdBindTargets(colors, count, m_depthStencil ? &depth : nullptr);
     if (m_zcullStats)
         ZcullNoteTargets();
 }
@@ -467,7 +467,7 @@ void Device::ApplyTextures(Deko9Stage stage, const Deko9ShaderInfo &info, uint32
         m_timing.staticSamples += !store->attachment;
         m_timing.staticHazardChecks += !store->attachment;
         sampled.stores[sampled.count++] = store;
-        const bool compare = store->format->depth && info.samplerDim[s] == DEKO9_SAMPLER_2D;
+        const bool compare = CompareSampler(store->format->depth, info.samplerDim[s]);
         if (compare)
             *shadowMask |= 1u << s;
         handles[s] = dkMakeTextureHandle(store->descriptor, ResolveSampler(base + s, compare));
@@ -586,9 +586,9 @@ bool Device::ApplyVertexStreams()
         if (stream.buffer)
         {
             Buffer &buffer = stream.buffer->buffer;
-            buffer.lastUse = m_openSeq;
             extents[s] = {buffer.Gpu() + stream.offset,
                           buffer.Size() > stream.offset ? buffer.Size() - stream.offset : 0};
+            buffer.StampUse(this, m_openSeq);
         }
         else if (stream.forgotten)
         {
@@ -658,10 +658,42 @@ bool Device::ApplyShaders()
 
 ProgramUnit *Device::BakeProgram(const ProgramKey &key, uint32_t psShadow)
 {
+    // Timing and lock-wait attribution only: a variant missing from the
+    // shader pack compiles here, at draw time, with the device lock held.
+    const uint64_t bakeStart = LockClockNs();
+    const bool locked = m_lock.OwnedByCaller();
+    // Other threads that block on the lock meanwhile are attributed to the
+    // "shaderbake" site (the site is owner-only, so only when locked).
+    struct BakeSite
+    {
+        DeviceLock *lock;
+        const char *prev;
+        ~BakeSite()
+        {
+            if (lock)
+                lock->SetSite(prev);
+        }
+    } site{locked ? &m_lock : nullptr, locked ? m_lock.SetSite("shaderbake") : nullptr};
     const InstanceLayout none{};
     const InstanceLayout &instance = key.instance ? m_instancing.layout : none;
-    const ShaderVariant *vs = m_vs->shader.Variant(this, 0, instance);
-    const ShaderVariant *ps = m_ps->shader.Variant(this, psShadow, {}, key.psEarlyZ != 0);
+    bool vsBuilt = false, psBuilt = false;
+    const ShaderVariant *vs = m_vs->shader.Variant(this, 0, instance, false, &vsBuilt);
+    const ShaderVariant *ps = m_ps->shader.Variant(this, psShadow, {}, key.psEarlyZ != 0, &psBuilt);
+    // Every variant a loaded material pass can select is built at load time
+    // (Deko9_PrebakeVariants); one built here stalled this draw. Reported
+    // once per variant (Fail dedups), counted every time, drawn correctly.
+    if (vsBuilt)
+    {
+        m_shaderStats.NoteDrawBuild();
+        Fail("SHADER_PREBAKE", "vs %016llx inst=%u built at draw time: no load-time prebake covered it",
+             (unsigned long long)m_vs->shader.Hash(), (unsigned)instance.count);
+    }
+    if (psBuilt)
+    {
+        m_shaderStats.NoteDrawBuild();
+        Fail("SHADER_PREBAKE", "ps %016llx mask=0x%x ez=%u built at draw time: no load-time prebake covered it",
+             (unsigned long long)m_ps->shader.Hash(), psShadow, key.psEarlyZ);
+    }
     if (!vs || !ps)
         return nullptr;
     auto unit = std::make_unique<ProgramUnit>();
@@ -672,6 +704,9 @@ ProgramUnit *Device::BakeProgram(const ProgramKey &key, uint32_t psShadow)
     if (!Capture(&unit->shaderWords, [&] { dkCmdBufBindShaders(m_cmd, DkStageFlag_GraphicsMask, shaders, 2); }) ||
         !Capture(&unit->attribWords, [&] { RecordVertexAttribs(m_vs->shader.Info(), instance); }))
         return nullptr;
+    unit->bakeNs = LockClockNs() - bakeStart;
+    m_shaderStats.NoteBake(unit->bakeNs, locked);
+    AddFrameExtra(DEKO9_EXTRA_BAKE, unit->bakeNs);
     return m_programUnits.Insert(std::move(unit));
 }
 
@@ -681,8 +716,7 @@ ProgramUnit *Device::BakeProgram(const ProgramKey &key, uint32_t psShadow)
 // is open.
 bool Device::EarlyZCandidate() const
 {
-    const Deko9ShaderInfo &ps = m_ps->shader.Info();
-    if (ps.writesDepth || (!ps.kills && !m_rs[D3DRS_ALPHATESTENABLE]) || m_occlusionOpen > 0)
+    if (!EarlyZShaderEligible(m_ps->shader.Info(), m_rs[D3DRS_ALPHATESTENABLE] != 0) || m_occlusionOpen > 0)
         return false;
     return RasterAllowsEarlyZ(m_rs, CurrentDepthTarget());
 }
@@ -701,6 +735,7 @@ bool Device::ApplyProgram(uint32_t psShadow)
     const ProgramKey key{m_vs->shader.id, m_ps->shader.id, m_decl->id, psShadow,
                          m_instancing.drawing ? m_instancing.layoutHash : 0, m_psEarlyZ ? 1u : 0u};
     const ProgramUnit *unit = m_program;
+    uint64_t bakedNowNs = 0; // a unit baked by this call: its first bind pays that lock time
     if (!unit || m_programKey != key)
     {
         unit = m_programUnits.Find(key);
@@ -714,6 +749,7 @@ bool Device::ApplyProgram(uint32_t psShadow)
             unit = BakeProgram(key, psShadow);
             if (!unit)
                 return false;
+            bakedNowNs = unit->bakeNs;
         }
         m_program = unit;
         m_programKey = key;
@@ -722,9 +758,11 @@ bool Device::ApplyProgram(uint32_t psShadow)
     {
         if (!unit->vs->bound || !unit->ps->bound)
         {
-            Log("first bind seq=%llu vs=%016llx ps=%016llx mask=0x%x inst=%u ez=%u", (unsigned long long)m_openSeq,
+            Log("first bind seq=%llu vs=%016llx ps=%016llx mask=0x%x inst=%u ez=%u bakeUs=%llu", (unsigned long long)m_openSeq,
                 (unsigned long long)m_vs->shader.Hash(), (unsigned long long)m_ps->shader.Hash(), psShadow,
-                (unsigned)unit->vs->instance.count, (unsigned)unit->ps->earlyZ);
+                (unsigned)unit->vs->instance.count, (unsigned)unit->ps->earlyZ,
+                (unsigned long long)(bakedNowNs / 1000));
+            m_shaderStats.NoteFirstBind(bakedNowNs);
             unit->vs->bound = unit->ps->bound = true;
         }
         ReplayWords(unit->shaderWords);
@@ -789,6 +827,16 @@ HRESULT Device::PrepareDraw(D3DPRIMITIVETYPE type, UINT primCount, DkPrimitive *
 {
     if (!MapPrimitive(type, primCount, prim, count))
         return Fail("DRAW", "primitive type %d", (int)type);
+    if (m_probe.flags)
+    {
+        // Probe: re-derive state the fast paths would have skipped.
+        if (m_probe.flags & DEKO9_PROBE_CONSTS)
+            m_vsFile.MarkAllDirty(), m_psFile.MarkAllDirty();
+        if (m_probe.flags & DEKO9_PROBE_TEXTURES)
+            m_dirtyTextures = true, m_texSlotDirty[0] = m_texSlotDirty[1] = ~0u;
+        if (m_probe.flags & DEKO9_PROBE_STREAMS)
+            m_dirtyInput = true, m_recorded.indexAddress = 0;
+    }
     if (!m_vs || !m_ps)
         return Fail("UNSUPPORTED", "fixed-function draw (vs=%p ps=%p)", (void *)m_vs, (void *)m_ps);
     if (!m_renderTargets[0])
@@ -914,7 +962,7 @@ HRESULT Device::PrepareDraw(D3DPRIMITIVETYPE type, UINT primCount, DkPrimitive *
     if (m_descriptorsDirty)
     {
         // New CPU-written descriptors (AllocImageDescriptor/SamplerDescriptor).
-        dkCmdBufBarrier(m_cmd, DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
+        CmdBarrier(DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
         m_descriptorsDirty = false;
     }
     if (m_dirtyTargets)
@@ -935,6 +983,9 @@ HRESULT Device::PrepareDraw(D3DPRIMITIVETYPE type, UINT primCount, DkPrimitive *
         gated = false;
         ++m_timing.rasterApplies;
     }
+    // A buffer renamed by another thread (Buffer::Lock without the lock)
+    // re-derives the stream extents here.
+    NoteForeignRenames();
     gated &= !m_dirtyInput;
     if (!ApplyVertexInput())
         return D3DERR_INVALIDCALL;
@@ -1126,8 +1177,8 @@ void Device::VerifyDraw()
             const DkGpuAddr addr = buffer.Gpu() + stream.offset;
             if (m_recorded.streamExtents[s].addr != addr)
                 mismatch("stream address", s, (uint32_t)stream.offset);
-            if (buffer.lastUse != m_openSeq)
-                mismatch("stream lastUse stamp", s, (uint32_t)buffer.lastUse);
+            if (buffer.LastUse() != m_openSeq)
+                mismatch("stream lastUse stamp", s, (uint32_t)buffer.LastUse());
         }
     }
 
@@ -1215,6 +1266,36 @@ void Device::VerifyDraw()
     m_verifyConstantsSynced = true; // this draw's flush was the full re-push (or later)
 }
 
+// One draw, or with the probe split mode the same triangles as several
+// consecutive draws (same pixels and order, more GPU draws).
+void Device::EmitDraw(bool indexed, DkPrimitive prim, uint32_t count, uint32_t first, int32_t baseVertex)
+{
+    uint32_t parts = m_probe.split;
+    const uint32_t tris = count / 3;
+    if (prim != DkPrimitive_Triangles || count % 3 || parts < 2 || tris < parts)
+        parts = 1;
+    uint32_t done = 0;
+    for (uint32_t i = 0; i < parts; ++i)
+    {
+        const uint32_t n = i + 1 == parts ? tris - done : tris / parts;
+        const uint32_t c = parts == 1 ? count : n * 3;
+        if (i && (m_probe.flags & DEKO9_PROBE_SUBCONSTS))
+        {
+            m_vsFile.MarkAllDirty();
+            m_psFile.MarkAllDirty();
+            ApplyConstants(DEKO9_STAGE_VERTEX);
+            ApplyConstants(DEKO9_STAGE_PIXEL);
+        }
+        const uint32_t at = first + (parts == 1 ? 0 : done * 3);
+        if (indexed)
+            dkCmdBufDrawIndexed(m_cmd, prim, c, 1, at, baseVertex, 0);
+        else
+            dkCmdBufDraw(m_cmd, prim, c, 1, at, 0);
+        done += n;
+    }
+    m_timing.probeExtraDraws += parts - 1;
+}
+
 HRESULT Device::DrawPrimitive(D3DPRIMITIVETYPE type, UINT startVertex, UINT primCount)
 {
     CensusScope census(this, Census_DrawPrimitive);
@@ -1228,7 +1309,8 @@ HRESULT Device::DrawPrimitive(D3DPRIMITIVETYPE type, UINT startVertex, UINT prim
         return hr;
     if (!VertexRangeValid(startVertex, count, "DrawPrimitive"))
         return D3DERR_INVALIDCALL;
-    dkCmdBufDraw(m_cmd, prim, count, 1, startVertex, 0);
+    EmitDraw(false, prim, count, startVertex, 0);
+    FaultTraceDrawArgsStreams(false, prim, count, 1, startVertex, 0);
     m_lock.HandOffIfContended();
     return D3D_OK;
 }
@@ -1255,7 +1337,6 @@ HRESULT Device::DrawIndexedPrimitive(D3DPRIMITIVETYPE type, INT baseVertex, UINT
         return hr;
     if (!VertexRangeValid((int64_t)baseVertex + minIndex, numVertices, "DrawIndexedPrimitive"))
         return D3DERR_INVALIDCALL;
-    ib.lastUse = m_openSeq;
     const DkIdxFormat indexFormat = m_indices->Format() == D3DFMT_INDEX32 ? DkIdxFormat_Uint32 : DkIdxFormat_Uint16;
     if (m_recorded.indexAddress != ib.Gpu() || m_recorded.indexFormat != indexFormat)
     {
@@ -1264,7 +1345,10 @@ HRESULT Device::DrawIndexedPrimitive(D3DPRIMITIVETYPE type, INT baseVertex, UINT
         m_recorded.indexFormat = indexFormat;
         ++m_timing.indexBinds;
     }
-    dkCmdBufDrawIndexed(m_cmd, prim, count, 1, startIndex, baseVertex, 0);
+    // After the address read: a lock that sees this stamp is ordered after it.
+    ib.StampUse(this, m_openSeq);
+    EmitDraw(true, prim, count, startIndex, baseVertex);
+    FaultTraceDrawArgsStreams(true, prim, count, 1, startIndex, baseVertex);
     m_lock.HandOffIfContended();
     return D3D_OK;
 }
@@ -1380,7 +1464,6 @@ HRESULT Device::DrawInstances(D3DPRIMITIVETYPE type, INT baseVertex, UINT minInd
     const HRESULT hr = PrepareDraw(type, primCount, &prim, &count);
     if (SUCCEEDED(hr) && VertexRangeValid((int64_t)baseVertex + minIndex, numVertices, "DrawInstances"))
     {
-        ib.lastUse = m_openSeq;
         const DkIdxFormat indexFormat = indexSize == 4 ? DkIdxFormat_Uint32 : DkIdxFormat_Uint16;
         if (m_recorded.indexAddress != ib.Gpu() || m_recorded.indexFormat != indexFormat)
         {
@@ -1389,7 +1472,10 @@ HRESULT Device::DrawInstances(D3DPRIMITIVETYPE type, INT baseVertex, UINT minInd
             m_recorded.indexFormat = indexFormat;
             ++m_timing.indexBinds;
         }
+        // After the address read: a lock that sees this stamp is ordered after it.
+        ib.StampUse(this, m_openSeq);
         dkCmdBufDrawIndexed(m_cmd, prim, count, instances, startIndex, baseVertex, 0);
+        FaultTraceDrawArgsStreams(true, prim, count, instances, startIndex, baseVertex);
         ++m_timing.instancedDraws;
         m_timing.instances += instances;
     }
@@ -1435,7 +1521,6 @@ HRESULT Device::DrawIndexedRanges(UINT numVertices, const ::Deko9IndexRange *ran
         if (!VertexRangeValid(ranges[i].baseVertex, numVertices, "DrawIndexedRanges"))
             return D3DERR_INVALIDCALL;
     }
-    ib.lastUse = m_openSeq;
     const DkIdxFormat indexFormat = indexSize == 4 ? DkIdxFormat_Uint32 : DkIdxFormat_Uint16;
     if (m_recorded.indexAddress != ib.Gpu() || m_recorded.indexFormat != indexFormat)
     {
@@ -1444,8 +1529,13 @@ HRESULT Device::DrawIndexedRanges(UINT numVertices, const ::Deko9IndexRange *ran
         m_recorded.indexFormat = indexFormat;
         ++m_timing.indexBinds;
     }
+    // After the address read: a lock that sees this stamp is ordered after it.
+    ib.StampUse(this, m_openSeq);
     for (uint32_t i = 0; i < count; ++i)
         dkCmdBufDrawIndexed(m_cmd, prim, 3 * ranges[i].triCount, 1, ranges[i].firstIndex, ranges[i].baseVertex, 0);
+    // The record keeps the first range; the count says how many followed.
+    FaultTraceDrawArgsStreams(true, prim, 3 * ranges[0].triCount, 1, ranges[0].firstIndex, ranges[0].baseVertex,
+                              count);
     CensusNoteExtraGpuDraws(count - 1);
     ++m_timing.rangeCalls;
     m_timing.rangeDraws += count;
@@ -1482,6 +1572,7 @@ HRESULT Device::DrawPrimitiveUP(D3DPRIMITIVETYPE type, UINT primCount, const voi
     dkCmdBufBindVtxBufferState(m_cmd, &state, 1);
     dkCmdBufBindVtxBuffers(m_cmd, 0, &extent, 1);
     dkCmdBufDraw(m_cmd, prim, count, 1, 0, 0);
+    FaultTraceDrawArgs(false, prim, count, 1, 0, 0, 0, upload.gpu, upload.size);
     m_streams[0].stride = 0;
     m_dirtyInput = true;
     m_recorded.streams = 0; // stream 0 was bound directly
@@ -1526,6 +1617,7 @@ HRESULT Device::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE type, UINT minIndex, UIN
                           indexUpload.gpu);
     m_recorded.indexAddress = 0; // bound directly
     dkCmdBufDrawIndexed(m_cmd, prim, count, 1, 0, 0, 0);
+    FaultTraceDrawArgs(true, prim, count, 1, 0, 0, indexUpload.gpu, vertexUpload.gpu, vertexUpload.size);
     m_streams[0].stride = 0;
     m_dirtyInput = true;
     m_recorded.streams = 0; // stream 0 was bound directly
@@ -1598,10 +1690,10 @@ HRESULT Device::Clear(DWORD count, const D3DRECT *rects, DWORD flags, D3DCOLOR c
         if (clearColor)
         {
             for (uint32_t rt = 0; rt < 4 && m_renderTargets[rt]; ++rt)
-                dkCmdBufClearColor(m_cmd, rt, DkColorMask_RGBA, rgba);
+                dkCmdBufClearColor(m_cmd, rt, DkColorMask_RGBA, rgba), ++m_cc.clears;
         }
         if (clearDepth || clearStencil)
-            dkCmdBufClearDepthStencil(m_cmd, clearDepth, z, clearStencil ? 0xff : 0, (uint8_t)stencil);
+            dkCmdBufClearDepthStencil(m_cmd, clearDepth, z, clearStencil ? 0xff : 0, (uint8_t)stencil), ++m_cc.clears;
         if (clearDepth && m_zcullStats)
         {
             const ImageStore &ds = *m_depthStencil->Store();
@@ -1712,7 +1804,7 @@ bool Device::ReadImage(ImageStore *store, uint32_t face, uint32_t level, void *d
         rect.z = face, rect.depth = 1;
     const DkCopyBuf copy{readback.gpu, 0, 0};
     dkCmdBufCopyImageToBuffer(m_cmd, &view, &rect, &copy, 0);
-    dkCmdBufBarrier(m_cmd, DkBarrier_Full, DkInvalidateFlags_L2Cache);
+    CmdBarrier(DkBarrier_Full, DkInvalidateFlags_L2Cache);
     m_listHasWork = true;
     ++Stats().readbacks;
     const uint64_t seq = m_openSeq;

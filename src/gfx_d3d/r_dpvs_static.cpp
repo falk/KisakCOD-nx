@@ -283,9 +283,7 @@ void __cdecl R_AddCellStaticSurfacesInFrustumCmd(DpvsStaticCellCmd *data)
 {
     uint32_t viewIndex; // [esp+4h] [ebp-4h]
 
-#ifdef __SWITCH__
     SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_CELLSTATIC);
-#endif
     viewIndex = data->viewIndex;
     g_smodelVisData = rgp.world->dpvs.smodelVisData[viewIndex];
     g_surfaceVisData = rgp.world->dpvs.surfaceVisData[viewIndex];

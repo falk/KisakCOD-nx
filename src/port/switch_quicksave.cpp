@@ -18,6 +18,7 @@
 // the two must agree.
 #ifdef __SWITCH__
 
+#include "switch_perf.h"
 #include "switch_quicksave.h"
 
 #include <universal/q_shared.h>
@@ -33,6 +34,7 @@
 #include <game/savedevice.h>
 #include <game/savememory.h>
 #include <platform/switch/switch_input.h>
+#include "switch_pad_layout.h"
 
 #include <cstdlib>
 
@@ -56,7 +58,6 @@ const dvar_t *s_resaveAfterLoad;
 const dvar_t *s_padShortcut;
 const dvar_t *s_autoCmds;
 
-uint64_t s_prevPadButtons;
 int s_controllableFrames;
 int s_framesSinceSave;
 bool s_autoSaved;
@@ -262,6 +263,7 @@ void ParseAutoCmds(const char *spec)
 
 void Switch_AutoCmdFrame(void)
 {
+    Switch_IntroDiag(0);
     if (!s_autoCmds)
         return;
     if (s_autoCmdCount < 0)
@@ -282,13 +284,19 @@ void Switch_AutoCmdFrame(void)
 
 void Switch_QuickSavePadEdge(uint64_t buttons)
 {
-    const bool pressed = (buttons & SWITCH_INPUT_BUTTON_MINUS) != 0
-                         && (s_prevPadButtons & SWITCH_INPUT_BUTTON_MINUS) == 0;
-    s_prevPadButtons = buttons;
-    if (!pressed || !s_padShortcut || !s_padShortcut->current.enabled)
+    static PadMinusState minus;
+    // Hold long enough that a quick tap never flashes the objectives.
+    const PadMinusOut out = PadMinusStep(&minus, (buttons & SWITCH_INPUT_BUTTON_MINUS) != 0,
+                                         Switch_ClientGameplayActive() != 0,
+                                         (uint32_t)Sys_Milliseconds(), 250);
+    if (out.scoresDown)
+        Cbuf_AddText(0, "+scores\n");
+    if (out.scoresUp)
+        Cbuf_AddText(0, "-scores\n");
+    if (!(out.tapSave || out.menuPress) || !s_padShortcut || !s_padShortcut->current.enabled)
         return;
 
-    if (Switch_ClientGameplayActive())
+    if (out.tapSave)
         RequestSave("pad");
     else
         RequestLoad("pad");

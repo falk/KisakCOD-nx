@@ -1,5 +1,7 @@
+#include <platform/switch/switch_watchdog.h>
 #include <universal/q_shared.h>
 #include <port/switch_perf.h>
+#include <port/switch_console_lines.h>
 #ifdef __SWITCH__
 #include <port/switch_pcsample.h>
 #include <platform/switch/switch_pgo.h>
@@ -114,9 +116,12 @@ const dvar_t *com_developer;
 #ifdef __SWITCH__
 static const dvar_t *switch_performanceMode;
 static const dvar_t *switch_perfTrace;
+static const dvar_t *switch_perfSlowMs;
+static const dvar_t *switch_perfStructured;
 static const dvar_t *switch_pcSample;
 static const dvar_t *switch_crashTest;
 static void Com_UpdateSwitchPerformanceMode();
+void Switch_PerfConfigFrame(); // switch_clocks.cpp
 #endif
 
 const dvar_t *sys_lockThreads;
@@ -154,7 +159,7 @@ int timeClientFrame;
 int logfile;
 
 int com_numConsoleLines;
-char *com_consoleLines[32];
+char *com_consoleLines[SW_CONSOLE_LINE_CAP];
 
 #define WEAPMEMSOURCE_NONE 0
 int weaponInfoSource;
@@ -826,19 +831,10 @@ void Com_ClearTempMemory()
 void __cdecl Com_ParseCommandLine(char* commandLine)
 {
     iassert( commandLine );
-    com_consoleLines[0] = commandLine;
-    com_numConsoleLines = 1;
-    while (*commandLine)
-    {
-        if (*commandLine == 43 || *commandLine == 10)
-        {
-            if (com_numConsoleLines == 32)
-                return;
-            com_consoleLines[com_numConsoleLines++] = commandLine + 1;
-            *commandLine = 0;
-        }
-        ++commandLine;
-    }
+    int dropped;
+    com_numConsoleLines = Sw_SplitConsoleLines(commandLine, com_consoleLines, SW_CONSOLE_LINE_CAP, &dropped);
+    if (dropped)
+        Com_Printf(CON_CHANNEL_ERROR, "ERROR: command line: %i console lines dropped past the %i-line cap (their '+' commands run glued to the last line)\n", dropped, SW_CONSOLE_LINE_CAP);
 }
 
 // A boolean dvar's startup value from the command line ("set <name> <n>" /
@@ -919,7 +915,12 @@ void __cdecl Com_StartupVariable(const char* match)
             }
             else
             {
+#ifdef __SWITCH__
+                void Switch_CmdlineDvarSet();
+                Switch_CmdlineDvarSet();
+#else
                 Dvar_Set_f();
+#endif
             }
         }
         Cmd_EndTokenizedString();
@@ -1606,11 +1607,15 @@ void Com_InitDvars()
     // grouped SWITCH_PERF per-second CPU phase breakdown.  Kept separate from
     // `performance` so production runs stay quiet and so the breakdown can be
     // taken in the exact shipping configuration.
+    switch_perfStructured = Dvar_RegisterBool("switch_perfStructured", true, DVAR_NOFLAG,
+        "Emit versioned CPU profiling windows and bounded frame samples while tracing is enabled");
     switch_perfTrace = Dvar_RegisterBool(
         "switch_perfTrace",
         false,
         DVAR_NOFLAG,
         "Print one SWITCH_PERF per-second CPU phase breakdown (frame/render/issue/scene/cgame)");
+    switch_perfSlowMs = Dvar_RegisterInt("switch_perfSlowMs", 20, 0, 1000, DVAR_NOFLAG,
+        "Frames whose wall or GPU time reaches this many ms print a SWITCH_PERF slowframe line (0 = off)");
     // Stack sampler for hardware profiling (switch_pcsample.cpp); prints
     // PCSAMPLE/PCS blocks every 5 s for offline tooling.
     switch_pcSample = Dvar_RegisterInt(
@@ -2009,7 +2014,14 @@ void __cdecl Com_Frame_Try_Block_Function()
 
     iassert(cmd_args.nesting == -1);
 
+#ifdef __SWITCH__
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_FRAME_WRITECONFIG);
+        Com_WriteConfiguration(0);
+    }
+#else
     Com_WriteConfiguration(0);
+#endif
 #ifdef KISAK_SP
     CL_CheckStartPlayingDemo();
 #endif
@@ -2060,6 +2072,9 @@ void __cdecl Com_Frame_Try_Block_Function()
     {
         KISAK_NULLSUB();
         PROF_SCOPED("MaxFPSSpin");
+#ifdef __SWITCH__
+        SWITCH_PERF_SCOPE(SWITCH_PERF_FRAME_EVENTLOOP);
+#endif
         while (1)
         {
             Com_EventLoop();
@@ -2082,7 +2097,14 @@ void __cdecl Com_Frame_Try_Block_Function()
             msec = 1;
     }
 
+#ifdef __SWITCH__
+    {
+        SWITCH_PERF_SCOPE(SWITCH_PERF_FRAME_CBUF);
+        Cbuf_Execute(0, CL_ControllerIndexFromClientNum(0));
+    }
+#else
     Cbuf_Execute(0, CL_ControllerIndexFromClientNum(0));
+#endif
     iassert(msec > 0);
     msec = Com_ModifyMsec(msec);
     iassert(msec > 0);
@@ -2119,6 +2141,9 @@ void __cdecl Com_Frame_Try_Block_Function()
 
         {
             PROF_SCOPED("pre frame");
+#ifdef __SWITCH__
+            SWITCH_PERF_SCOPE(SWITCH_PERF_FRAME_PREFRAME);
+#endif
             CL_RunOncePerClientFrame(0, msec);
             Com_EventLoop();
 #ifdef KISAK_MP
@@ -2402,12 +2427,16 @@ void __cdecl Com_CheckSyncFrame()
 
 void __cdecl Com_Frame()
 {
+    Watchdog_Crumb(CRUMB_MAIN_FRAME);
 #ifdef TRACY_ENABLE
     TracyCFrameMarkStart("Com_Frame");
 #endif
 #ifdef __SWITCH__
     Com_UpdateSwitchPerformanceMode();
+    Switch_PerfConfigFrame();
+    SwitchPerf_SetStructured(switch_perfStructured && switch_perfStructured->current.enabled);
     SwitchPerf_SetEnabled(switch_perfTrace && switch_perfTrace->current.enabled);
+    SwitchPerf_SetSlowFrameMs(switch_perfSlowMs ? switch_perfSlowMs->current.integer : 20);
     SwitchPcSample_SetRate(switch_pcSample ? switch_pcSample->current.integer : 0);
     SwitchPerf_BeginFrame();
 #if defined(KISAK_SP)
@@ -2434,7 +2463,14 @@ void __cdecl Com_Frame()
     else
     {
         Profile_Guard(1);
+#ifdef __SWITCH__
+        {
+            SWITCH_PERF_SCOPE(SWITCH_PERF_FRAME_SYNC);
+            Com_CheckSyncFrame();
+        }
+#else
         Com_CheckSyncFrame();
+#endif
         {
             PROF_SCOPED("MainThread");
             Com_Frame_Try_Block_Function();

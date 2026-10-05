@@ -1,3 +1,4 @@
+#include <platform/switch/switch_watchdog.h>
 #include "r_dynres.h"
 #include <deko9/deko9_native.h>
 #include "rb_gpupass.h"
@@ -535,9 +536,9 @@ void __cdecl RB_SplitScreenFilter(const Material *material, const GfxViewInfo *v
     if (tess.indexCount)
         RB_EndTessSurface();
     R_Set2D(&gfxCmdBufSourceState);
-    // The view's rectangle in the scene target: with r_dynres that is the
+    // The view's rectangle in the scene target: on the scene layout that is the
     // scene viewport (the display one is in back-buffer pixels).
-    const GfxViewport &viewport = R_DynResEnabled() ? viewInfo->sceneViewport : viewInfo->displayViewport;
+    const GfxViewport &viewport = R_SceneLayoutEnabled() ? viewInfo->sceneViewport : viewInfo->displayViewport;
     x = (float)viewport.x;
     y = (float)viewport.y;
     w = (float)viewport.width;
@@ -2920,10 +2921,15 @@ static void RB_ApplyDeko9FrameSettings()
                                       ? DEKO9_PERDRAW_STATICTEX
                                       : 0u));
     // These take effect at the next Present, so a frame is recorded whole.
-    Deko9_SetGpuPasses(device, r_deko9GpuPasses && r_deko9GpuPasses->current.enabled);
+    Deko9_SetGpuPasses(device, (r_deko9GpuPasses && r_deko9GpuPasses->current.enabled) || RB_HrpWantsGpuPasses());
+    Deko9_SetDrawProbe(device, r_deko9DrawProbe ? (uint32_t)r_deko9DrawProbe->current.integer : 0u,
+                       r_deko9DrawSplit ? (uint32_t)r_deko9DrawSplit->current.integer : 1u);
+    RB_HrpFrameUpdate();
     Deko9_SetBarrierMode(device, r_deko9LightBarriers ? (uint32_t)r_deko9LightBarriers->current.integer : 0);
+    Deko9_SetTiledCache(device, r_deko9TiledCache ? (uint32_t)r_deko9TiledCache->current.integer : 0);
     Deko9_SetZcullStats(device, r_deko9ZcullStats && r_deko9ZcullStats->current.enabled);
     Deko9_SetShadowFilter(device, r_shadowFilter ? (uint32_t)r_shadowFilter->current.integer : 0);
+    Deko9_SetShaderOpt(device, r_deko9ShaderOpt ? (uint32_t)r_deko9ShaderOpt->current.integer : DEKO9_DEFAULT_SHADER_OPT);
     Deko9_SetCensus(device, r_deko9Census && r_deko9Census->current.enabled);
     Deko9_SetFaultTrace(device, r_deko9FaultTrace ? (uint32_t)r_deko9FaultTrace->current.integer : 0u);
     Deko9_SetGpuMap(device, r_deko9GpuMap ? (uint32_t)r_deko9GpuMap->current.integer : 0u);
@@ -3132,9 +3138,7 @@ GfxIndexBufferState *RB_SwapBuffers()
 
 #endif
         {
-#ifdef __SWITCH__
             SWITCH_PERF_SCOPE(SWITCH_PERF_EXEC_PRESENT);
-#endif
             Deko9_SetUpscaleSharpness(dx.device, r_fsrSharpness ? r_fsrSharpness->current.value : 0.2f);
             Deko9_SetUpscaleMode(dx.device, r_fsrMode ? (uint32_t)r_fsrMode->current.integer : 0u);
             hr = dx.windows[dx.targetWindowIndex].swapChain->Present(0, 0, 0, 0, 0);
@@ -3425,9 +3429,7 @@ void __cdecl RB_CallExecuteRenderCommands()
         iassert( dx.device );
         iassert( dx.inScene );
         {
-#ifdef __SWITCH__
             SWITCH_PERF_SCOPE(SWITCH_PERF_EXEC_ENDSCENE);
-#endif
             do
             {
                 if (r_logFile && r_logFile->current.integer)
@@ -3448,9 +3450,7 @@ void __cdecl RB_CallExecuteRenderCommands()
         dx.inScene = 0;
         if (!r_glob.isRenderingRemoteUpdate)
         {
-#ifdef __SWITCH__
             SWITCH_PERF_SCOPE(SWITCH_PERF_EXEC_FENCE);
-#endif
             if (dx.gpuSync)
             {
                 R_AcquireGpuFenceLock();
@@ -3485,11 +3485,9 @@ void __cdecl  RB_RenderThread(uint32_t threadContext)
     uint32_t start; // [esp+38h] [ebp-4h]
 
     iassert(threadContext == THREAD_CONTEXT_BACKEND);
-#ifdef __SWITCH__
     // This thread's SWITCH_PERF scopes go to the `backend` line (never into
     // the main thread's plain accumulators, which they would race).
     SwitchPerf_MarkBackendThread();
-#endif
 
     while (r_glob.haveThreadOwnership)
         NET_Sleep(1);
@@ -3523,12 +3521,16 @@ void __cdecl  RB_RenderThread(uint32_t threadContext)
                 KISAK_NULLSUB();
                 R_ProcessWorkerCmdsWithTimeout(Sys_WaitBackendEvent, 1);
             }
+            Watchdog_Crumb(CRUMB_BACKEND, 1);
 
             if (Sys_FinishRenderer())
             {
                 data = Sys_RendererSleep();
                 if (data)
+                {
+                    Watchdog_Crumb(CRUMB_BACKEND, 2);
                     RB_RenderCommandFrame((GfxBackEndData*)data);
+                }
                 Sys_StopRenderer();
                 //KISAK_NULLSUB();
                 RB_RenderThreadIdle();
@@ -3610,9 +3612,7 @@ void __cdecl RB_RenderCommandFrame(const GfxBackEndData *data)
         allowRendering = 0;
     if (allowRendering)
     {
-#ifdef __SWITCH__
         SWITCH_PERF_SCOPE(SWITCH_PERF_BACKEND_FRAME);
-#endif
         KISAK_NULLSUB();
         RB_BeginFrame(data);
         RB_Draw3D();
@@ -3623,17 +3623,13 @@ void __cdecl RB_RenderCommandFrame(const GfxBackEndData *data)
     }
     Sys_RenderCompleted();
     {
-#ifdef __SWITCH__
         SWITCH_PERF_SCOPE(SWITCH_PERF_BACKEND_SWAPWAIT);
-#endif
         PROF_SCOPED("WaitRenderSwap");
         R_ProcessWorkerCmdsWithTimeout(RB_BackendTimeout, 1);
     }
     if (allowRendering)
     {
-#ifdef __SWITCH__
         SWITCH_PERF_SCOPE(SWITCH_PERF_BACKEND_ENDFRAME);
-#endif
         KISAK_NULLSUB();
         RB_EndFrame(drawType);
     }

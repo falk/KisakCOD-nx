@@ -14,6 +14,7 @@
 #include <game/g_main.h>
 #include <aim_assist/aim_assist.h>
 #include <universal/critical_section.h>
+#include <port/switch_pad_layout.h>
 #ifdef __SWITCH__
 #include <platform/switch/switch_input_lifecycle.h>
 #include <port/switch_gyro.h>
@@ -512,20 +513,14 @@ void IN_Stance_Down()
 {
     if (IN_IsTempStanceKeyActive())
         return;
-    clients[0].stanceHeld = 1;
-    clients[0].stancePosition = clients[0].stance;
-    clients[0].stanceTime = com_frameTime;
-    if (clients[0].stance != CL_STANCE_CROUCH)
-        clients[0].stance = CL_STANCE_CROUCH;
+    PadStance_Down(clients[0], com_frameTime);
 }
 
 void IN_Stance_Up()
 {
     if (IN_IsTempStanceKeyActive())
         return;
-    if (clients[0].stanceHeld && clients[0].stancePosition == CL_STANCE_CROUCH)
-        clients[0].stance = CL_STANCE_STAND;
-    clients[0].stanceHeld = 0;
+    PadStance_Up(clients[0]);
 }
 
 void __cdecl IN_CenterView()
@@ -771,14 +766,7 @@ void CL_StanceButtonUpdate()
 {
     iassert(!IN_IsTempStanceKeyActive());
 
-    if (clients[0].stanceHeld && com_frameTime - clients[0].stanceTime >= cl_stanceHoldTime->current.integer)
-    {
-        if (clients[0].stancePosition == CL_STANCE_PRONE)
-            clients[0].stance = CL_STANCE_STAND;
-        else
-            clients[0].stance = CL_STANCE_PRONE;
-        clients[0].stanceHeld = 0;
-    }
+    PadStance_HoldUpdate(clients[0], com_frameTime, cl_stanceHoldTime->current.integer);
 }
 
 void __cdecl CL_AddCurrentStanceToCmd(usercmd_s *cmd)
@@ -1055,7 +1043,22 @@ void __cdecl CL_GamepadMove(usercmd_s *cmd)
     cmd->rightmove = ClampChar(cmd->rightmove + side);
     cmd->upmove = ClampChar(cmd->upmove + (int)(gamepad.up * 127.0f));
 
-    speed = 0.001f * (float)cls.frametime;
+    // The zoomed FOV scale (set by cgame from the ADS/scope FOV, as the mouse
+    // path uses it) keeps the stick's on-screen turn speed steady when zoomed.
+    speed = 0.001f * (float)cls.frametime * clients[0].cgameFOVSensitivityScale;
+    // A linear look stick makes small corrections too fast; a power curve on
+    // the deflection keeps full speed at full tilt and fine control near the
+    // centre.
+    static const dvar_t *input_lookCurve = Dvar_RegisterFloat(
+        "input_lookCurve", 2.0f, 1.0f, 4.0f, DVAR_ARCHIVE,
+        "Look-stick response exponent: 1 = linear, higher = finer control near the centre");
+    const float lookMagnitude = sqrtf(gamepad.yaw * gamepad.yaw + gamepad.pitch * gamepad.pitch);
+    if (lookMagnitude > 0.0f)
+    {
+        const float curved = powf(lookMagnitude > 1.0f ? 1.0f : lookMagnitude, input_lookCurve->current.value);
+        gamepad.yaw *= curved / lookMagnitude;
+        gamepad.pitch *= curved / lookMagnitude;
+    }
     yaw = gamepad.yaw * cl_yawspeed->current.value * speed * input_viewSensitivity->current.value;
     pitch = gamepad.pitch * cl_pitchspeed->current.value * speed * input_viewSensitivity->current.value;
     clients[0].viewangles[YAW] -= yaw;
@@ -1091,8 +1094,8 @@ void __cdecl CL_GamepadMove(usercmd_s *cmd)
             float gyroYawDeltaDeg = 0.0f;
             float gyroPitchDeltaDeg = 0.0f;
             Switch_GyroGetDelta(&gyroYawDeltaDeg, &gyroPitchDeltaDeg);
-            clients[0].viewangles[YAW] -= gyroYawDeltaDeg;
-            clients[0].viewangles[PITCH] -= gyroPitchDeltaDeg;
+            clients[0].viewangles[YAW] -= gyroYawDeltaDeg * clients[0].cgameFOVSensitivityScale;
+            clients[0].viewangles[PITCH] -= gyroPitchDeltaDeg * clients[0].cgameFOVSensitivityScale;
         }
     }
 
@@ -1103,11 +1106,6 @@ void __cdecl CL_GamepadMove(usercmd_s *cmd)
         cmd->buttons |= BUTTON_ADS;
     if (gamepad.buttons & SWITCH_INPUT_BUTTON_A)
         cmd->buttons |= BUTTON_JUMP;
-    if (gamepad.buttons & SWITCH_INPUT_BUTTON_B)
-    {
-        cmd->buttons |= BUTTON_CROUCH;
-        cmd->buttons |= BUTTON_TEMP_STANCE;
-    }
     // Console use/reload key.  These two face buttons are bound by *physical
     // position*, not by the Xbox label the retail bind list uses: the west
     // button (Switch Y, Xbox X) reloads, the north button (Switch X, Xbox Y)
@@ -1115,14 +1113,28 @@ void __cdecl CL_GamepadMove(usercmd_s *cmd)
     // which is not where a console player's thumb expects it.
     if (gamepad.buttons & SWITCH_INPUT_BUTTON_Y)
         cmd->buttons |= BUTTON_USE_RELOAD;
-    if (gamepad.buttons & SWITCH_INPUT_BUTTON_R)
-        cmd->buttons |= BUTTON_FRAG;
+    {
+        const uint32_t weapon = clients[0].snap.ps.weapon;
+        const bool selectedDetonator = weapon && PM_GetWeaponFireButton(weapon) == BUTTON_THROW;
+        const PadThrowDecision throwing = PadThrowResolve(switchAdsHeld,
+            (gamepad.buttons & SWITCH_INPUT_BUTTON_R) != 0, selectedDetonator);
+        if (throwing.frag)
+            cmd->buttons |= BUTTON_FRAG;
+        if (throwing.throwSelected)
+            cmd->buttons |= BUTTON_THROW;
+    }
     if (gamepad.buttons & SWITCH_INPUT_BUTTON_L)
         cmd->buttons |= BUTTON_SMOKE;
     if (gamepad.buttons & SWITCH_INPUT_BUTTON_STICKR)
         cmd->buttons |= BUTTON_MELEE;
-    if (gamepad.buttons & SWITCH_INPUT_BUTTON_STICKL)
-        cmd->buttons |= BUTTON_SPRINT;
+    {
+        const PadL3Decision l3 = PadL3Resolve((gamepad.buttons & SWITCH_INPUT_BUTTON_STICKL) != 0,
+                                              (cmd->buttons & BUTTON_ADS) != 0);
+        if (l3.sprint)
+            cmd->buttons |= BUTTON_SPRINT;
+        if (l3.breath)
+            cmd->buttons |= BUTTON_BREATH;
+    }
     {
         // Buttons retail console binds to *commands* rather than usercmd bits.
         // Mission scripts gate hints and objectives on notifyOnCommand(...)
@@ -1146,11 +1158,14 @@ void __cdecl CL_GamepadMove(usercmd_s *cmd)
                 Cmd_NotifyScriptCommand("+attack");
             if (pressedButtons & SWITCH_INPUT_BUTTON_ZL)
             {
+                Cmd_NotifyScriptCommand("+speed");
+                Cmd_NotifyScriptCommand("+speed_throw");
                 Cmd_NotifyScriptCommand("+toggleads_throw");
                 Cmd_NotifyScriptCommand("toggleads");
             }
             if (pressedButtons & SWITCH_INPUT_BUTTON_Y)
             {
+                Cmd_NotifyScriptCommand("+activate");
                 Cmd_NotifyScriptCommand("+reload");
                 Cmd_NotifyScriptCommand("+usereload");
             }
@@ -1161,14 +1176,13 @@ void __cdecl CL_GamepadMove(usercmd_s *cmd)
             }
             if (pressedButtons & SWITCH_INPUT_BUTTON_B)
             {
-                Cmd_NotifyScriptCommand("+stance");
+                // +stance itself runs as a real command below (stance machine).
                 Cmd_NotifyScriptCommand("gocrouch");
                 Cmd_NotifyScriptCommand("togglecrouch");
             }
             if (pressedButtons & SWITCH_INPUT_BUTTON_STICKR)
             {
                 Cmd_NotifyScriptCommand("+melee");
-                Cmd_NotifyScriptCommand("+melee_breath");
             }
             if (pressedButtons & SWITCH_INPUT_BUTTON_STICKL)
             {
@@ -1183,9 +1197,6 @@ void __cdecl CL_GamepadMove(usercmd_s *cmd)
             if (pressedButtons & SWITCH_INPUT_BUTTON_L)
             {
                 Cmd_NotifyScriptCommand("+smoke");
-                Cmd_NotifyScriptCommand("+activate");
-                // killhouse_code.gsc registers "equip_C4" against +actionslot 4.
-                Cmd_NotifyScriptCommand("+actionslot 4");
             }
             if (releasedButtons & SWITCH_INPUT_BUTTON_L)
             {
@@ -1194,6 +1205,16 @@ void __cdecl CL_GamepadMove(usercmd_s *cmd)
                 Cmd_NotifyScriptCommand("-smoke");
             }
         }
+    }
+
+    {
+        // Stance (B) and action slots (d-pad) are real commands so their
+        // handlers and script notifications run exactly as a keyboard bind.
+        static PadCommandState s_padCommands;
+        PadCommandOut padOut;
+        PadCommandStep(&s_padCommands, gamepad.buttons, Switch_ClientGameplayActive() != 0, &padOut);
+        for (int i = 0; i < padOut.count; ++i)
+            Cbuf_AddText(0, va("%s\n", padOut.cmds[i]));
     }
 
     {

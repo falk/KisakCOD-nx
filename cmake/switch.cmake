@@ -62,9 +62,12 @@ add_library(switch_deko9 STATIC
     "${SRC_DIR}/deko9/deko9_fsr_shaders.cpp"
     "${SRC_DIR}/deko9/deko9_gpufault.cpp"
     "${SRC_DIR}/deko9/deko9_memory.cpp"
+    "${SRC_DIR}/deko9/deko9_prebake.cpp"
     "${SRC_DIR}/deko9/deko9_resources.cpp"
     "${SRC_DIR}/deko9/deko9_shader.cpp"
     "${SRC_DIR}/deko9/deko9_state_map.cpp"
+    "${SRC_DIR}/deko9/deko9_taau.cpp"
+    "${SRC_DIR}/deko9/deko9_taau_shaders.cpp"
     "${SRC_DIR}/deko9/deko9_zcull.cpp")
 target_include_directories(switch_deko9 PRIVATE
     "${DEPS_DIR}/d3d9-headers/directx"
@@ -134,8 +137,11 @@ function(kisak_switch_configure_sp)
         "${SRC_DIR}/platform/switch/switch_pmem_stats.cpp"
         "${SRC_DIR}/port/switch_snapvector.cpp"
         "${SRC_DIR}/port/switch_quicksave.cpp"
+        "${SRC_DIR}/port/switch_intro_diag.cpp"
         "${SRC_DIR}/port/switch_gyro.cpp"
         "${SRC_DIR}/port/switch_rumble.cpp"
+        "${SRC_DIR}/port/switch_ui_menus.cpp"
+        "${SRC_DIR}/port/switch_cmdline_dvars.cpp"
         "${SRC_DIR}/platform/switch/switch_clocks.cpp"
         # Statistical stack sampler behind `switch_pcSample` (off by default).
         "${SRC_DIR}/port/switch_pcsample.cpp"
@@ -149,6 +155,7 @@ function(kisak_switch_configure_sp)
         "${SRC_DIR}/port/switch_cinematic_ffmpeg.cpp"
         "${SRC_DIR}/port/switch_excluded_boundaries.cpp"
         "${SRC_DIR}/port/switch_material_residue.cpp"
+        "${SRC_DIR}/port/switch_shader_prebake.cpp"
         "${SRC_DIR}/port/switch_misc_stubs.cpp"
         # r_model_skin_simd.cpp is r_model_skin_sse.cpp with GCC vector
         # extensions (NEON), byte-identical by switch_model_skin_simd_test.

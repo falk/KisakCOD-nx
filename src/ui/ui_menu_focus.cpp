@@ -2,10 +2,87 @@
 #error This file is for SinglePlayer only
 #endif
 
-// Exact original focus and cursor traversal moved from ui_shared.cpp.  They
-// remain the only owner of controller cursor semantics on Switch and desktop.
+// Shared SP focus and cursor traversal for Switch controllers and desktop keys.
 #include "ui_shared.h"
 #include <client/client.h>
+
+#ifdef __SWITCH__
+void UI_RemoveUnsupportedSwitchOptions(menuDef_t *menu)
+{
+    if (!menu || !menu->window.name || !menu->items)
+        return;
+    const bool graphics = !I_stricmp(menu->window.name, "options_graphics");
+    const bool sound = !I_stricmp(menu->window.name, "options_sound");
+    const bool look = !I_stricmp(menu->window.name, "options_look");
+    if (!graphics && !sound && !look)
+        return;
+    for (int i = 0; i < menu->itemCount; )
+    {
+        itemDef_s *item = menu->items[i];
+        if (!item) { ++i; continue; }
+        const char *dvar = item->dvar;
+        const bool unsupported = dvar &&
+            ((graphics && (!I_stricmp(dvar, "ui_r_aasamples") ||
+                           !I_stricmp(dvar, "r_gamma") ||
+                           !I_stricmp(dvar, "ui_r_vsync") ||
+                           !I_stricmp(dvar, "ai_corpsecount"))) ||
+             (sound && (!I_stricmp(dvar, "ui_snd_enableEq") ||
+                        !I_stricmp(dvar, "ui_snd_khz") ||
+                        !I_stricmp(dvar, "ui_outputConfig"))) ||
+             (look && !I_stricmp(dvar, "sensitivity")));
+        const bool soundApply = sound && item->window.name &&
+            (!I_stricmp(item->window.name, "apply") || !I_stricmp(item->window.name, "apply2"));
+        if (!unsupported && !soundApply)
+        {
+            ++i;
+            continue;
+        }
+        // Authored option labels and highlights precede their control on the same row.
+        // Remove the whole row so an inert label or mouse hitbox cannot retain focus.
+        int first = i;
+        const rectDef_s row = item->window.rectClient;
+        while (first > 0)
+        {
+            const itemDef_s *previous = menu->items[first - 1];
+            if (!previous) break;
+            const rectDef_s &rect = previous->window.rectClient;
+            if (!(previous->window.staticFlags & 0x100000) ||
+                rect.y != row.y || rect.h != row.h ||
+                rect.x < row.x || rect.x >= row.x + row.w ||
+                rect.horzAlign != row.horzAlign || rect.vertAlign != row.vertAlign)
+                break;
+            --first;
+        }
+        const int count = i - first + 1;
+        int &selection = menu->cursorItem[0];
+        if (selection >= first && selection <= i) selection = -1;
+        else if (selection > i) selection -= count;
+        // Close content-row gaps without moving tabs, footer buttons or expressions.
+        if (unsupported && row.w > 0 && row.h > 0)
+            for (int j = i + 1; j < menu->itemCount; ++j)
+            {
+                itemDef_s *next = menu->items[j];
+                if (!next) continue;
+                rectDef_s &rect = next->window.rectClient;
+                if (rect.y > row.y && rect.h == row.h &&
+                    rect.horzAlign == row.horzAlign && rect.vertAlign == row.vertAlign &&
+                    rect.x >= row.x && rect.x < row.x + row.w &&
+                    (next->dvar || (next->window.staticFlags & 0x100000)) &&
+                    !next->rectYExp.numEntries)
+                {
+                    rect.y -= row.h + 2;
+                    next->window.rect.y -= row.h + 2;
+                }
+            }
+        for (int j = i + 1; j < menu->itemCount; ++j)
+            menu->items[j - count] = menu->items[j];
+        menu->itemCount -= count;
+        for (int j = menu->itemCount; j < menu->itemCount + count; ++j)
+            menu->items[j] = nullptr;
+        i = first;
+    }
+}
+#endif
 
 const rectDef_s *__cdecl Item_GetTextRect(int localClientNum, const itemDef_s *item)
 {
@@ -79,7 +156,6 @@ int __cdecl Item_SetFocus(UiContext *dc, itemDef_s *item, float x, float y)
 {
     rectDef_s r; // [esp+28h] [ebp-2Ch] BYREF
     const rectDef_s *textRect; // [esp+40h] [ebp-14h]
-    itemDef_s *oldFocus; // [esp+44h] [ebp-10h]
     menuDef_t *focusedMenu; // [esp+48h] [ebp-Ch]
     menuDef_t *parent; // [esp+4Ch] [ebp-8h]
     int i; // [esp+50h] [ebp-4h]
@@ -91,8 +167,12 @@ int __cdecl Item_SetFocus(UiContext *dc, itemDef_s *item, float x, float y)
     }
     if ((item->window.staticFlags & 0x100000) != 0 || !Window_IsVisible(dc->localClientNum, &item->window))
         return 0;
-    if (Window_HasFocus(dc->localClientNum, &item->window) && Item_IsVisible(dc->localClientNum, item))
-        return 1;
+    // Empty buttons without a label or image are mouse hit regions, not
+    // controller choices. Image buttons and expression labels remain eligible.
+    if (!dc->isCursorVisible && item->type == 1
+        && (!item->text || !*item->text) && !item->textExp.numEntries
+        && !item->window.background && !item->materialExp.numEntries)
+        return 0;
     parent = item->parent;
     if (parent)
     {
@@ -113,7 +193,19 @@ int __cdecl Item_SetFocus(UiContext *dc, itemDef_s *item, float x, float y)
         return 0;
     if (!Item_IsVisible(dc->localClientNum, item))
         return 0;
-    oldFocus = Menu_ClearFocus(dc, item->parent);
+    // Retained focus does not override a changed visibility or enable gate.
+    if (Window_HasFocus(dc->localClientNum, &item->window))
+        return 1;
+    if (!item->type)
+    {
+        textRect = Item_GetTextRect(dc->localClientNum, item);
+        r = *textRect;
+        r.y -= r.h;
+        // Reject a missed text target before clearing focus or moving the cursor.
+        if (!Rect_ContainsPoint(dc->localClientNum, &r, x, y))
+            return 0;
+    }
+    Menu_ClearFocus(dc, item->parent);
     if (item->type)
     {
         Window_AddDynamicFlags(dc->localClientNum, &item->window, 2);
@@ -122,21 +214,7 @@ int __cdecl Item_SetFocus(UiContext *dc, itemDef_s *item, float x, float y)
     }
     else
     {
-        textRect = Item_GetTextRect(dc->localClientNum, item);
-        r = *textRect;
-        r.y = r.y - r.h;
-        r.horzAlign = textRect->horzAlign;
-        r.vertAlign = textRect->vertAlign;
-        if (Rect_ContainsPoint(dc->localClientNum, &r, x, y))
-        {
-            Window_AddDynamicFlags(dc->localClientNum, &item->window, 2);
-        }
-        else if (oldFocus)
-        {
-            Window_AddDynamicFlags(dc->localClientNum, &oldFocus->window, 2);
-            if (oldFocus->onFocus)
-                Item_RunScript(dc, oldFocus, (char*)oldFocus->onFocus);
-        }
+        Window_AddDynamicFlags(dc->localClientNum, &item->window, 2);
     }
     for (i = 0; i < parent->itemCount; ++i)
     {
@@ -209,7 +287,8 @@ itemDef_s *__cdecl Menu_SetPrevCursorItem(UiContext *dc, menuDef_t *menu)
             1);
     if (menu->cursorItem[v9] < 0)
     {
-        Menu_SetCursorItem(dc->localClientNum, menu, menu->itemCount - 1);
+        // Traversal decrements before testing, so start beyond the last item.
+        Menu_SetCursorItem(dc->localClientNum, menu, menu->itemCount);
         wrapped = 1;
     }
     do
@@ -320,7 +399,7 @@ itemDef_s *__cdecl Menu_SetNextCursorItem(UiContext *dc, menuDef_t *menu)
             1);
     if (menu->cursorItem[v8] == -1)
     {
-        Menu_SetCursorItem(dc->localClientNum, menu, 0);
+        // The first increment selects item zero from an unselected cursor.
         wrapped = 1;
     }
     do
@@ -361,7 +440,11 @@ itemDef_s *__cdecl Menu_SetNextCursorItem(UiContext *dc, menuDef_t *menu)
         if (menu->cursorItem[v5] >= menu->itemCount)
         {
             if (wrapped)
-                return menu->items[oldCursor];
+            {
+                // There may be no eligible item, including an old cursor of -1.
+                Menu_SetCursorItem(dc->localClientNum, menu, oldCursor);
+                return 0;
+            }
             wrapped = 1;
             Menu_SetCursorItem(dc->localClientNum, menu, 0);
         }
@@ -386,4 +469,3 @@ itemDef_s *__cdecl Menu_SetNextCursorItem(UiContext *dc, menuDef_t *menu)
             1);
     return menu->items[menu->cursorItem[v3]];
 }
-

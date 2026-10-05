@@ -96,7 +96,7 @@ void __cdecl CG_DamageFeedback(int32_t localClientNum, int32_t yawByte, int32_t 
     // Local player's own damage feedback only (CG_DamageFeedback is only
     // ever called for the local client's playerState_s in SP -- see the
     // two CG_TransitionPlayerState call sites below).
-    if (damage > 0)
+    if (damage > 0 && yawByte == 255 && pitchByte == 255)
         Switch_RumbleNotifyDamage(damage);
 #endif
     kick = (double)damage * bg_viewKickScale->current.value;
@@ -124,6 +124,12 @@ void __cdecl CG_DamageFeedback(int32_t localClientNum, int32_t yawByte, int32_t 
         AngleVectors(angles, dir, 0, 0);
         sideFrac = Vec3Dot(dir, cgameGlob->refdef.viewaxis[1]);
         forwardFrac = Vec3Dot(dir, cgameGlob->refdef.viewaxis[0]);
+#if defined(__SWITCH__)
+        // viewaxis[1] points left and dir is the shot's travel direction, so a
+        // hit from the left has a negative left-dot.
+        if (damage > 0)
+            Switch_RumbleNotifyDamageFrom(damage, sideFrac);
+#endif
         cgameGlob->v_dmg_roll = -kick * sideFrac;
         cgameGlob->v_dmg_pitch = kick * forwardFrac;
         slot = 0;

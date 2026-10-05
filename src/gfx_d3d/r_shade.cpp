@@ -75,13 +75,11 @@ int __cdecl R_SetIndexData(GfxCmdBufPrimState *state, uint8_t *indices, int triC
     bufferData = (uint8_t *)gfxBuf.dynamicIndexBuffer->indices + 2 * gfxBuf.dynamicIndexBuffer->used;
 
     memcpy(bufferData, indices, indexDataSize);
-#ifdef __SWITCH__
-    if (SwitchPerf_g_enabled)
+    if (KISAK_PERF_ACTIVE)
     {
         SwitchPerf_AddEvent(SWITCH_PERF_EV_SETIDX_CALLS, 1);
         SwitchPerf_AddEvent(SWITCH_PERF_EV_SETIDX_BYTES, (uint64_t)indexDataSize);
     }
-#endif
     if (state->indexBuffer != ib)
         R_ChangeIndices(state, ib);
     gfxBuf.dynamicIndexBuffer->used += 3 * triCount;
@@ -561,7 +559,7 @@ void __cdecl R_SetupPass(GfxCmdBufContext context, uint32_t passIndex)
     iassert( pass->pixelShader );
     R_SetPixelShader(context.state, pass->pixelShader);
     if (g_drawCensusOn)
-        RB_DrawCensusLabel(material, context.state->technique, pass->pixelShader);
+        RB_DrawCensusLabel(material, context.state->technique, pass->pixelShader, pass->vertexShader);
     if (pass->stableArgCount)
     {
         R_SetPassShaderStableArguments(

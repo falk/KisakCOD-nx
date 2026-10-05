@@ -13,6 +13,8 @@
 
 #include <cstdint>
 
+#include "deko9_shader.h"
+
 struct IDirect3DDevice9;
 struct IDirect3DBaseTexture9;
 struct IDirect3DResource9;
@@ -20,6 +22,8 @@ struct IDirect3DSurface9;
 struct IDirect3DQuery9;
 struct IDirect3DVertexBuffer9;
 struct IDirect3DIndexBuffer9;
+struct IDirect3DVertexShader9;
+struct IDirect3DPixelShader9;
 
 void Deko9_BeginBatch(IDirect3DDevice9 *device);
 void Deko9_EndBatch(IDirect3DDevice9 *device);
@@ -32,6 +36,11 @@ void Deko9_SetTexture(IDirect3DDevice9 *device, uint32_t sampler, IDirect3DBaseT
 // state (only the fields that differ from oldPacked) and returns the state
 // the engine tracks afterwards.
 uint32_t Deko9_SetSamplerPacked(IDirect3DDevice9 *device, uint32_t sampler, uint32_t packed, uint32_t oldPacked);
+// MIPMAPLODBIAS of every engine sampler (the packed path above never sets
+// it), rounded to -k/8 for k in 0..15 so sampler keys stay compact: r_taau
+// sharpens the scene's textures when it renders below the output size.
+// Applies to the samplers already set too.
+void Deko9_SetEngineLodBias(IDirect3DDevice9 *device, float bias);
 
 // Fast-path verification (r_deko9Verify): each draw re-derives its binding,
 // vertex input and constants the slow way and compares; mismatches report
@@ -61,6 +70,61 @@ bool Deko9_GatherProbe(IDirect3DDevice9 *device, IDirect3DBaseTexture9 *source, 
 // KILLHOUSE_LOAD_SHADERS), never per shader; a no-op when nothing new
 // compiled.
 void Deko9_FlushShaderPack();
+
+// Load-time shader variant prebake. A draw selects a compiled variant of its
+// shaders by depth-compare mask, early-Z and instance layout; one missing
+// is translated and compiled at draw time with the device lock held. The
+// caller describes every loaded material pass; the device enumerates every
+// variant those passes can select (deko9_variant_plan.h), builds the ones
+// not installed yet without holding the device lock, and installs them.
+// Building runs on one thread created on core `cpuId` at Horizon priority
+// `priority` (pass a core and a priority below the frame workers' so the
+// build only fills their idle time), or on the calling thread when
+// cpuId < 0 or the thread cannot start. Blocks the caller until every
+// variant is installed: call it from the loading thread, never from the
+// main thread. A variant that a draw still has to build afterwards is
+// reported (FAIL:DEKO9_SHADER_PREBAKE, drawBuilds= on the perf line) and
+// built as before.
+struct Deko9PassVariants
+{
+    IDirect3DVertexShader9 *vs;
+    IDirect3DPixelShader9 *ps;
+    // Pixel sampler registers bound to code images that can be a
+    // depth-format texture (the hardware shadow maps).
+    uint32_t depthSamplerMask;
+    // Some state-bits entry of the material enables the alpha test here.
+    uint8_t alphaTest;
+    // Registers of the pass's instanced static-model draws (0: none).
+    uint8_t instanceRegCount;
+    uint8_t instanceRegs[16];
+};
+struct Deko9PrebakeResult
+{
+    uint32_t passes;    // descriptions accepted
+    uint32_t planned;   // distinct variants the passes can select
+    uint32_t present;   // already installed
+    uint32_t built;     // installed now
+    uint32_t packHits;  // of those, served by the shader pack
+    uint32_t failed;    // could not be built (reported)
+    uint32_t threads;   // compile threads used (0: the calling thread)
+    uint64_t planUs, buildUs, wallUs;
+};
+bool Deko9_PrebakeVariants(IDirect3DDevice9 *device, const Deko9PassVariants *passes, uint32_t count, int cpuId,
+                           int priority, Deko9PrebakeResult *result);
+
+// The engine's zone-load prebake switch (r_deko9Prebake, registered with
+// this default). Off, a zone load plans and builds nothing and every
+// variant is built at its first draw, with the device lock held.
+constexpr bool DEKO9_DEFAULT_PREBAKE = true;
+// Runs `prebake` (the zone's whole plan and build) only when `enabled`;
+// returns whether it ran.
+template <typename Prebake> inline bool Deko9_PrebakeIfEnabled(bool enabled, Prebake &&prebake)
+{
+    if (!enabled)
+        return false;
+    prebake();
+    return true;
+}
 
 // ---- native float-Z (r_deko9NativeFloatZ) -------------------------------------
 // Rebuilds the engine's float-Z target (signed view depth, see deko9_fsr.h
@@ -127,6 +191,17 @@ enum : uint32_t
 void Deko9_SetParticleRules(IDirect3DDevice9 *device, uint32_t rules);
 // Zcull invalidations the depth pass recorded (DEKO9_HRP_RULE_ZCULL).
 uint64_t Deko9_GetParticleZcullInvalidates(IDirect3DDevice9 *device);
+// Bisection aid: records the strongest deko3d barrier (wait for idle, then
+// invalidate texture, shader, descriptor and zcull caches and flush + invalidate
+// L2) regardless of the hazard tracker, so a missing or too weak sync edge
+// around the off-screen passes shows up as a changed image on hardware.
+void Deko9_ParticleFullBarrier(IDirect3DDevice9 *device);
+// Bisection aid: the depth pass's and the composite's constant memory as the
+// GPU holds it (read after the GPU is idle): depth[8] = rect x, y, last x,
+// last y, factor - 1, 0, 0, 0; composite[12] = CompositeConstants words.
+// False before the passes ran.
+bool Deko9_ReadParticleConstants(IDirect3DDevice9 *device, uint32_t depth[8], uint32_t composite[12]);
+uint64_t Deko9_GetParticleFullBarriers(IDirect3DDevice9 *device);
 
 // Early fragment tests (r_deko9EarlyZ, default on): a pixel shader that can
 // discard (texkill, or the alpha test on) is depth-tested late on Maxwell,
@@ -161,6 +236,43 @@ enum : uint32_t
     DEKO9_PERDRAW_STATICTEX = 1u << 3,
 };
 void Deko9_SetPerDraw(IDirect3DDevice9 *device, uint32_t flags);
+
+// Defaults of the device settings the engine applies from its dvars once
+// per frame (Deko9_Set*). The device starts with these values, so whatever
+// it builds before the first frame applies the dvars (the shaders created
+// while the first zones load, their prebaked variants) already matches;
+// each one equals the registered default of the dvar named beside it.
+constexpr bool DEKO9_DEFAULT_VERIFY = false;      // r_deko9Verify
+constexpr bool DEKO9_DEFAULT_EARLY_Z = true;      // r_deko9EarlyZ
+// r_deko9HazardCache, r_deko9ConstFast, r_deko9TexIncremental, r_deko9StaticHazard (one bit each)
+constexpr uint32_t DEKO9_DEFAULT_PERDRAW =
+    DEKO9_PERDRAW_HAZARD | DEKO9_PERDRAW_CONSTS | DEKO9_PERDRAW_TEXTURES | DEKO9_PERDRAW_STATICTEX;
+constexpr bool DEKO9_DEFAULT_GPU_PASSES = false;  // r_deko9GpuPasses
+constexpr uint32_t DEKO9_DEFAULT_DRAW_PROBE = 0;  // r_deko9DrawProbe
+constexpr uint32_t DEKO9_DEFAULT_DRAW_SPLIT = 1;  // r_deko9DrawSplit
+constexpr uint32_t DEKO9_DEFAULT_BARRIER_MODE = 0; // r_deko9LightBarriers
+constexpr uint32_t DEKO9_DEFAULT_TILED_CACHE = 0; // r_deko9TiledCache
+constexpr bool DEKO9_DEFAULT_ZCULL_STATS = false; // r_deko9ZcullStats
+constexpr uint32_t DEKO9_DEFAULT_SHADOW_FILTER = 0; // r_shadowFilter
+constexpr uint32_t DEKO9_DEFAULT_SHADER_OPT = 0;  // r_deko9ShaderOpt
+constexpr bool DEKO9_DEFAULT_CENSUS = false;      // r_deko9Census
+constexpr uint32_t DEKO9_DEFAULT_FAULT_TRACE = 0; // r_deko9FaultTrace
+constexpr uint32_t DEKO9_DEFAULT_GPU_MAP = 0;     // r_deko9GpuMap
+constexpr bool DEKO9_DEFAULT_RT_COMPRESSION = true; // r_deko9RtCompression
+constexpr float DEKO9_DEFAULT_UPSCALE_SHARPNESS = 0.2f; // r_fsrSharpness
+constexpr uint32_t DEKO9_DEFAULT_UPSCALE_MODE = 0; // r_fsrMode
+constexpr uint32_t DEKO9_DEFAULT_CMD_CHUNK_KB = 0; // r_deko9CmdChunkKB (0: the device's chunk size)
+// r_deko9DrawProbe / r_deko9DrawSplit: GPU per-draw cost probe. Pixels are
+// unchanged; only the number of GPU draws or the per-draw feeding changes.
+// `split` > 1 issues each triangle-list draw as that many consecutive draws.
+enum : uint32_t
+{
+    DEKO9_PROBE_CONSTS = 1u << 0,    // re-push every shader constant each draw
+    DEKO9_PROBE_TEXTURES = 1u << 1,  // re-resolve textures/samplers each draw
+    DEKO9_PROBE_STREAMS = 1u << 2,   // re-bind vertex streams and index buffer each draw
+    DEKO9_PROBE_SUBCONSTS = 1u << 3, // each split sub-draw also re-pushes constants
+};
+void Deko9_SetDrawProbe(IDirect3DDevice9 *device, uint32_t flags, uint32_t split);
 // Submits the open list and waits until the GPU has finished everything.
 void Deko9_WaitForGpuIdle(IDirect3DDevice9 *device);
 // Single-submitter rule: the calling thread becomes the render owner, the
@@ -199,8 +311,11 @@ enum Deko9GpuPass : uint32_t
     Deko9GpuPass_View2D,       // per-view 2D command list (viewInfo->cmds)
     Deko9GpuPass_Hud2D,        // frame 2D command list (backEndData->cmds: HUD, menus)
     Deko9GpuPass_Present,      // back buffer -> swapchain blit (device internal)
-    Deko9GpuPass_Upscale,      // r_dynres: scene -> back buffer upscale (or copy) before the 2D pass
+    Deko9GpuPass_Upscale,      // r_renderScale: scene -> back buffer upscale (or copy) before the 2D pass
     Deko9GpuPass_Hrp,          // r_halfResParticles: off-screen depth downsample + composites
+    Deko9GpuPass_TaauResolve,  // r_taau: temporal resolve (replaces Upscale)
+    Deko9GpuPass_TaauMotion,   // r_taau: per-object motion draws
+    Deko9GpuPass_TaauReactive, // r_taau: the two luma passes around the transparents
     Deko9GpuPass_Count
 };
 
@@ -233,7 +348,7 @@ void Deko9_CensusReport(IDirect3DDevice9 *device, const char *label, uint32_t wi
 // Material label of the next draws that bind `pixelShader` (the engine's
 // R_SetupPass; strings must outlive the frame).
 void Deko9_CensusLabel(IDirect3DDevice9 *device, const char *material, const char *technique, const char *shader,
-                       const void *pixelShader);
+                       const char *vertexShader, const void *pixelShader);
 // Lights pass: lightIndex = point-light partition + 1 while its surfaces
 // draw, 0 after; viewLights != 0 (with lightIndex 0) starts a view with that
 // many point lights.
@@ -253,7 +368,7 @@ void Deko9_SetRtCompression(bool enable);
 void Deko9_SetRtCompressionOverride(int compress);
 bool Deko9_IsCompressed(IDirect3DResource9 *resource);
 
-// ---- dynamic render resolution (r_dynres) -----------------------------------
+// ---- scene render scale (r_renderScale, r_dynres) ---------------------------
 // Re-lays out a single-level 2D render-target texture or render-target /
 // depth-stencil surface at width x height (up to the size it was created
 // with): the object keeps its identity, the new layout gets fresh memory of
@@ -283,6 +398,36 @@ bool Deko9_SetColorless(IDirect3DSurface9 *surface);
 // FAIL:DEKO9_UPSCALE_RECT) when it cannot run.
 bool Deko9_UpscaleSurface(IDirect3DDevice9 *device, IDirect3DBaseTexture9 *src, const int32_t *srcRect,
                           IDirect3DSurface9 *dst, const int32_t *dstRect);
+// r_taau (deko9_taau.h): temporal resolve of `color`'s srcRect, with the
+// scene `depth` of the same size, into dstRect of `dst`. The device keeps the
+// history (two images the size of `dst`, recreated and reset when it
+// changes); frame->reset ignores it. Logs `DEKO9 taau frames=60 gpu=...`
+// every 60 calls. False (and FAIL:DEKO9_TAAU) when it cannot run.
+namespace deko9
+{
+struct TaauFrame;
+struct TaauMotionDraw;
+struct TaauMotionView;
+}
+// r_taau per-object motion: draws `count` moving surfaces (deko9_taau.h)
+// into the device's motion texture against the scene `depth` (srcRect is
+// the scene viewport); the next Deko9_TaauResolve reads it. A draw whose
+// index or vertex range (vertexCount vertices from each offset) leaves its
+// buffers is skipped and counted (motion_skips= in the "taau" line). False
+// (and FAIL:DEKO9_TAAU_MOTION) when the pass cannot run.
+bool Deko9_TaauMotion(IDirect3DDevice9 *device, IDirect3DSurface9 *depth, const int32_t srcRect[4],
+                      const deko9::TaauMotionView *view, const deko9::TaauMotionDraw *draws, uint32_t count);
+// r_taau reactive weighting: called before a view's transparent passes
+// (after = false: snapshots the luma of `color`'s srcRect) and after them
+// (after = true: keeps the change they made) for the next
+// Deko9_TaauResolve; `half` keeps the change at half the scene size (both
+// calls of a frame agree). False (and FAIL:DEKO9_TAAU_OPAQUE) when it
+// cannot run.
+bool Deko9_TaauOpaque(IDirect3DDevice9 *device, IDirect3DBaseTexture9 *color, const int32_t srcRect[4], bool after,
+                      bool half);
+bool Deko9_TaauResolve(IDirect3DDevice9 *device, IDirect3DBaseTexture9 *color, IDirect3DSurface9 *depth,
+                       const int32_t srcRect[4], IDirect3DSurface9 *dst, const int32_t dstRect[4],
+                       const deko9::TaauFrame *frame);
 // The engine's scene size for the frame being recorded (0x0 = the back
 // buffer): published with the frame's GPU time and printed as render= on
 // the `DEKO9 perf` line.
@@ -301,6 +446,8 @@ bool Deko9_GetGpuFrame(IDirect3DDevice9 *device, float *gpuMs, uint32_t *width, 
 //    a target rendered since the last barrier).
 // Hazards involving the copy or 2D engine always record the full barrier.
 void Deko9_SetBarrierMode(IDirect3DDevice9 *device, uint32_t mode);
+// r_deko9TiledCache: 0 off, 1 = tiled caching (128x128 tiles), 2 = 64x64 tiles.
+void Deko9_SetTiledCache(IDirect3DDevice9 *device, uint32_t mode);
 
 // ---- zcull (r_deko9ZcullStats; deko9_zcull.cpp) --------------------------------
 // Zcull is always on (the queue created at init; deko3d has no
@@ -317,6 +464,9 @@ void Deko9_SetBarrierMode(IDirect3DDevice9 *device, uint32_t mode);
 // each affected pixel shader compiles (or loads from the SD cache) the other
 // variant at its next draw.
 void Deko9_SetShadowFilter(IDirect3DDevice9 *device, uint32_t mode);
+// r_deko9ShaderOpt: DEKO9_SHADER_OPT_* bits (deko9_shader.h) every
+// translation uses; a change drops the baked programs like the filter.
+void Deko9_SetShaderOpt(IDirect3DDevice9 *device, uint32_t mask);
 
 void Deko9_SetZcullStats(IDirect3DDevice9 *device, bool enable);
 // The zcull region model's counters of one pass (Deko9GpuPass) since stats
@@ -336,12 +486,14 @@ bool Deko9_GetZcullPassStats(IDirect3DDevice9 *device, uint32_t pass, Deko9Zcull
 // adaptive GPU sync, end-of-scene fence) waits on frame ids through these
 // calls instead of D3D9 event queries.
 uint32_t Deko9_FramesInFlight();
+// These three never take the device lock, from any thread: they read the
+// frame state the recording thread publishes at each Present.
 // The frame being recorded (frames presented + 1).
 uint64_t Deko9_FrameRecording(IDirect3DDevice9 *device);
 // Whether every GPU command of frame `frame` has completed. Frame 0 is done;
 // a frame not presented yet is not (nothing of it was submitted as a frame).
 bool Deko9_FrameDone(IDirect3DDevice9 *device, uint64_t frame);
-// Sleeps (50 us fence-poll slices, device lock released) until
+// Sleeps (50 us fence-poll slices, no device lock) until
 // Deko9_FrameDone(frame) or `timeoutNs`; returns it. A frame not presented
 // yet returns false at once. Only polls inside a Deko9Batch.
 bool Deko9_WaitFrame(IDirect3DDevice9 *device, uint64_t frame, int64_t timeoutNs);
@@ -362,7 +514,8 @@ struct Deko9Span
 // back end; at most Deko9_FrameRecording() + 1 for a front-end producer).
 // `bytes`/`align` as for a plain allocation (align >= 256 for GPU-visible
 // vertex/index data, matching every other CPU-written buffer in deko9).
-// False on allocation failure; `out` is left untouched.
+// False on allocation failure; `out` is left untouched. Takes the arena's
+// own mutex, not the device lock (except to grow the arena by a chunk).
 bool Deko9_FrameAlloc(IDirect3DDevice9 *device, uint64_t frame, uint32_t bytes, uint32_t align, Deko9Span *out);
 // Re-points a D3D9 vertex/index buffer's storage at `span` (its GPU base
 // changes, offsets into it stay valid): the engine's GfxVertexBufferState/
@@ -473,6 +626,7 @@ struct Deko9Counters
     // Per-draw fast paths (Deko9_SetPerDraw), per-60-frame window like draws:
     // draws that skipped hazard evaluation.
     uint64_t hazardSkips;
+    uint64_t probeExtraDraws; // Deko9_SetDrawProbe split sub-draws
     // Deko9_DrawIndexedRanges calls and the deko3d draws (ranges) they
     // recorded.
     uint64_t rangeCalls, rangeDraws;
@@ -505,16 +659,43 @@ void Deko9_SetDebugName(IDirect3DBaseTexture9 *texture, const char *name);
 
 // ---- GPU-fault black box ---------------------------------
 // r_deko9FaultTrace: interval N > 0 has the GPU report (list, draw) every N
-// draws (dkCmdBufReportValue at CROP), keeps a record of every draw of the
-// last 16 lists (pass, programs, textures with their TIC addresses, render
-// target) and runs a watcher thread: a "DEKO9 gpuhb" heartbeat every 250 ms,
-// and a "DEKO9 blackbox" dump (the draws around the GPU's position plus the
-// last memory events) when the GPU stops mid-list for 20 ms, or at a queue
+// draws twice: once the work before it reached CROP (dkCmdBufReportValue)
+// and once the channel's front end fetched it (a top-of-pipe host
+// semaphore release), plus both at list start and end. It keeps a record
+// of every draw of the last 16 lists (pass, programs, pixel textures with
+// their TIC addresses, targets, draw arguments and buffer addresses;
+// deko9's own full-screen passes as native=<kind>) and runs a watcher
+// thread: a "DEKO9 gpuhb" heartbeat every 250 ms, and a "DEKO9 blackbox"
+// dump (where the GPU stopped and whether the front end or the engine is
+// stuck, each pending list's fence, the newest swapchain acquire fence,
+// the draws around the GPU's position, the last memory events) when the
+// GPU stops mid-list for 20 ms or between lists for 250 ms, or at a queue
 // error. 0 = off. r_deko9GpuMap 1: "DEKO9 gpumap" lines for the static pools
 // and every image created/resized/freed/named (the VA the GPU addresses it
 // through), so offline tooling can name a fault VA. The trace applies at the next
 // Present, the map at once (the engine also sets it right after CreateDevice).
 void Deko9_SetFaultTrace(IDirect3DDevice9 *device, uint32_t interval);
+// The stall watchdog's way to the same dump (any thread, no device lock);
+// does nothing before a device exists.
+void Deko9_BlackBoxDump(const char *reason);
+// Self-test hooks: the two GPU-written crumb cells (CROP, top of pipe; false
+// when the trace is off or the top cell is unavailable), and the newest draw
+// record of the open list.
+bool Deko9_GetFaultTraceCells(IDirect3DDevice9 *device, uint32_t *crop, uint32_t *top);
+struct Deko9DrawRecordInfo
+{
+    uint32_t draw, texCount, count, instances, gpuDraws;
+    uint8_t indexed, native;
+    uint64_t vb0, ib;
+};
+bool Deko9_GetLastDrawRecord(IDirect3DDevice9 *device, Deko9DrawRecordInfo *out);
+// Submits the open list and decodes its command words from draw's top crumb
+// through the next one (r_deko9FaultTrace on); false when they are not found.
+bool Deko9_FaultTraceCommandWindow(IDirect3DDevice9 *device, uint32_t draw, char *out, size_t cap, bool *bad);
+// r_deko9CmdChunkKB: command-memory chunk size in bytes (0 = default 256 KiB,
+// else clamped to 1 KiB..4 MiB), applied at the next Present. Each chunk switch
+// starts a new GPFIFO entry, so small chunks put many into every list.
+void Deko9_SetCmdChunkBytes(IDirect3DDevice9 *device, uint32_t bytes);
 void Deko9_SetGpuMap(IDirect3DDevice9 *device, uint32_t level);
 // Internal hook of Deko9_SetDebugName.
 void Deko9_GpuMapNoteName(IDirect3DBaseTexture9 *texture);

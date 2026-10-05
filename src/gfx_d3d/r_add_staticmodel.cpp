@@ -51,14 +51,12 @@ char __cdecl R_PreTessStaticModelCachedList(
         // r_deko9StaticPretess(Models), r_pretess.h: no copy; the draw side
         // reads the list and draws the surface's zone index range once per
         // instance with the instance's cache slot as base vertex.
-#ifdef __SWITCH__
-        if (SwitchPerf_g_enabled)
+        if (KISAK_PERF_ACTIVE)
         {
             SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_SMODEL_LISTS, 1);
             SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_SMODEL_INST, count);
             SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_SMODEL_STATIC_INST, count);
         }
-#endif
         drawSurf.fields.surfType = SF_STATICMODEL_PRETESS;
         if (R_AllocDrawSurf(delayedCmdBuf, drawSurf, drawSurfList, 3u + ((count + 1) >> 1)))
         {
@@ -74,14 +72,12 @@ char __cdecl R_PreTessStaticModelCachedList(
     preTessIndices = R_AllocPreTessIndices(surfIndexCount * count);
     if (!preTessIndices)
         return 0;
-#ifdef __SWITCH__
-    if (SwitchPerf_g_enabled)
+    if (KISAK_PERF_ACTIVE)
     {
         SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_SMODEL_LISTS, 1);
         SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_SMODEL_INST, count);
         SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_BYTES, 2ull * surfIndexCount * count);
     }
-#endif
 
     {
         PROF_SCOPED("R_memcpy");
@@ -535,9 +531,7 @@ void __cdecl R_SkinStaticModelsCamera(
 {
     uint32_t surfTypeIndex; // [esp+0h] [ebp-4h]
 
-#ifdef __SWITCH__
     SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SMODEL_SKIN);
-#endif
     for (surfTypeIndex = 0; surfTypeIndex < SF_END_STATICMODEL - SF_BEGIN_STATICMODEL; ++surfTypeIndex)
         R_SkinStaticModelsCameraForSurface(
             model,
@@ -1010,9 +1004,7 @@ void __cdecl R_AddAllStaticModelSurfacesSpotShadow(uint32_t spotShadowIndex, uin
     uint32_t v28; // [esp+10B0h] [ebp-8h]
     int surfCount; // [esp+10B4h] [ebp-4h]
 
-#ifdef __SWITCH__
     SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_SMODEL_SPOTSHADOW);
-#endif
     smodelCount = rgp.world->dpvs.smodelCount;
     smodelDrawInsts = rgp.world->dpvs.smodelDrawInsts;
     iassert(rg.lodParms.valid);

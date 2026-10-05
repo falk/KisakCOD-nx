@@ -24,6 +24,9 @@
 #include <universal/q_parse.h>
 #include <database/database.h>
 #include <qcommon/com_playerprofile.h>
+#ifdef __SWITCH__
+#include <port/switch_ui_menus.h>
+#endif
 
 const dvar_t *ui_showList;
 const dvar_t *ui_isSaving;
@@ -74,7 +77,14 @@ void UI_RegisterDvars()
 {
     Dvar_RegisterBool("cg_brass", 1, 1u, 0);
     Dvar_RegisterBool("fx_marks", 1, 1u, 0);
+#ifdef __SWITCH__
+    const bool invertPitch = Dvar_GetBool("input_invertPitch");
+    Dvar_RegisterBool("ui_mousePitch", invertPitch, 0x201u, "Invert controller pitch");
+    // The PC menu field mirrors the pad preference, including imported profiles.
+    Dvar_SetBoolByName("ui_mousePitch", invertPitch);
+#else
     Dvar_RegisterBool("ui_mousePitch", Dvar_GetFloat("m_pitch") < 0.0, 0x201u, "Invert mouse pitch");
+#endif
     ui_smallFont = Dvar_RegisterFloat("ui_smallFont", 0.25, 0.0, 1.0, 0, "Small font scale");
     ui_bigFont = Dvar_RegisterFloat("ui_bigFont", 0.4f, 0.0, 1.0, 0, "Big font scale");
     ui_extraBigFont = Dvar_RegisterFloat("ui_extraBigFont", 0.55f, 0.0, 1.0, 0, "Extra large font scale");
@@ -717,7 +727,7 @@ void __cdecl UI_DrawSaveGameShot(rectDef_s *rect, double scale, float *color)
         }
         if (!imageName || !sshotImage)
             uiInfo.sshotImage = Material_RegisterHandle("unknownsave", IMAGE_TRACK_UI);
-        I_strncpyz(uiInfo.sshotImageName, imageName, 64);
+        I_strncpyz(uiInfo.sshotImageName, imageName ? imageName : "", 64);
     }
     else
     {
@@ -741,7 +751,8 @@ void __cdecl UI_DrawSaveGameName(int localClientNum, rectDef_s *rect, Font_s *fo
 	if (!name || !*name)
 		return;
 
-	UI_DrawWrappedText(&scrPlaceView[localClientNum], name, rect, font, rect->x, rect->y, scale, color, textStyle, ITEM_ALIGN_CENTER, NULL);
+	rectDef_s textRect; // DrawWrappedText always fills it in
+	UI_DrawWrappedText(&scrPlaceView[localClientNum], name, rect, font, rect->x, rect->y, scale, color, textStyle, ITEM_ALIGN_CENTER, &textRect);
 }
 
 void __cdecl UI_DrawGLInfo(int localClientNum, rectDef_s *rect, Font_s *font, float scale, float *color, int textStyle)
@@ -749,7 +760,8 @@ void __cdecl UI_DrawGLInfo(int localClientNum, rectDef_s *rect, Font_s *font, fl
 	char info[1024];
 
     Com_sprintf(info, sizeof(info), "Video: %ux%u @ %.0fHz\nGPU: %s\nCPU: %s %s", cls.vidConfig.displayWidth, cls.vidConfig.displayHeight, cls.vidConfig.displayFrequency, sys_info.gpuDescription, sys_info.cpuVendor, sys_info.cpuName);
-    UI_DrawWrappedText(&scrPlaceView[localClientNum], info, rect, font, rect->x, rect->y, scale, color, textStyle, 0, NULL);
+    rectDef_s textRect; // DrawWrappedText always fills it in
+    UI_DrawWrappedText(&scrPlaceView[localClientNum], info, rect, font, rect->x, rect->y, scale, color, textStyle, 0, &textRect);
 }
 
 void UI_DrawCinematic()
@@ -863,6 +875,11 @@ void __cdecl UI_Update(const char *name)
                 else
                     v4 = 0.022;
                 Dvar_SetFloatByName("m_pitch", v4);
+#ifdef __SWITCH__
+                // Retail PC look menus edit this field; the pad consumes its
+                // own inversion preference rather than the mouse pitch scale.
+                Dvar_SetBoolByName("input_invertPitch", Dvar_GetBool(name));
+#endif
             }
         }
         else
@@ -1077,9 +1094,7 @@ const char *__cdecl UI_FeederItemText(
         switch (column)
         {
         case 0: return slot.savegameName ? slot.savegameName : "";
-        case 1: return slot.mapName      ? slot.mapName      : "";
-        case 2: return slot.date         ? slot.date         : "";
-        case 3: return slot.time         ? slot.time         : "";
+        case 1: return slot.date && slot.time ? va("%s %s", slot.date, slot.time) : "";
         default: return slot.savegameName ? slot.savegameName : "";
         }
     }
@@ -1135,6 +1150,9 @@ void __cdecl UI_FeederSelection(int localClientNum, float feederID, int index)
             return;
         I_strncpyz(uiInfo.savegameName, file, sizeof(uiInfo.savegameName));
         Dvar_SetString((dvar_s *)ui_savegame, (char *)file);
+#ifdef __SWITCH__
+        Switch_UI_FormatSaveInfo(&uiInfo.savegameList[slotIdx], uiInfo.savegameInfo, sizeof(uiInfo.savegameInfo));
+#endif
         return;
     }
 
@@ -1569,6 +1587,12 @@ int __cdecl UI_PopupScriptMenu(const char *menuName, bool useMouse)
     menuDef_t *Focused; // r3
     double v6; // fp0
 
+#ifdef __SWITCH__
+    // PC scripts request mouse popups; Switch uses controller focus and must
+    // not retain an invisible mouse hit region as its selected item.
+    useMouse = false;
+    uiInfo.uiDC.isCursorVisible = false;
+#endif
     Focused = Menu_GetFocused(&uiInfo.uiDC);
     if (!Focused)
         goto LABEL_5;
@@ -1665,6 +1689,9 @@ void UI_LoadModsList()
 
 void __cdecl UI_Refresh()
 {
+#ifdef __SWITCH__
+    Switch_UI_Frame();
+#endif
 #ifdef KISAK_SP
     // A menu opened by the game (PlayerCmd_OpenMenu -> "openmenu" ->
     // UI_OpenMenu_f) never goes through UI_SetActiveMenu, which is where every
@@ -1951,6 +1978,9 @@ void __cdecl UI_LoadSavegames(int /*unused*/)
             uiInfo.savegameList[idx].time = 0;
             uiInfo.savegameList[idx].date = 0;
             memset(&uiInfo.savegameList[idx].tm, 0, sizeof(uiInfo.savegameList[idx].tm));
+#ifdef __SWITCH__
+            Switch_UI_FillSaveInfo(&uiInfo.savegameList[idx], nameBuf);
+#endif
             uiInfo.savegameStatus.displaySavegames[idx] = idx;
         }
         FS_FreeFileList(saveFiles);

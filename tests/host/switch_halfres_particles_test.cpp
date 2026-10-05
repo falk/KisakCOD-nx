@@ -386,8 +386,43 @@ void TestImageScale1()
 
 } // namespace
 
+static void TestAutoGate()
+{
+    hrp::AutoGate g;
+    auto run = [&](uint32_t frames, double ms) {
+        for (uint32_t i = 0; i < frames; ++i)
+            g.Update((uint64_t)(ms * 1e6), 3.5, 2.4);
+    };
+    run(200, 1.0);
+    Check(!g.on, "auto: light load stays off");
+    run(200, 5.0);
+    Check(g.on, "auto: heavy load turns on");
+    run(200, 3.0);
+    Check(g.on, "auto: between thresholds holds on");
+    run(200, 1.5);
+    Check(!g.on, "auto: light off-screen cost turns off");
+    run(200, 3.0);
+    Check(!g.on, "auto: between thresholds holds off");
+    // A short spike inside one window averages out; dwell blocks a re-switch.
+    hrp::AutoGate h;
+    for (uint32_t i = 0; i < 100; ++i)
+        h.Update(i % 30 == 0 ? 40000000 : 1000000, 3.5, 2.4);
+    Check(!h.on, "auto: one spike frame per window does not switch");
+    hrp::AutoGate d;
+    uint32_t switches = 0;
+    bool prev = false;
+    for (uint32_t i = 0; i < 1000; ++i)
+    {
+        const bool now = d.Update((i / 30) % 2 ? 6000000 : 1000000, 3.5, 2.4);
+        switches += now != prev;
+        prev = now;
+    }
+    Check(switches <= 1000 / hrp::AutoGate::kDwell + 1, "auto: dwell bounds the switch rate");
+}
+
 int main()
 {
+    TestAutoGate();
     TestRemap();
     TestClassify();
     TestScheme();

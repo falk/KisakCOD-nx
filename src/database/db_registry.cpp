@@ -1,3 +1,4 @@
+#include <platform/switch/switch_watchdog.h>
 #include <universal/q_shared.h>
 #include "database.h"
 
@@ -2821,7 +2822,9 @@ void __cdecl  DB_Thread(uint32_t threadContext)
     Profile_Guard(1);
     while (1)
     {
+        Watchdog_Crumb(CRUMB_DATABASE, 1);
         Sys_WaitStartDatabase();
+        Watchdog_Crumb(CRUMB_DATABASE, 2);
         DB_TryLoadXFile();
     }
 }
@@ -3196,6 +3199,11 @@ int32_t __cdecl DB_TryLoadXFileInternal(char *zoneName, int32_t zoneFlags)
             // appended to its in-memory delta (deko9_resources.cpp); write
             // that back here -- once per zone load, never per shader, never
             // under the device lock.
+            // Every shader variant this zone's materials can select is
+            // built now, before the level draws (switch_shader_prebake.cpp),
+            // so the pack flush below also carries the prebaked ones.
+            extern void R_PrebakeShaderVariants(const char *zoneName);
+            R_PrebakeShaderVariants(zoneName);
             // A no-op when nothing new compiled.
             extern void Deko9_FlushShaderPack();
             Deko9_FlushShaderPack();

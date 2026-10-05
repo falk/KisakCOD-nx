@@ -152,6 +152,9 @@ void R_SkinXModelCmd(_WORD *data)
             {
                 if (skinnedSurf->skinnedCachedOffset >= 0)
                     skinVertNormalOut = &gfxBuf.skinnedCacheNormalsAddr[skinnedSurf->skinnedCachedOffset >> 5];
+                // Switch SP stores motion history in this union, not a normal
+                // cache offset. Its normals must be computed from this pose.
+#if !defined(__SWITCH__) || !defined(KISAK_SP)
                 // With a cache offset the union holds oldSkinnedCachedOffset:
                 // last frame's byte offset, or negative (0x80000001 + size)
                 // when there is none -- always in SP, where only MP's
@@ -159,9 +162,10 @@ void R_SkinXModelCmd(_WORD *data)
                 // `skinnedVert != NULL` through a pointer cast, which took
                 // the SP sentinel as valid (a wild read once the SIMD path
                 // ran with r_fastSkin) and read the union's stale upper
-                // half on LP64.
-                if (skinnedSurf->oldSkinnedCachedOffset >= 0)
+                // half on LP64. Without a cache offset it holds skinnedVert.
+                if (skinnedSurf->skinnedCachedOffset >= 0 && skinnedSurf->oldSkinnedCachedOffset >= 0)
                     skinVertNormalIn = &gfxBuf.oldSkinnedCacheNormalsAddr[skinnedSurf->oldSkinnedCachedOffset >> 5];
+#endif
             }
             R_SkinXSurfaceSkinnedSse(xsurf, &boneSkelMats[boneIndex], skinVertNormalIn, skinVertNormalOut, skinVerticesOut);
         }
@@ -470,4 +474,3 @@ void __cdecl R_SkinXSurfaceRigid(
 
     iassert(vertex - vertices == totalVertCount);
 }
-

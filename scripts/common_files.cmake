@@ -195,6 +195,12 @@ set(GFX_D3D
     "${SRC_DIR}/gfx_d3d/r_dynres.cpp"
     "${SRC_DIR}/gfx_d3d/r_dynres.h"
     "${SRC_DIR}/gfx_d3d/r_dynres_controller.h"
+    "${SRC_DIR}/gfx_d3d/r_render_scale.h"
+    "${SRC_DIR}/gfx_d3d/r_taau.cpp"
+    "${SRC_DIR}/gfx_d3d/r_taau.h"
+    "${SRC_DIR}/gfx_d3d/r_taau_motion.cpp"
+    "${SRC_DIR}/gfx_d3d/r_taau_motion.h"
+    "${SRC_DIR}/gfx_d3d/r_taau_motion_table.h"
     "${SRC_DIR}/gfx_d3d/rb_floatz_native.cpp"
     "${SRC_DIR}/gfx_d3d/rb_halfres_particles.cpp"
     "${SRC_DIR}/gfx_d3d/rb_halfres_particles.h"
@@ -597,12 +603,18 @@ set(UNIVERSAL
     # and switch_perf's default sink all call into it (seam 13).
     "${SRC_DIR}/platform/switch/switch_port_log.h"
     "${SRC_DIR}/platform/switch/switch_port_log.cpp"
+    "${SRC_DIR}/platform/switch/switch_log_ring.h"
+    "${SRC_DIR}/platform/switch/switch_async_file_writer.h"
+    "${SRC_DIR}/platform/switch/switch_watchdog.h"
+    "${SRC_DIR}/platform/switch/switch_watchdog.cpp"
     # Per-frame CPU phase profiler behind the `switch_perfTrace` dvar (off by
     # default); already platform-neutral (clock_gettime tick source off
     # Switch), so it is compiled for every KISAK_PLATFORM like the two files
     # above it, not just added under the Switch-only block.
     "${SRC_DIR}/port/switch_perf.h"
     "${SRC_DIR}/port/switch_perf.cpp"
+    "${SRC_DIR}/port/switch_save_writer.cpp"
+    "${SRC_DIR}/port/switch_save_writer.h"
     "${SRC_DIR}/universal/com_shared.cpp"
     "${SRC_DIR}/universal/com_sndalias.cpp"
     "${SRC_DIR}/universal/com_sndalias.h"

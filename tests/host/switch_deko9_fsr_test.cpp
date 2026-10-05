@@ -14,6 +14,7 @@
 #include "src/deko9/deko9_fsr.h"
 #include "src/deko9/deko9_fsr_reference.h"
 #include "src/deko9/deko9_shader.h"
+#include "src/deko9/deko9_taau.h"
 
 #include <cmath>
 #include <cstdio>
@@ -30,6 +31,20 @@ void Check(bool ok, const char *what, const char *detail = "")
     std::printf("%s:DEKO9_FSR_%s %s\n", ok ? "PASS" : "FAIL", what, detail);
     if (!ok)
         ++g_failures;
+}
+
+// Reconvergence-stack ops of the programs that still branch per pixel: SGSR's
+// edge-direction tests, the gather probe, and the TAAU resolve's flat-2x2 and
+// history-validity skips (performance branches).
+uint32_t KnownDivergentOps(const char *name)
+{
+    if (!std::strncmp(name, "COMPILE_SGSR", 12))
+        return 3;
+    if (!std::strcmp(name, "COMPILE_GATHER_PROBE"))
+        return 5;
+    if (!std::strncmp(name, "COMPILE_TAAU_RESOLVE", 20))
+        return 6;
+    return 0;
 }
 
 using deko9::fsrref::Image;
@@ -149,6 +164,12 @@ int main()
     const std::string rcasRect = deko9::SourceRectVariant(deko9::kBilinearRcasGlsl);
     const std::string bilinearRect = deko9::SourceRectVariant(deko9::kBilinearGlsl);
     Check(sgsrRect.find("#version 460\n#define DEKO9_SOURCE_RECT 1\n") == 0, "SOURCE_RECT_VARIANT_TEXT");
+    const std::string taauResolve[4] = {
+        deko9::TaauVariant(deko9::kTaauResolveGlsl, 0),
+        deko9::TaauVariant(deko9::kTaauResolveGlsl, deko9::kTaauBilinearHistory),
+        deko9::TaauVariant(deko9::kTaauResolveGlsl, deko9::kTaauBilinearCurrent),
+        deko9::TaauVariant(deko9::kTaauResolveGlsl, deko9::kTaauBilinearHistory | deko9::kTaauBilinearCurrent)};
+    const std::string taauReactiveHalf = deko9::TaauVariant(deko9::kTaauOpaqueGlsl, deko9::kTaauHalfReactive);
     struct
     {
         const char *name;
@@ -164,7 +185,15 @@ int main()
                     {"COMPILE_GATHER_PROBE", DEKO9_STAGE_PIXEL, deko9::kGatherProbeGlsl},
                     {"COMPILE_FLOATZ", DEKO9_STAGE_PIXEL, deko9::kFloatZGlsl},
                     {"COMPILE_HRP_DEPTH", DEKO9_STAGE_PIXEL, deko9::kHrpDepthGlsl},
-                    {"COMPILE_HRP_COMPOSITE", DEKO9_STAGE_PIXEL, deko9::kHrpCompositeGlsl}};
+                    {"COMPILE_HRP_COMPOSITE", DEKO9_STAGE_PIXEL, deko9::kHrpCompositeGlsl},
+                    {"COMPILE_TAAU_RESOLVE", DEKO9_STAGE_PIXEL, taauResolve[0].c_str()},
+                    {"COMPILE_TAAU_RESOLVE_BH", DEKO9_STAGE_PIXEL, taauResolve[1].c_str()},
+                    {"COMPILE_TAAU_RESOLVE_BC", DEKO9_STAGE_PIXEL, taauResolve[2].c_str()},
+                    {"COMPILE_TAAU_RESOLVE_BHBC", DEKO9_STAGE_PIXEL, taauResolve[3].c_str()},
+                    {"COMPILE_TAAU_REACTIVE", DEKO9_STAGE_PIXEL, deko9::kTaauOpaqueGlsl},
+                    {"COMPILE_TAAU_REACTIVE_HALF", DEKO9_STAGE_PIXEL, taauReactiveHalf.c_str()},
+                    {"COMPILE_TAAU_MOTION_VS", DEKO9_STAGE_VERTEX, deko9::kTaauMotionVertexGlsl},
+                    {"COMPILE_TAAU_MOTION_PS", DEKO9_STAGE_PIXEL, deko9::kTaauMotionFragmentGlsl}};
     for (const auto &program : programs)
     {
         std::vector<uint8_t> dksh;
@@ -195,6 +224,34 @@ int main()
         char name[64];
         std::snprintf(name, sizeof(name), "CBUF_SLOTS_%s", program.name + 8);
         Check(scanned && scan.instructions > 0 && unbound == 0, name, detail);
+        // Every native full-screen program runs per-pixel selections only:
+        // no reconvergence-stack control flow (SSY/SYNC/PBK/BRK), which a
+        // pixel-divergent branch needs (the branchy composite gave wrong,
+        // varying output on Maxwell).
+        if (scanned)
+        {
+            const uint8_t *code = dksh.data() + hdr[2] + scan.entrypoint + 0x50;
+            const size_t words = (scan.codeSize - scan.entrypoint - 0x50) / 8;
+            uint32_t stack = 0;
+            for (size_t i = 0; i < words; ++i)
+            {
+                if (i % 4 == 0)
+                    continue; // scheduling control word
+                uint64_t w;
+                std::memcpy(&w, code + i * 8, 8);
+                const uint32_t op = (uint32_t)(w >> 52);
+                stack += op == 0xe29 || op == 0xf0f || op == 0xe2a || op == 0xe34;
+            }
+            std::snprintf(detail, sizeof(detail), "reconvergence_ops=%u", stack);
+            std::snprintf(name, sizeof(name), "NO_DIVERGENCE_%s", program.name + 8);
+            // Programs with a known pixel-divergent branch are pinned to
+            // their current count: they fail when it changes, so a fix or a
+            // new branch is noticed.
+            const uint32_t expected = KnownDivergentOps(program.name);
+            if (expected)
+                std::snprintf(name, sizeof(name), "KNOWN_DIVERGENCE_%s", program.name + 8);
+            Check(stack == expected, name, detail);
+        }
     }
 
     // 2. Constants (960x540 -> 1280x720).

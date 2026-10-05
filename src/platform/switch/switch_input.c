@@ -14,10 +14,10 @@ typedef struct
 
 static const SwitchInputBinding switch_input_menu_bindings[] =
 {
-    { SWITCH_INPUT_BUTTON_UP, SWITCH_INPUT_K_UPARROW, 0 },
-    { SWITCH_INPUT_BUTTON_DOWN, SWITCH_INPUT_K_DOWNARROW, 0 },
-    { SWITCH_INPUT_BUTTON_LEFT, SWITCH_INPUT_K_LEFTARROW, 0 },
-    { SWITCH_INPUT_BUTTON_RIGHT, SWITCH_INPUT_K_RIGHTARROW, 0 },
+    { SWITCH_INPUT_BUTTON_UP, SWITCH_INPUT_K_UPARROW, 1 },
+    { SWITCH_INPUT_BUTTON_DOWN, SWITCH_INPUT_K_DOWNARROW, 1 },
+    { SWITCH_INPUT_BUTTON_LEFT, SWITCH_INPUT_K_LEFTARROW, 1 },
+    { SWITCH_INPUT_BUTTON_RIGHT, SWITCH_INPUT_K_RIGHTARROW, 1 },
     { SWITCH_INPUT_BUTTON_A, SWITCH_INPUT_K_ENTER, 1 },
     { SWITCH_INPUT_BUTTON_B, SWITCH_INPUT_K_ESCAPE, 1 },
     /* + is the in-game pause key (the same K_ESCAPE the retail client
@@ -265,14 +265,14 @@ void Switch_InputFrame(SwitchInputState *state, SwitchInputEventSink sink, void 
 
 /* Keep in step with the gameplay block of CL_SwitchPadMove (cl_input.cpp):
  * only commands whose effect that button really reproduces are listed
- * (e.g. +melee_breath / +breath_sprint are not: R/L stick set only the melee
- * and sprint bits, not the hold-breath one). */
+ * (e.g. +melee_breath is not: R stick sets only the melee bit). */
 static const struct
 {
     const char *command;
     uint64_t button;
 } s_switchPadCommands[] = {
     { "+attack", SWITCH_INPUT_BUTTON_ZR },
+    { "+speed", SWITCH_INPUT_BUTTON_ZL },
     { "+speed_throw", SWITCH_INPUT_BUTTON_ZL },
     { "+toggleads_throw", SWITCH_INPUT_BUTTON_ZL },
     { "toggleads", SWITCH_INPUT_BUTTON_ZL },
@@ -289,9 +289,16 @@ static const struct
     { "+reload", SWITCH_INPUT_BUTTON_Y },
     { "weapnext", SWITCH_INPUT_BUTTON_X },
     { "+frag", SWITCH_INPUT_BUTTON_R },
+    { "+throw", SWITCH_INPUT_BUTTON_R },
     { "+smoke", SWITCH_INPUT_BUTTON_L },
     { "+melee", SWITCH_INPUT_BUTTON_STICKR },
     { "+sprint", SWITCH_INPUT_BUTTON_STICKL },
+    { "+breath_sprint", SWITCH_INPUT_BUTTON_STICKL },
+    { "+actionslot 1", SWITCH_INPUT_BUTTON_UP },
+    { "+actionslot 2", SWITCH_INPUT_BUTTON_DOWN },
+    { "+actionslot 3", SWITCH_INPUT_BUTTON_LEFT },
+    { "+actionslot 4", SWITCH_INPUT_BUTTON_RIGHT },
+    { "+scores", SWITCH_INPUT_BUTTON_MINUS },
     { "togglemenu", SWITCH_INPUT_BUTTON_PLUS },
 };
 
@@ -348,4 +355,22 @@ const char *Switch_InputPadButtonName(uint64_t button)
     case SWITCH_INPUT_BUTTON_DOWN: return "Down";
     default: return NULL;
     }
+}
+
+const char *Switch_InputPadBindingName(const char *command)
+{
+    if (command == NULL)
+        return NULL;
+    /* Movement is an axis, not a digital button or a keyboard assignment. */
+    if (Switch_InputCommandEqual(command, "+forward")
+        || Switch_InputCommandEqual(command, "+back")
+        || Switch_InputCommandEqual(command, "+moveleft")
+        || Switch_InputCommandEqual(command, "+moveright"))
+        return "L Stick";
+    if (Switch_InputCommandEqual(command, "+left")
+        || Switch_InputCommandEqual(command, "+right")
+        || Switch_InputCommandEqual(command, "+lookup")
+        || Switch_InputCommandEqual(command, "+lookdown"))
+        return "R Stick";
+    return Switch_InputPadButtonName(Switch_InputPadButtonForCommand(command));
 }

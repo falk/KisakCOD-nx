@@ -2674,7 +2674,7 @@ void __cdecl CG_FireWeapon(
             // turret use -- see the playerUsingTurret assignment above).
 #if defined(__SWITCH__)
             if (isPlayer)
-                Switch_RumbleNotifyWeaponFire((int32_t)weaponDef->weapClass);
+                Switch_RumbleNotifyWeaponFire((int32_t)weaponDef->weapClass, weaponDef->bBoltAction ? 1 : 0);
 #endif
 #endif
         }

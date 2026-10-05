@@ -482,7 +482,7 @@ void SCR_UpdateFrame()
             Com_Printf(16,
                 "PERF_RENDER begin=%.1f scene=%.1f ui=%.1f end=%.1f issue=%.1f "
                 "surfs_camera=%ld surfs_shadow=%ld surfs_bsp=%ld surfs_smodel=%ld surfs_ent=%ld "
-                "draws_cam=%d(world=%d smc=%d smr=%d xm=%d bm=%d fx=%d hud=%d) draws_shadow=%d(smc=%d smr=%d) tris=%ld\n",
+                "draws_cam=%d(world=%d smc=%d smr=%d xm=%d bm=%d fx=%d hud=%d) draws_shadow=%d(smc=%d smr=%d) tris=%ld sm=%d\n",
                 (double)begin_sum * inv_frames,
                 (double)scene_sum * inv_frames,
                 (double)ui_sum * inv_frames,
@@ -495,7 +495,10 @@ void SCR_UpdateFrame()
                 drawsCam[GFX_PRIM_STATS_BMODEL], drawsCam[GFX_PRIM_STATS_FX],
                 drawsCam[GFX_PRIM_STATS_HUD],
                 drawsShadowTotal, drawsShadow[GFX_PRIM_STATS_SMODELCACHED],
-                drawsShadow[GFX_PRIM_STATS_SMODELRIGID], trisTotal);
+                drawsShadow[GFX_PRIM_STATS_SMODELRIGID], trisTotal,
+                // sm_enable is archived: a run with surfs_shadow=0 shows here
+                // whether shadow maps were simply switched off.
+                (int)R_GetAllowShadowMaps());
             report_begin = perf_after_issue;
             frames = 0;
             begin_sum = scene_sum = ui_sum = end_sum = issue_sum = 0;

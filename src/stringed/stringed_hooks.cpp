@@ -330,7 +330,8 @@ int __cdecl SEH_GetLocalizedTokenReference(
             return 0;
     }
 
-    strcpy(token, translation);
+    // Single-character labels and untranslated tokens can alias the output.
+    memmove(token, translation, strlen(translation) + 1);
     
     return 1;
 }

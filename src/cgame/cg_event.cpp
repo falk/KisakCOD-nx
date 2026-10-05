@@ -182,6 +182,9 @@ void __cdecl CG_EntityEvent(int32_t localClientNum, centity_s *cent, int32_t eve
                 CG_PlayEntitySoundAlias(localClientNum, ent->number, *(&cgMedia.landSound[event - EV_LANDING_FIRST] + offset));
             if (clientNum == cgameGlob->predictedPlayerState.clientNum)
             {
+#if defined(__SWITCH__)
+                Switch_RumbleNotifyLand(0);
+#endif
                 cgameGlob->landChange = 0.0 - (double)eventParm;
                 cgameGlob->landTime = cgameGlob->time;
             }
@@ -195,6 +198,9 @@ void __cdecl CG_EntityEvent(int32_t localClientNum, centity_s *cent, int32_t eve
             CG_PlayEntitySoundAlias(localClientNum, ent->number, cgMedia.landDmgSound);
             if (clientNum == cgameGlob->predictedPlayerState.clientNum)
             {
+#if defined(__SWITCH__)
+                Switch_RumbleNotifyLand(1);
+#endif
                 fallHeight = (double)eventParm
                     * 0.009999999776482582
                     * (bg_fallDamageMaxHeight->current.value - bg_fallDamageMinHeight->current.value)
@@ -424,6 +430,10 @@ void __cdecl CG_EntityEvent(int32_t localClientNum, centity_s *cent, int32_t eve
                     CG_SetEquippedOffHand(localClientNum, ent->eventParm);
                 return;
             case EV_MELEE_HIT:
+#if defined(__SWITCH__)
+                if (isPlayerView)
+                    Switch_RumbleNotifyMelee();
+#endif
                 if (ent->eventParm)
                 {
                     CG_PlayEntitySoundAlias(localClientNum, ent->otherEntityNum, cgMedia.meleeKnifeHit);

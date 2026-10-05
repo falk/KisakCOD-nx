@@ -1180,6 +1180,57 @@ void RunTests()
     }
     Deko9_SetBarrierMode(g_device, 0);
 
+    // Tiled caching (r_deko9TiledCache 1/2) must render exactly like off: many
+    // overlapping translucent layers (blend read-modify-write on every pixel),
+    // with a render-to-texture sampled in the middle of the list.
+    {
+        static uint32_t ref[kSize * kSize], got[kSize * kSize];
+        for (uint32_t mode = 0; mode <= 2; ++mode)
+        {
+            Deko9_SetTiledCache(g_device, mode);
+            g_device->Present(nullptr, nullptr, nullptr, nullptr); // the mode applies at the next list
+            BeginPass();
+            g_device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+            g_device->SetPixelShader(g_psColor);
+            g_device->SetRenderTarget(0, rttSurface);
+            g_device->Clear(0, nullptr, D3DCLEAR_TARGET, green, 1.0f, 0);
+            SetColor(0, 0, 1, 1);
+            DrawQuad(-1, -0.5f, 1, -1);
+            g_device->SetRenderTarget(0, g_targetSurface);
+            g_device->Clear(0, nullptr, D3DCLEAR_TARGET, black, 1.0f, 0);
+            g_device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+            g_device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+            g_device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+            for (int layer = 0; layer < 24; ++layer)
+            {
+                const float t = (float)layer / 24.0f;
+                SetColor(t, 1.0f - t, 0.5f, 0.2f + 0.02f * (float)(layer % 7));
+                DrawQuad(-1.0f + 0.05f * (float)(layer % 9), 1.0f - 0.04f * (float)(layer % 5),
+                         0.2f + 0.04f * (float)(layer % 11), -1.0f + 0.03f * (float)(layer % 13));
+                if (layer == 11)
+                {
+                    g_device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+                    g_device->SetPixelShader(g_psTexture);
+                    g_device->SetTexture(0, rtt);
+                    DrawQuad(0.5f, 1, 1, 0);
+                    g_device->SetTexture(0, nullptr);
+                    g_device->SetPixelShader(g_psColor);
+                    g_device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+                }
+            }
+            g_device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+            Read(mode ? got : ref);
+            if (mode)
+            {
+                char detail[64];
+                std::snprintf(detail, sizeof(detail), "mode=%u", mode);
+                Check(!std::memcmp(ref, got, sizeof(ref)), "TILED_CACHE_IDENTICAL", detail);
+            }
+        }
+        Deko9_SetTiledCache(g_device, 0);
+        g_device->Present(nullptr, nullptr, nullptr, nullptr);
+    }
+
     // Zcull (r_deko9ZcullStats; deko9_zcull.cpp; zcull itself is always on,
     // no toggle). The region model: a full depth clear makes the region
     // valid for the pass's depth-tested draws; binding another depth surface
@@ -1305,14 +1356,14 @@ void RunTests()
         Deko9_GpuMarker(g_device, Deko9GpuPass_PointLights);
         Deko9_CensusLight(g_device, 0, 2);
         Deko9_CensusLight(g_device, 1, 0);
-        Deko9_CensusLabel(g_device, "selftest_light", "light_tech", "ps_color", g_psColor);
+        Deko9_CensusLabel(g_device, "selftest_light", "light_tech", "ps_color", "vs_quad", g_psColor);
         SetColor(1, 0, 0, 1);
         DrawQuad(-0.1f, 0.1f, 0.1f, -0.1f); // covered by the hud quad below
         Deko9_CensusLight(g_device, 0, 0);
         if (censusVb && censusIb)
         {
             Deko9_GpuMarker(g_device, Deko9GpuPass_Decal);
-            Deko9_CensusLabel(g_device, "selftest_ranges", "ranges_tech", "ps_color", g_psColor);
+            Deko9_CensusLabel(g_device, "selftest_ranges", "ranges_tech", "ps_color", "vs_quad", g_psColor);
             g_device->SetStreamSource(0, censusVb, 0, sizeof(Vertex));
             g_device->SetIndices(censusIb);
             SetColor(0, 1, 0, 1);
@@ -1322,7 +1373,7 @@ void RunTests()
             g_device->SetIndices(nullptr);
         }
         Deko9_GpuMarker(g_device, Deko9GpuPass_Hud2D);
-        Deko9_CensusLabel(g_device, "selftest_quad", "hud_tech", "ps_color", g_psColor);
+        Deko9_CensusLabel(g_device, "selftest_quad", "hud_tech", "ps_color", "vs_quad", g_psColor);
         SetColor(1, 1, 1, 1);
         DrawQuad(-0.5f, 0.5f, 0.5f, -0.5f);
         presented = SUCCEEDED(g_device->Present(nullptr, nullptr, nullptr, nullptr));
@@ -2059,6 +2110,7 @@ void RunHrpTests()
     DrawLayers(false, kN, kN);
     std::vector<Rgba> direct;
     Check(ReadColor(sceneASurf, sysColor, &direct), "HRP_DIRECT_READ");
+    std::vector<Rgba> halfNearest; // factor 2, nearest-depth upsample: HRP_FULL_SYNC's reference
 
     for (int factor = 1; factor <= 2; ++factor)
     {
@@ -2141,6 +2193,8 @@ void RunHrpTests()
             std::snprintf(detail, sizeof(detail), "max_lsb=%d at (%d,%d) vs_direct_max_lsb=%d", lsb, where % (int)kN,
                           where / (int)kN, vsDirect);
             Check(read && lsb <= 4, mode ? "HRP_HALF_REF_NEAREST" : "HRP_HALF_REF_BILINEAR", detail);
+            if (mode == 1 && read)
+                halfNearest = got;
         }
     }
     uint64_t depthPasses = 0, composites = 0;
@@ -2186,6 +2240,29 @@ void RunHrpTests()
             if (object)
                 object->Release();
         }
+    }
+    // r_halfResParticlesDebug 16: full barriers around a composite record
+    // one barrier each and leave its pixels exactly as without them.
+    {
+        g_device->SetRenderTarget(0, sceneBSurf);
+        g_device->SetDepthStencilSurface(nullptr);
+        g_device->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_COLORVALUE(kBase[0], kBase[1], kBase[2], kBase[3]), 1.0f,
+                        0);
+        deko9::hrpref::CompositeConstants c;
+        const int origin[2] = {0, 0}, view[2] = {(int)kN, (int)kN}, off[2] = {(int)kN / 2, (int)kN / 2};
+        deko9::hrpref::CompositeSetup(&c, origin, view, off, 1, 0.1f);
+        const int32_t dstRect[4] = {0, 0, (int32_t)kN, (int32_t)kN};
+        const uint64_t before = Deko9_GetParticleFullBarriers(g_device);
+        Deko9_ParticleFullBarrier(g_device);
+        const bool composed = Deko9_ParticleComposite(g_device, hrColor, hrZ, fullZ, sceneBSurf, dstRect, &c);
+        Deko9_ParticleFullBarrier(g_device);
+        const uint64_t recorded = Deko9_GetParticleFullBarriers(g_device) - before;
+        std::vector<Rgba> got;
+        const bool read = composed && ReadColor(sceneBSurf, sysColor, &got);
+        int where = 0;
+        const int lsb = read && halfNearest.size() == got.size() ? MaxLsb(got, halfNearest, &where) : 99;
+        std::snprintf(detail, sizeof(detail), "barriers=%llu max_lsb=%d", (unsigned long long)recorded, lsb);
+        Check(recorded == 2 && lsb == 0, "HRP_FULL_SYNC", detail);
     }
     g_device->SetRenderTarget(0, g_targetSurface);
     g_device->SetDepthStencilSurface(nullptr);
@@ -2447,8 +2524,10 @@ void RunPerDrawTests()
         uint32_t px[kSize * kSize];
         uint64_t hazardSkips, verified, mismatches;
     };
+    uint32_t probeFlags = 0, probeSplit = 1;
     const auto scene = [&](uint32_t flags, Result *r) {
         Deko9_SetPerDraw(g_device, flags);
+        Deko9_SetDrawProbe(g_device, probeFlags, probeSplit);
         Deko9_SetVerify(g_device, true);
         fill(texA, red);
         fill(texB, green);
@@ -2567,6 +2646,46 @@ void RunPerDrawTests()
     std::snprintf(detail, sizeof(detail), "band3 off=%08x on=%08x (want %08x)", (unsigned)off.px[36 * kSize + 32],
                   (unsigned)on.px[36 * kSize + 32], (unsigned)red);
     Check(Near(off.px[36 * kSize + 32], red) && Near(on.px[36 * kSize + 32], red), "PERDRAW_REUPLOAD_ORDER", detail);
+    // GPU per-draw probe (Deko9_SetDrawProbe): split draws and forced
+    // re-binds change the draw count, never the pixels.
+    const struct
+    {
+        uint32_t flags, split;
+        const char *name;
+    } kProbes[] = {{0, 2, "SPLIT2"}, {0, 3, "SPLIT3"}, {DEKO9_PROBE_SUBCONSTS, 2, "SPLIT2_SUBCONSTS"},
+                   {DEKO9_PROBE_CONSTS | DEKO9_PROBE_TEXTURES | DEKO9_PROBE_STREAMS, 1, "REBIND_ALL"},
+                   {15, 2, "ALL"}};
+    for (const auto &probe : kProbes)
+    {
+        probeFlags = probe.flags;
+        probeSplit = probe.split;
+        scene(kAllPerDraw, &single);
+        uint32_t d = 0;
+        for (uint32_t i = 0; i < kSize * kSize; ++i)
+            d += off.px[i] != single.px[i];
+        char name[64];
+        std::snprintf(name, sizeof(name), "DRAWPROBE_PIXELS_IDENTICAL_%s", probe.name);
+        std::snprintf(detail, sizeof(detail), "differing=%u of %u mismatches=%llu", (unsigned)d,
+                      (unsigned)(kSize * kSize), (unsigned long long)single.mismatches);
+        Check(d == 0 && single.mismatches == 0, name, detail);
+    }
+    {
+        // The split really issues more draws.
+        Deko9Counters c0{}, c1{};
+        probeFlags = 0;
+        probeSplit = 2;
+        Deko9_SetDrawProbe(g_device, 0, 2);
+        Deko9_GetCounters(g_device, &c0);
+        g_device->SetStreamSource(0, vb, 0, sizeof(Vertex));
+        g_device->SetPixelShader(g_psColor);
+        g_device->DrawPrimitive(D3DPT_TRIANGLELIST, 0, 2);
+        Deko9_GetCounters(g_device, &c1);
+        Deko9_SetDrawProbe(g_device, 0, 1);
+        g_device->SetStreamSource(0, nullptr, 0, 0);
+        std::snprintf(detail, sizeof(detail), "extra=%llu", (unsigned long long)c1.probeExtraDraws - c0.probeExtraDraws);
+        Check(c1.probeExtraDraws - c0.probeExtraDraws == 1, "DRAWPROBE_SPLIT_COUNTS", detail);
+    }
+    Deko9_SetDrawProbe(g_device, 0, 1);
     Deko9_SetPerDraw(g_device, kAllPerDraw);
     g_device->SetTexture(0, nullptr);
     vb->Release();
@@ -2885,6 +3004,102 @@ void RunMoveTests()
     a->Release();
     b->Release();
     small->Release();
+}
+
+// r_deko9FaultTrace: the GPU writes both crumb cells (the top-of-pipe one is
+// deko3d's host semaphore release with the crumb patched in as payload), and
+// the draw record carries the pixel textures and the draw's arguments.
+void RunFaultTraceTests()
+{
+    Deko9_SetFaultTrace(g_device, 1);
+    g_device->Present(nullptr, nullptr, nullptr, nullptr); // the trace applies at Present
+    uint32_t crop = 0, top = 0;
+    Check(Deko9_GetFaultTraceCells(g_device, &crop, &top), "FAULT_TRACE_ON");
+    IDirect3DTexture9 *texture = nullptr;
+    D3DLOCKED_RECT locked;
+    const bool made = SUCCEEDED(g_device->CreateTexture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &texture,
+                                                        nullptr)) &&
+                      SUCCEEDED(texture->LockRect(0, &locked, nullptr, 0));
+    Check(made, "FAULT_TRACE_SETUP");
+    if (!made)
+        return;
+    for (UINT y = 0; y < 4; ++y)
+        std::memset(static_cast<uint8_t *>(locked.pBits) + y * locked.Pitch, 0xff, 16);
+    texture->UnlockRect(0);
+    BeginPass();
+    g_device->SetPixelShader(g_psTexture);
+    g_device->SetTexture(0, texture);
+    DrawQuad(-1, 1, 1, -1);
+    Deko9DrawRecordInfo info{};
+    const bool recorded = Deko9_GetLastDrawRecord(g_device, &info);
+    char detail[160];
+    std::snprintf(detail, sizeof(detail), "tex=%u count=%u inst=%u indexed=%u native=%u vb0=%llx", info.texCount,
+                  info.count, info.instances, (unsigned)info.indexed, (unsigned)info.native,
+                  (unsigned long long)info.vb0);
+    Check(recorded && info.texCount == 1 && info.count == 6 && info.instances == 1 && !info.indexed &&
+              !info.native && info.vb0,
+          "FAULT_TRACE_DRAW_RECORD", detail);
+    // The black box's command window on a real deko3d stream: the draw's
+    // top crumb is found in the submitted list and every header decodes.
+    char window[1024] = "";
+    bool bad = true;
+    const bool found = Deko9_FaultTraceCommandWindow(g_device, info.draw, window, sizeof(window), &bad);
+    Check(found && !bad && window[0] == 's', "FAULT_TRACE_COMMAND_WINDOW", window);
+    uint32_t px[kSize * kSize];
+    Read(px); // waits for the list, whose end both cells then hold
+    ExpectPixels("FAULT_TRACE_DRAW", px, {{P(8, 8), 0xffffffff}, {P(56, 56), 0xffffffff}});
+    const bool cells = Deko9_GetFaultTraceCells(g_device, &crop, &top);
+    std::snprintf(detail, sizeof(detail), "crop=%08x top=%08x", (unsigned)crop, (unsigned)top);
+    Check(cells && crop == top && (crop & 0xffff) == 0xffff, "FAULT_TRACE_CELLS", detail);
+    g_device->SetTexture(0, nullptr);
+    texture->Release();
+}
+
+// Tiny command-memory chunks: every list crosses many GPFIFO entry switches
+// (each chunk switch starts a new entry). The GPU must finish every list, the
+// image must be the last draw's, and the black box must decode a draw's words
+// across a switch from the list's recorded segments.
+void RunCmdChunkTests()
+{
+    Deko9_SetCmdChunkBytes(g_device, 1024);
+    g_device->Present(nullptr, nullptr, nullptr, nullptr); // applies at Present
+    BeginPass();
+    g_device->SetPixelShader(g_psColor);
+    constexpr uint32_t kLists = 48;
+    uint32_t windows = 0, bad = 0, crossed = 0;
+    char window[2048], detail[200] = "";
+    for (uint32_t list = 1; list <= kLists; ++list)
+    {
+        g_device->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff000000, 1.0f, 0);
+        for (uint32_t d = 0; d < list; ++d)
+        {
+            SetColor((d & 1) ? 1.0f : 0.0f, 0, 1, 1);
+            DrawQuad(-1, 1, 1, -1);
+        }
+        Deko9DrawRecordInfo info{};
+        bool isBad = true;
+        if (!Deko9_GetLastDrawRecord(g_device, &info) ||
+            !Deko9_FaultTraceCommandWindow(g_device, info.draw, window, sizeof(window), &isBad))
+            continue;
+        ++windows;
+        bad += isBad ? 1 : 0;
+        const char *at = std::strstr(window, "|seg ");
+        if (at && !crossed++)
+            std::snprintf(detail, sizeof(detail), "%.180s", at - std::min<ptrdiff_t>(at - window, 60));
+    }
+    char counts[64];
+    std::snprintf(counts, sizeof(counts), "windows=%u bad=%u crossed=%u", windows, bad, crossed);
+    Check(windows == kLists && !bad, "CMD_CHUNK_WINDOWS", counts);
+    Check(crossed > 0, "CMD_CHUNK_SWITCH_DECODED", detail);
+    uint32_t px[kSize * kSize];
+    Read(px);
+    ExpectPixels("CMD_CHUNK_DRAW", px, {{P(8, 8), 0xffff00ff}, {P(56, 56), 0xffff00ff}});
+    uint32_t crop = 0, top = 0;
+    const bool cells = Deko9_GetFaultTraceCells(g_device, &crop, &top);
+    std::snprintf(counts, sizeof(counts), "crop=%08x top=%08x", (unsigned)crop, (unsigned)top);
+    Check(cells && crop == top && (crop & 0xffff) == 0xffff, "CMD_CHUNK_CELLS", counts);
+    Deko9_SetCmdChunkBytes(g_device, 0);
+    g_device->Present(nullptr, nullptr, nullptr, nullptr);
 }
 
 void RunDirtyBoxTests()
@@ -3635,7 +3850,201 @@ void RunDynResTests(IDirect3D9 *d3d, HWND window, bool timing)
     device->Release();
 }
 
+// Block-compressed upload + sample round trip across size classes. Every 4x4
+// block is a solid colour keyed by its block coordinates, so a layout or
+// pitch mismatch for one size class shows as misplaced or missing blocks.
+void RunBlockTextureTests()
+{
+    struct Case
+    {
+        UINT w, h;
+        D3DFORMAT format;
+        const char *name;
+    };
+    const Case cases[] = {
+        {128, 32, D3DFMT_DXT5, "BC3_128x32"}, {128, 64, D3DFMT_DXT5, "BC3_128x64"},
+        {64, 64, D3DFMT_DXT5, "BC3_64x64"},   {256, 64, D3DFMT_DXT5, "BC3_256x64"},
+        {128, 16, D3DFMT_DXT5, "BC3_128x16"}, {256, 128, D3DFMT_DXT5, "BC3_256x128"},
+        {64, 32, D3DFMT_DXT5, "BC3_64x32"},   {256, 32, D3DFMT_DXT5, "BC3_256x32"},
+        {32, 32, D3DFMT_DXT5, "BC3_32x32"},   {128, 24, D3DFMT_DXT5, "BC3_128x24"},
+        {128, 48, D3DFMT_DXT5, "BC3_128x48"}, {512, 32, D3DFMT_DXT5, "BC3_512x32"},
+        {64, 128, D3DFMT_DXT5, "BC3_64x128"}, {128, 32, D3DFMT_DXT1, "BC1_128x32"}, {128, 32, D3DFMT_DXT3, "BC2_128x32"},
+    };
+    for (const Case &c : cases)
+    {
+        const UINT bytes = c.format == D3DFMT_DXT1 ? 8 : 16;
+        const UINT bw = c.w / 4, bh = c.h / 4;
+        IDirect3DTexture9 *tex = nullptr;
+        D3DLOCKED_RECT locked;
+        const bool made = SUCCEEDED(g_device->CreateTexture(c.w, c.h, 1, 0, c.format, D3DPOOL_MANAGED, &tex, nullptr)) &&
+                          SUCCEEDED(tex->LockRect(0, &locked, nullptr, 0));
+        if (!made)
+        {
+            Check(false, c.name, "create/lock failed");
+            continue;
+        }
+        auto r5 = [](UINT bx) { return bx & 31; };
+        auto g6 = [](UINT by) { return (by * 4 + 1) & 63; };
+        for (UINT by = 0; by < bh; ++by)
+        {
+            for (UINT bx = 0; bx < bw; ++bx)
+            {
+                uint8_t *blk = static_cast<uint8_t *>(locked.pBits) + by * locked.Pitch + bx * bytes;
+                std::memset(blk, 0, bytes);
+                uint8_t *color = blk + (bytes - 8);
+                if (c.format == D3DFMT_DXT5)
+                    blk[0] = blk[1] = 255;
+                else if (c.format == D3DFMT_DXT3)
+                    std::memset(blk, 0xff, 8);
+                const uint16_t c565 = (uint16_t)(r5(bx) << 11 | g6(by) << 5 | 0x1f);
+                color[0] = color[2] = (uint8_t)(c565 & 0xff);
+                color[1] = color[3] = (uint8_t)(c565 >> 8);
+            }
+        }
+        tex->UnlockRect(0);
+        bool ok = true;
+        char detail[96] = "";
+        for (UINT wy = 0; wy * kSize < c.h && ok; ++wy)
+        {
+            for (UINT wx = 0; wx * kSize < c.w && ok; ++wx)
+            {
+                const UINT pw = std::min<UINT>(kSize, c.w - wx * kSize), ph = std::min<UINT>(kSize, c.h - wy * kSize);
+                const float u0 = (float)(wx * kSize) / c.w, u1 = (float)(wx * kSize + pw) / c.w;
+                const float v0 = (float)(wy * kSize) / c.h, v1 = (float)(wy * kSize + ph) / c.h;
+                const float x1 = -1.0f + 2.0f * pw / kSize, y1 = 1.0f - 2.0f * ph / kSize;
+                const Vertex v[6] = {
+                    {-1, 1, 0.5f, 1, u0, v0}, {x1, 1, 0.5f, 1, u1, v0}, {-1, y1, 0.5f, 1, u0, v1},
+                    {x1, 1, 0.5f, 1, u1, v0}, {x1, y1, 0.5f, 1, u1, v1}, {-1, y1, 0.5f, 1, u0, v1},
+                };
+                BeginPass();
+                g_device->SetPixelShader(g_psTexture);
+                g_device->SetTexture(0, tex);
+                g_device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+                g_device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+                g_device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+                g_device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+                g_device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+                g_device->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff00ff00, 1.0f, 0);
+                g_device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 2, v, sizeof(Vertex));
+                uint32_t px[kSize * kSize];
+                if (!Read(px))
+                {
+                    ok = false;
+                    std::snprintf(detail, sizeof(detail), "readback failed");
+                    break;
+                }
+                for (UINT y = 2; y < ph && ok; y += 4)
+                {
+                    for (UINT x = 2; x < pw; x += 4)
+                    {
+                        const UINT bx = (wx * kSize + x) / 4, by = (wy * kSize + y) / 4;
+                        const uint32_t r5v = r5(bx), g6v = g6(by);
+                        const uint32_t want = 0xff000000u | ((r5v << 3 | r5v >> 2) << 16) | ((g6v << 2 | g6v >> 4) << 8) |
+                                              0xff;
+                        if (!Near(px[y * kSize + x], want))
+                        {
+                            std::snprintf(detail, sizeof(detail), "block(%u,%u)=%08x want %08x", bx, by,
+                                          (unsigned)px[y * kSize + x], (unsigned)want);
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Check(ok, c.name, detail);
+        tex->Release();
+    }
+}
+
 } // namespace
+
+// taau_test.cpp
+// vs_2_0: dcl_position v0; dcl_texcoord v1; mov oPos, v0; mov oT0.xy, v1;
+// mov oT0.zw, c0 (c0.z is the shadow-map compare reference)
+const DWORD kVsShadowRef[] = {
+    0xFFFE0200,
+    0x0200001F, 0x80000000, 0x900F0000,
+    0x0200001F, 0x80000005, 0x900F0001,
+    0x02000001, 0xC00F0000, 0x90E40000,
+    0x02000001, 0xE0030000, 0x90E40001,
+    0x02000001, 0xE00C0000, 0xA0E40000,
+    0x0000FFFF,
+};
+
+// Hardware shadow maps, as the engine uses them (R_InitShadowmap and the
+// sun/spot shadow passes): the caps the engine checks must select the
+// depth-texture path, a depth-only pass writes a D24S8 texture, and a texld
+// of that texture returns the depth comparison against texcoord.z (D3D9 on
+// NVIDIA: 1 = lit when ref <= stored depth), not the raw depth.
+void RunShadowMapTests(IDirect3D9 *d3d)
+{
+    // R_InitShadowmap tries D24S8 with these colour formats in order; any
+    // match selects the depth path, none falls back to an R32F colour map.
+    bool caps = false;
+    for (const D3DFORMAT color : {D3DFMT_R5G6B5, D3DFMT_X8R8G8B8, D3DFMT_A8R8G8B8})
+        caps |= SUCCEEDED(d3d->CheckDepthStencilMatch(0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, color, D3DFMT_D24S8)) &&
+                SUCCEEDED(d3d->CheckDeviceFormat(0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_DEPTHSTENCIL,
+                                                 D3DRTYPE_TEXTURE, D3DFMT_D24S8));
+    Check(caps, "SHADOWMAP_CAPS");
+
+    IDirect3DTexture9 *shadow = nullptr;
+    IDirect3DSurface9 *shadowSurface = nullptr;
+    IDirect3DVertexShader9 *vsRef = nullptr;
+    const bool made = SUCCEEDED(g_device->CreateTexture(kSize, kSize, 1, D3DUSAGE_DEPTHSTENCIL, D3DFMT_D24S8,
+                                                        D3DPOOL_DEFAULT, &shadow, nullptr)) &&
+                      SUCCEEDED(shadow->GetSurfaceLevel(0, &shadowSurface)) &&
+                      SUCCEEDED(g_device->CreateVertexShader(kVsShadowRef, &vsRef));
+    Check(made, "SHADOWMAP_CREATE");
+    if (!made)
+        return;
+
+    // Caster pass: depth 0.25 in the left half, cleared 1.0 elsewhere.
+    BeginPass();
+    g_device->SetDepthStencilSurface(shadowSurface);
+    g_device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff000000, 1.0f, 0);
+    g_device->SetRenderState(D3DRS_ZENABLE, TRUE);
+    g_device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+    g_device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+    g_device->SetPixelShader(g_psColor);
+    SetColor(0, 1, 0, 1);
+    DrawQuad(-1, 1, 0, -1, 0.25f);
+    g_device->SetRenderState(D3DRS_ZENABLE, FALSE);
+
+    // Receiver pass: sample the map with linear filtering (the engine's
+    // shadow sampler state) at two reference depths.
+    uint32_t px[kSize * kSize];
+    // The comparison result fills all four channels, alpha included.
+    const uint32_t white = 0xffffffff, black = 0x00000000;
+    BeginPass();
+    g_device->SetDepthStencilSurface(nullptr);
+    g_device->SetVertexShader(vsRef);
+    g_device->SetPixelShader(g_psTexture);
+    g_device->SetTexture(0, shadow);
+    g_device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    g_device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    g_device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    g_device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    const float refMid[4] = {0, 0, 0.5f, 1};
+    g_device->SetVertexShaderConstantF(0, refMid, 1);
+    g_device->Clear(0, nullptr, D3DCLEAR_TARGET, 0xff0000ff, 1.0f, 0);
+    DrawQuad(-1, 1, 1, -1);
+    Read(px);
+    ExpectPixels("SHADOWMAP_COMPARE", px, {{P(8, 8), black}, {P(24, 56), black}, {P(40, 8), white}, {P(56, 56), white}});
+    const float refNear[4] = {0, 0, 0.1f, 1};
+    g_device->SetVertexShaderConstantF(0, refNear, 1);
+    DrawQuad(-1, 1, 1, -1);
+    Read(px);
+    ExpectPixels("SHADOWMAP_COMPARE_LIT", px, {{P(8, 8), white}, {P(56, 56), white}});
+
+    g_device->SetTexture(0, nullptr);
+    g_device->SetVertexShader(g_vs);
+    vsRef->Release();
+    shadowSurface->Release();
+    shadow->Release();
+}
+
+void RunTaauTests(IDirect3D9 *d3d, HWND window, void (*check)(bool, const char *, const char *));
 
 int main(int, char **)
 {
@@ -3704,10 +4113,19 @@ int main(int, char **)
         if (setup)
             RunMoveTests();
         if (setup)
+            RunBlockTextureTests();
+        if (setup)
         {
+            // The native passes run with the black box on: their records
+            // and crumbs must not change what they render.
+            RunFaultTraceTests();
+            RunCmdChunkTests();
             RunFloatZTests(true);
             RunFloatZTests(false);
             RunHrpTests();
+            RunShadowMapTests(d3d);
+            Deko9_SetFaultTrace(g_device, 0);
+            g_device->Present(nullptr, nullptr, nullptr, nullptr);
         }
         // The FSR device replaces this one (one swapchain per window). The
         // test's own objects are left unreleased: they never touch the
@@ -3726,6 +4144,7 @@ int main(int, char **)
         }
         g_checkSuffix = "";
         Deko9_SetRtCompression(true);
+        RunTaauTests(d3d, window, [](bool ok, const char *name, const char *detail) { Check(ok, name, detail); });
     }
     Emit(g_failures || !created ? "FAIL:DEKO9_SELFTEST" : "PASS:DEKO9_SELFTEST");
     Emit("DEKO9_SELFTEST_END");

@@ -45,10 +45,13 @@ Reading it:
 
 - `render scene` is `SCR_DrawScreenField` (the frontend scene build);
   `render cgame` is `CL_CGameRendering` (which contains the scene build via
-  `CG_DrawActive`). If `scene` dominates, the frame is CPU-frontend-bound.
+  `CG_DrawActive`). A large `scene` identifies frontend elapsed cost; compare
+  it with backend/GPU durations and waits to establish the frame limit.
 - `issue` is `R_IssueRenderCommands`; `exec` is `RB_CallExecuteRenderCommands`
-  (the deko3d submission), and `present`/`fence` split it further. If
-  `issue` is small while `scene` is large, the GPU is not the bottleneck.
+  (the deko3d submission), and `present`/`fence` split it further.
+  A small main-thread `issue` with a large `scene` suggests frontend cost;
+  with threaded rendering it cannot exclude backend or GPU limits. Compare
+  backend scopes, GPU timestamps and frame-ring waits before attributing cost.
 - `issue prep` includes `waitfront`: the main thread's wait for queued renderer
   work before `RB_BeginFrame`. These counters are nested, so do not add them.
 - `backend` is the render back-end thread's own accumulator (`r_smp_backend

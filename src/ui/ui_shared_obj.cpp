@@ -1367,6 +1367,10 @@ void __cdecl SetScriptPunctuations(script_s *script)
     script->punctuations = default_punctuations;
 }
 
+// Port: serves a built-in menu's text before the file system is asked.
+const char *(*UI_BuiltinMenuTextProvider)(const char *filename, int *length);
+script_s *__cdecl LoadScriptMemory(char *ptr, int length, const char *name);
+
 script_s *__cdecl LoadScriptFile(const char *filename)
 {
     char v2; // [esp+3h] [ebp-61h]
@@ -1377,11 +1381,17 @@ script_s *__cdecl LoadScriptFile(const char *filename)
     char pathname[64]; // [esp+1Ch] [ebp-48h] BYREF
     int length; // [esp+60h] [ebp-4h]
 
+    int builtinLength;
+    if (UI_BuiltinMenuTextProvider)
+    {
+        if (const char *builtin = UI_BuiltinMenuTextProvider(filename, &builtinLength))
+            return LoadScriptMemory((char *)builtin, builtinLength, filename);
+    }
     Com_sprintf(pathname, 0x40u, "%s", filename);
     length = FS_FOpenFileRead(pathname, &fp);
     if (!fp)
         return 0;
-    buffer = (script_s *)GetClearedMemory(length + 1201);
+    buffer = (script_s *)GetClearedMemory(length + sizeof(script_s) + 1);
     v4 = filename;
     v3 = buffer;
     do
@@ -1649,7 +1659,7 @@ int __cdecl PC_Directive_define(source_s *source)
             return 0;
         PC_FindHashedDefine(source->definehash, token.string);
     }
-    definea = (define_s *)GetMemory(&token.string[strlen(token.string) + 1] - &token.string[1] + 33);
+    definea = (define_s *)GetMemory(sizeof(define_s) + strlen(token.string) + 1);
     definea->name = 0;
     definea->flags = 0;
     definea->builtin = 0;
@@ -1750,7 +1760,7 @@ script_s *__cdecl LoadScriptMemory(char *ptr, int length, const char *name)
     script_s *v5; // [esp+8h] [ebp-10h]
     script_s *buffer; // [esp+10h] [ebp-8h]
 
-    buffer = (script_s *)GetClearedMemory(length + 1201);
+    buffer = (script_s *)GetClearedMemory(length + sizeof(script_s) + 1);
     v5 = buffer;
     do
     {
@@ -1785,7 +1795,7 @@ define_s *__cdecl PC_DefineFromString(char *string)
     memset((uint8_t *)&src, 0, sizeof(src));
     strncpy(src.filename, "*extern", 0x40u);
     src.scriptstack = script;
-    src.definehash = (define_s **)GetClearedMemory(0x1000u);
+    src.definehash = (define_s **)GetClearedMemory(1024 * sizeof(define_s *));
     res = PC_Directive_define(&src);
     for (t = src.tokens; t; t = src.tokens)
     {
@@ -3061,7 +3071,7 @@ source_s *__cdecl LoadSourceFile(char *filename)
     source->defines = 0;
     source->indentstack = 0;
     source->skip = 0;
-    source->definehash = (define_s **)GetClearedMemory(0x1000u);
+    source->definehash = (define_s **)GetClearedMemory(1024 * sizeof(define_s *));
     PC_AddGlobalDefinesToSource(source);
     return source;
 }
@@ -4948,7 +4958,7 @@ int __cdecl MenuParse_itemDef(menuDef_t *menu, int handle)
 
     if (menu->itemCount < 256)
     {
-        item = (itemDef_s *)UI_Alloc(0x174u, 4);
+        item = (itemDef_s *)UI_Alloc(sizeof(itemDef_s), 8);
         Item_Init(item, menu->imageTrack);
         if (!Item_Parse(handle, item))
         {
@@ -4974,7 +4984,7 @@ int __cdecl MenuParse_execKey(menuDef_t *menu, int handle)
     keyindex = (uint8_t)keyname;
     if (!PC_Script_Parse(handle, &action))
         return 0;
-    handler = (ItemKeyHandler *)UI_Alloc(0xCu, 4);
+    handler = (ItemKeyHandler *)UI_Alloc(sizeof(ItemKeyHandler), 8);
     handler->key = keyindex;
     handler->action = action;
     handler->next = menu->onKey;
@@ -4992,7 +5002,7 @@ int __cdecl MenuParse_execKeyInt(menuDef_t *menu, int handle)
         return 0;
     if (!PC_Script_Parse(handle, &action))
         return 0;
-    handler = (ItemKeyHandler *)UI_Alloc(0xCu, 4);
+    handler = (ItemKeyHandler *)UI_Alloc(sizeof(ItemKeyHandler), 8);
     handler->key = keyname;
     handler->action = action;
     handler->next = menu->onKey;
@@ -5180,7 +5190,7 @@ void __cdecl Item_ValidateTypeData(itemDef_s *item, int handle)
         switch (item->type)
         {
         case 6:
-            item->typeData.listBox = (listBoxDef_s *)UI_Alloc(0x154u, 4);
+            item->typeData.listBox = (listBoxDef_s *)UI_Alloc(sizeof(listBoxDef_s), 8);
             break;
         case 4:
         case 9:
@@ -5191,7 +5201,7 @@ void __cdecl Item_ValidateTypeData(itemDef_s *item, int handle)
         case 0xA:
         case 0:
         case 0x11:
-            item->typeData.listBox = (listBoxDef_s *)UI_Alloc(0x20u, 4);
+            item->typeData.listBox = (listBoxDef_s *)UI_Alloc(sizeof(editFieldDef_s), 8);
             if (item->type == 4 || item->type == 16 || item->type == 9 || item->type == 18 || item->type == 17)
             {
                 editDef = Item_GetEditFieldDef(item);
@@ -5202,7 +5212,7 @@ void __cdecl Item_ValidateTypeData(itemDef_s *item, int handle)
             }
             break;
         case 0xC:
-            item->typeData.listBox = (listBoxDef_s *)UI_Alloc(0x188u, 4);
+            item->typeData.listBox = (listBoxDef_s *)UI_Alloc(sizeof(multiDef_s), 8);
             break;
         }
     }
@@ -5760,7 +5770,7 @@ int __cdecl ItemParse_execKey(itemDef_s *item, int handle)
     keyindex = (uint8_t)keyname;
     if (!PC_Script_Parse(handle, &action))
         return 0;
-    handler = (ItemKeyHandler *)UI_Alloc(0xCu, 4);
+    handler = (ItemKeyHandler *)UI_Alloc(sizeof(ItemKeyHandler), 8);
     handler->key = keyindex;
     handler->action = action;
     handler->next = item->onKey;
@@ -5778,7 +5788,7 @@ int __cdecl ItemParse_execKeyInt(itemDef_s *item, int handle)
         return 0;
     if (!PC_Script_Parse(handle, &action))
         return 0;
-    handler = (ItemKeyHandler *)UI_Alloc(0xCu, 4);
+    handler = (ItemKeyHandler *)UI_Alloc(sizeof(ItemKeyHandler), 8);
     handler->key = keyname;
     handler->action = action;
     handler->next = item->onKey;
@@ -6299,8 +6309,8 @@ void __cdecl Menu_PostParse(menuDef_t *menu)
 
     if (!menu)
         MyAssertHandler(".\\ui\\ui_shared_obj.cpp", 2653, 0, "%s", "menu");
-    size = 4 * menu->itemCount;
-    menu->items = (itemDef_s **)UI_Alloc(size, 4);
+    size = sizeof(itemDef_s *) * menu->itemCount;
+    menu->items = (itemDef_s **)UI_Alloc(size, 8);
     memcpy((uint8_t *)menu->items, (uint8_t *)g_load_0.items, size);
     if (menu->fullScreen)
     {
@@ -6316,7 +6326,7 @@ char __cdecl Menu_New(int handle, int imageTrack)
 {
     menuDef_t *menu; // [esp+0h] [ebp-4h]
 
-    menu = (menuDef_t *)UI_Alloc(0x11Cu, 4);
+    menu = (menuDef_t *)UI_Alloc(sizeof(menuDef_t), 8);
     Menu_Init(menu, imageTrack);
     if (Menu_Parse(handle, menu))
     {

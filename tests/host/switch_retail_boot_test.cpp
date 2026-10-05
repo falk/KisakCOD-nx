@@ -6,10 +6,12 @@
 // script already builds for F5's walk proof (switch_retail_walk_test.cpp),
 // so the fixture bytes are independently verified against that walker's own
 // byte-accounting first.
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <database/database.h>
@@ -34,6 +36,18 @@
 #include <gfx_d3d/fxprimitives.h>
 #include <gfx_d3d/r_bsp.h>
 #include <qcommon/com_bsp.h>
+#include <xanim/dobj.h>
+#include <xanim/dobj_utils.h>
+#include <gfx_d3d/r_dobj_skin.h>
+#include <gfx_d3d/r_scene.h>
+#include <port/switch_shader_prebake.h>
+
+GfxScene scene{};
+// Worker scheduling is outside this decoder/placement proof.
+int R_FXNonDependentOrSpotLightPending(void *) { std::abort(); }
+int R_EndFenceBusy(void *) { std::abort(); }
+int R_PreSkinXSurface(const DObj_s *, XSurface *, const GfxModelSurfaceInfo *,
+                      uint32_t *, GfxModelSkinnedSurface *);
 // rb_light.h pulls the backend/D3D headers, which the host build does not
 // have.  The light-region containment test the runtime primary-light
 // assignment (R_GetPrimaryLightForModelVertex -> R_IsPointInLightRegionHull)
@@ -169,10 +183,9 @@ bool UnloadFixtureZone(const RetailWalkLoadZoneResult &result)
 // origin quantizes to, and the entry that cell's row/RLE bytes carry -- from
 // the grid's own mins/maxs/rowAxis/colAxis and row data only.  This is
 // deliberately independent of rb_light.cpp's R_LightGridLookup (it does not
-// call it and is written from the structural layout); the guest's
-// KILLHOUSE_LIGHTGRID_APPLY line reports what the real lookup returned for
-// the same origin, so the two independent resolutions can be joined and
-// compared.  The caller owns `cell` (zeroed here).
+// call it and is written from the structural layout), so its result can be
+// compared with the real lookup's for the same origin.  The caller owns
+// `cell` (zeroed here).
 struct RetailLightGridCell
 {
     bool insideGrid;
@@ -891,11 +904,220 @@ static void PathTreeSelfReach(const PathData &p, PathTreeCensus &census)
     }
 }
 
+static bool ExportCharacterSkinInputs()
+{
+    const char *dir = std::getenv("KISAK_CHARACTER_SKIN_EXPORT_DIR");
+    if (!dir) return true;
+    if (!useFastFile)
+        useFastFile = Dvar_RegisterBool("useFastFile", true, DVAR_NOFLAG, "Use fastfile assets");
+    static_assert(sizeof(DObjSkelMat) == 64 && sizeof(GfxPackedVertex) == 32);
+    const char *names[] = {"head_sp_sas_woodland_hugh", "head_sp_sas_woodland_zied",
+        "head_sp_sas_woodland_peter", "head_sp_sas_woodland_mac", "head_sp_sas_woodland_todd",
+        "body_sp_sas_woodland_support_a", "body_sp_sas_woodland_assault_a",
+        "body_sp_sas_woodland_assault_b", "body_complete_sp_sas_ct_price_maskup",
+        "body_complete_sp_sas_woodland_gaz"};
+    for (const char *name : names)
+    {
+        const XModel *model = StubFindXAssetHeader(ASSET_TYPE_XMODEL, name).model;
+        if (!model) continue;
+        auto invalid = [&](uint32_t surface, const char *reason) {
+            std::printf("CHARACTER_SKIN_EXPORT_FAIL model=%s surface=%u bones=%u surfaces=%u reason=%s\n",
+                        name, surface, model->numBones, model->numsurfs, reason);
+            return false;
+        };
+        if (!model->numBones || model->numBones > 128 || !model->surfs || !model->numsurfs)
+            return invalid(0, "model_counts_or_surfaces");
+        if (model->numLods < 1 || model->numLods > 4 || !model->materialHandles)
+            return invalid(0, "lod_count_or_materials");
+        for (int lod = 0; lod < model->numLods; ++lod)
+        {
+            const XModelLodInfo &info = model->lodInfo[lod];
+            if (!std::isfinite(info.dist) || info.dist < 0 ||
+                uint32_t(info.surfIndex) + info.numsurfs > model->numsurfs)
+                return invalid(lod, "lod_range_or_distance");
+            XSurface *selected = nullptr;
+            if (XModelGetSurfaces(model, &selected, lod) != info.numsurfs ||
+                selected != model->surfs + info.surfIndex ||
+                XModelGetSkins(model, lod) != model->materialHandles + info.surfIndex)
+                return invalid(lod, "lod_surface_material_selection");
+            std::printf("CHARACTER_LOD model=%s lod=%d distance=%.9g first=%u surfaces=%u\n",
+                        name, lod, info.dist, info.surfIndex, info.numsurfs);
+            for (uint32_t s = info.surfIndex; s < uint32_t(info.surfIndex) + info.numsurfs; ++s)
+            {
+                const Material *material = model->materialHandles[s];
+                if (!material) return invalid(s, "lod_material_null");
+                std::printf("CHARACTER_LOD_SURFACE model=%s lod=%d surface=%u material=%s vertices=%u rigid=%u\n",
+                            name, lod, s, material->info.name, model->surfs[s].vertCount,
+                            model->surfs[s].vertListCount);
+            }
+            // An isolated threshold advances at equality; zero is terminal.
+            if (info.dist == 0)
+            {
+                if (XModelGetLodForDist(model, 1000000.0f) != lod)
+                    return invalid(lod, "lod_zero_terminal");
+            }
+            else if ((lod == 0 || (model->lodInfo[lod - 1].dist > 0 &&
+                       model->lodInfo[lod - 1].dist < info.dist)) &&
+                     (lod + 1 == model->numLods || model->lodInfo[lod + 1].dist == 0 ||
+                       model->lodInfo[lod + 1].dist > info.dist))
+            {
+                const int after = lod + 1 == model->numLods ? -1 : lod + 1;
+                if (XModelGetLodForDist(model, std::nextafter(info.dist, -INFINITY)) != lod ||
+                    XModelGetLodForDist(model, info.dist) != after ||
+                    XModelGetLodForDist(model, std::nextafter(info.dist, INFINITY)) != after)
+                    return invalid(lod, "lod_threshold_boundary");
+            }
+        }
+        std::vector<DObjSkelMat> bones(model->numBones);
+        for (uint32_t b = 0; b < model->numBones; ++b)
+        {
+            bones[b].axis[0][0] = bones[b].axis[1][1] = bones[b].axis[2][2] = 1.0f;
+            bones[b].origin[0] = float(b); bones[b].origin[1] = 2.0f * b;
+            bones[b].origin[2] = -float(b);
+            bones[b].origin[3] = 1.0f;
+        }
+        for (uint32_t s = 0; s < model->numsurfs; ++s)
+        {
+            const XSurface &surf = model->surfs[s];
+            if (!surf.deformed && surf.vertListCount == 1)
+            {
+                if (!model->baseMat || !useFastFile->current.enabled)
+                    return invalid(s, "rigid_pose_input");
+                for (uint32_t boneOffset : {0u, 52u})
+                {
+                    if (boneOffset + model->numBones > 128) continue;
+                    std::vector<DObjAnimMat> pose(boneOffset + model->numBones);
+                    std::memcpy(pose.data() + boneOffset, model->baseMat,
+                                model->numBones * sizeof(DObjAnimMat));
+                    DObj_s object{};
+                    object.skel.mat = pose.data();
+                    GfxModelSurfaceInfo info{};
+                    info.boneIndex = boneOffset;
+                    info.boneCount = model->numBones;
+                    info.baseMat = model->baseMat;
+                    GfxModelRigidSurface output{};
+                    uint32_t vertices = 0;
+                    if (R_PreSkinXSurface(&object, &model->surfs[s], &info, &vertices, &output.surf) !=
+                            sizeof(output) || output.surf.skinnedCachedOffset != -2 || vertices)
+                        return invalid(s, "rigid_record_selection");
+                    for (int axis = 0; axis < 3; ++axis)
+                        if (std::fabs(output.placement.base.origin[axis]) > 0.002f ||
+                            std::fabs(output.placement.base.quat[axis]) > 0.0001f)
+                            return invalid(s, "rigid_bind_pose_transform");
+                    if (std::fabs(std::fabs(output.placement.base.quat[3]) - 1.0f) > 0.0001f)
+                        return invalid(s, "rigid_bind_pose_rotation");
+                }
+                std::printf("CHARACTER_RIGID_BIND model=%s surface=%u bone=%u\n",
+                            name, s, surf.vertList->boneOffset / 64u);
+            }
+            uint32_t header[10] = {0x534b494e, model->numBones, surf.vertCount,
+                                  uint32_t(surf.deformed), surf.vertListCount, 0, 0, 0, 0, 0};
+            if (!surf.vertCount || !surf.verts0 || surf.vertListCount > surf.vertCount ||
+                (surf.vertListCount && !surf.vertList)) return invalid(s, "surface_counts_or_data");
+            uint32_t weighted = 0;
+            for (uint32_t w = 0; w < 4; ++w)
+            {
+                if (surf.vertInfo.vertCount[w] < 0) return invalid(s, "negative_blend_count");
+                header[6 + w] = surf.vertInfo.vertCount[w];
+                weighted += header[6 + w];
+                header[5] += header[6 + w] * (2 * w + 1);
+            }
+            if (surf.deformed && (weighted != surf.vertCount || !surf.vertInfo.vertsBlend))
+                return invalid(s, "deformed_blend_count_or_data");
+            if (!surf.deformed && weighted) return invalid(s, "rigid_has_blends");
+            uint32_t blend = 0;
+            for (uint32_t w = 0; w < 4; ++w)
+                for (uint32_t v = 0; v < header[6 + w]; ++v)
+                {
+                    for (uint32_t b = 0; b <= w; ++b)
+                    {
+                        const uint32_t offset = surf.vertInfo.vertsBlend[blend + (b ? 2 * b - 1 : 0)];
+                        if (offset % 64 || offset >= model->numBones * 64u)
+                            return invalid(s, "blend_bone_offset");
+                    }
+                    blend += 2 * w + 1;
+                }
+            std::vector<uint16_t> rigid;
+            uint32_t rigidVerts = 0;
+            for (uint32_t r = 0; r < surf.vertListCount; ++r)
+            {
+                const XRigidVertList &part = surf.vertList[r];
+                if (part.boneOffset % 64 || part.boneOffset >= model->numBones * 64u)
+                    return invalid(s, "rigid_bone_offset");
+                rigidVerts += part.vertCount;
+                rigid.push_back(part.boneOffset); rigid.push_back(part.vertCount);
+            }
+            if (!surf.deformed && rigidVerts != surf.vertCount) return invalid(s, "rigid_vertex_count");
+            char path[4096];
+            const int len = std::snprintf(path, sizeof(path), "%s/%s_%u.skin", dir, name, s);
+            if (len < 0 || size_t(len) >= sizeof(path)) return invalid(s, "path_length");
+            FILE *out = std::fopen(path, "wb");
+            if (!out) return invalid(s, "open_output");
+            auto write = [&](const void *p, size_t bytes) { return !bytes || std::fwrite(p, 1, bytes, out) == bytes; };
+            const bool ok = write(header, sizeof(header)) && write(bones.data(), bones.size() * 64) &&
+                write(surf.verts0, surf.vertCount * 32u) &&
+                write(surf.vertInfo.vertsBlend, header[5] * sizeof(uint16_t)) &&
+                write(rigid.data(), rigid.size() * sizeof(uint16_t));
+            const bool closed = std::fclose(out) == 0;
+            if (!ok || !closed) { std::remove(path); return invalid(s, "write_output"); }
+            std::printf("CHARACTER_SKIN_EXPORT model=%s surface=%u bones=%u vertices=%u deformed=%u rigid=%u blends=%u\n",
+                        name, s, model->numBones, surf.vertCount, surf.deformed, surf.vertListCount, header[5]);
+        }
+    }
+    const char *bodies[] = {"body_sp_sas_woodland_support_a",
+        "body_sp_sas_woodland_assault_a", "body_sp_sas_woodland_assault_b"};
+    for (const char *bodyName : bodies)
+        for (int h = 0; h < 5; ++h)
+        {
+            XModel *models[2] = {StubFindXAssetHeader(ASSET_TYPE_XMODEL, bodyName).model,
+                                StubFindXAssetHeader(ASSET_TYPE_XMODEL, names[h]).model};
+            if (!models[0] || !models[1]) continue;
+            if (uint32_t(models[0]->numBones) + models[1]->numBones > 128)
+                return false;
+            DObj_s object{};
+            object.models = models;
+            object.numModels = 2;
+            int cases = 0;
+            for (int b = -1; b < models[0]->numLods; ++b)
+                for (int head = -1; head < models[1]->numLods; ++head)
+                {
+                    int8_t lods[2] = {int8_t(b), int8_t(head)};
+                    int bits[4]{};
+                    uint32_t expected[4]{};
+                    uint32_t offset = 0, count = 0;
+                    for (int m = 0; m < 2; ++m)
+                    {
+                        if (lods[m] >= 0)
+                        {
+                            const XModelLodInfo &info = models[m]->lodInfo[lods[m]];
+                            count += info.numsurfs;
+                            for (uint32_t bone = 0; bone < 128 && bone + offset < 128; ++bone)
+                                if (uint32_t(info.partBits[bone >> 5]) & (0x80000000u >> (bone & 31)))
+                                    expected[(bone + offset) >> 5] |= 0x80000000u >> ((bone + offset) & 31);
+                        }
+                        offset += models[m]->numBones;
+                    }
+                    if (DObjGetSurfaces(&object, bits, lods) != count ||
+                        std::memcmp(bits, expected, sizeof(bits)))
+                    {
+                        std::printf("CHARACTER_LOD_MASK_FAIL body=%s head=%s lods=%d,%d\n",
+                                    bodyName, names[h], b, head);
+                        return false;
+                    }
+                    ++cases;
+                }
+            std::printf("CHARACTER_LOD_MASK body=%s head=%s boneOffset=%u cases=%d\n",
+                        bodyName, names[h], models[0]->numBones, cases);
+        }
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     // zone-batch and deko-shader-dump take a variable number of zones.
     const bool variadicZones = argc >= 4 && (!std::strcmp(argv[2], "zone-batch") ||
-                                         !std::strcmp(argv[2], "deko-shader-dump"));
+                                         !std::strcmp(argv[2], "deko-shader-dump") ||
+                                         !std::strcmp(argv[2], "deko-variant-passes"));
     if (!variadicZones && argc != 2 && argc != 3 && argc != 4)
     {
         std::fprintf(stderr,
@@ -1010,6 +1232,159 @@ int main(int argc, char **argv)
         }
         std::printf("DEKO_SHADER_DUMP zone=%s techsets=%u programs=%u new=%u ok=%u\n",
                     argv[argc - 1], count, seen, written, ok ? 1u : 0u);
+        for (auto it = zoneIndices.rbegin(); it != zoneIndices.rend(); ++it)
+            ok = DB_RetailZoneEnd(*it) && ok;
+        return ok ? 0 : 1;
+    }
+
+    // Shader variant prebake census: every material pass of the zones (in
+    // argument order: code_post_gfx, ui, common, then the level) exactly as the
+    // zone-load prebake describes it (switch_shader_prebake.h), one
+    // DEKO_VARIANT_PASS line each, shaders keyed by the deko3d renderer's
+    // bytecode hash. Programs the corpus lacks are written to
+    // KISAK_DEKO_EXTRACT_DIR (user game data, outside the repository).
+    if (argc >= 4 && !std::strcmp(argv[2], "deko-variant-passes"))
+    {
+        const char *extractDir = std::getenv("KISAK_DEKO_EXTRACT_DIR");
+        if (!extractDir)
+        {
+            std::fprintf(stderr, "DEKO_VARIANT_PASSES_FAIL KISAK_DEKO_EXTRACT_DIR unset\n");
+            return 1;
+        }
+        SL_Init();
+        static GfxImage identityNormalMap{};
+        identityNormalMap.mapType = MAPTYPE_2D;
+        identityNormalMap.width = identityNormalMap.height = identityNormalMap.depth = 1;
+        identityNormalMap.name = "$identitynormalmap";
+        StubRegisterStockAsset(ASSET_TYPE_IMAGE, XAssetHeader(&identityNormalMap));
+        std::vector<uint32_t> zoneIndices;
+        for (int z = 3; z < argc; ++z)
+        {
+            RetailWalkLoadZoneResult result{};
+            const RetailWalkLoadZoneResultCode code = RetailWalkLoadZoneAssets(argv[z], &result);
+            if (code != RETAIL_WALK_LOAD_OK)
+            {
+                std::fprintf(stderr, "DEKO_VARIANT_PASSES_LOAD_FAIL zone=%s code=%d ordinal=%u type=%u\n",
+                             argv[z], (int)code, result.failedOrdinal, result.failedType);
+                return 1;
+            }
+            zoneIndices.push_back(result.zoneIndex);
+        }
+        bool ok = true;
+        const auto programHash = [&](const char *ext, const void *program, uint32_t words) -> uint64_t {
+            if (!program || !words)
+                return 0;
+            uint64_t hash = 0xcbf29ce484222325ull;
+            const uint8_t *bytes = static_cast<const uint8_t *>(program);
+            for (uint32_t i = 0; i < words * 4u; ++i)
+                hash = (hash ^ bytes[i]) * 0x100000001b3ull;
+            char path[512];
+            if (std::snprintf(path, sizeof(path), "%s/%016llx.%s", extractDir, (unsigned long long)hash, ext) >=
+                (int)sizeof(path))
+            {
+                ok = false;
+                return hash;
+            }
+            if (FILE *existing = std::fopen(path, "rb"))
+            {
+                std::fclose(existing);
+                return hash;
+            }
+            FILE *file = std::fopen(path, "wb");
+            if (!file)
+            {
+                ok = false;
+                return hash;
+            }
+            ok = std::fwrite(program, 4, words, file) == words && ok;
+            ok = std::fclose(file) == 0 && ok;
+            return hash;
+        };
+        // The runtime feature remap (Material_RuntimeRemapTarget) for the
+        // Switch configuration: shader model 3, every feature dvar on,
+        // hardware shadow maps. Only the shadow token then changes: the
+        // "sm"/"hsm" feature maps to "hsm" (Material_RemapTechniqueSetName's
+        // tokenizer: '_' separates, a digit-to-letter boundary splits).
+        const uint32_t techsetCount = StubCollectRegistered(ASSET_TYPE_TECHNIQUE_SET, nullptr, 0);
+        std::vector<XAssetHeader> techsets(techsetCount);
+        StubCollectRegistered(ASSET_TYPE_TECHNIQUE_SET, techsets.data(), techsetCount);
+        const auto remapTarget = [&](const MaterialTechniqueSet *set) -> const MaterialTechniqueSet * {
+            if (!set || !set->name)
+                return set;
+            std::string name, token;
+            const char *parse = set->name;
+            if (!std::strncmp(parse, "sm2/", 4))
+                parse += 4;
+            const auto flush = [&](bool underscore) {
+                if (token.empty())
+                    return;
+                if (underscore && !name.empty())
+                    name += '_';
+                name += token == "sm" ? "hsm" : token;
+                token.clear();
+            };
+            bool underscore = false;
+            for (; *parse; ++parse)
+            {
+                if (*parse == '_')
+                {
+                    flush(underscore);
+                    underscore = true;
+                    continue;
+                }
+                if (!token.empty() && std::isdigit((unsigned char)token.back()) &&
+                    !std::isdigit((unsigned char)*parse))
+                {
+                    flush(underscore);
+                    underscore = false;
+                }
+                token += *parse;
+            }
+            flush(underscore);
+            if (name == set->name)
+                return set;
+            for (const XAssetHeader &t : techsets)
+                if (t.techniqueSet && t.techniqueSet->name && name == t.techniqueSet->name)
+                    return t.techniqueSet;
+            return set;
+        };
+        const uint32_t count = StubCollectRegistered(ASSET_TYPE_MATERIAL, nullptr, 0);
+        std::vector<XAssetHeader> materials(count);
+        StubCollectRegistered(ASSET_TYPE_MATERIAL, materials.data(), count);
+        uint32_t passes = 0, remapped = 0;
+        for (const XAssetHeader &header : materials)
+        {
+            const Material *material = header.material;
+            if (!material || !material->techniqueSet)
+                continue;
+            const MaterialTechniqueSet *target = remapTarget(material->techniqueSet);
+            remapped += target != material->techniqueSet;
+            const MaterialTechniqueSet *sets[2] = {material->techniqueSet,
+                                                   target != material->techniqueSet ? target : nullptr};
+            for (const MaterialTechniqueSet *set : sets)
+                R_ForEachPrebakePass(material, set, true, true, [&](const PrebakePassInputs &in) {
+                const MaterialPass &pass = *in.pass;
+                const uint64_t vs = pass.vertexShader ? programHash("vs", pass.vertexShader->prog.loadDef.program,
+                                                                    pass.vertexShader->prog.loadDef.programSize)
+                                                      : 0;
+                const uint64_t ps = pass.pixelShader ? programHash("ps", pass.pixelShader->prog.loadDef.program,
+                                                                   pass.pixelShader->prog.loadDef.programSize)
+                                                     : 0;
+                if (!vs && !ps)
+                    return;
+                char regs[16 * 4 + 1] = "";
+                int at = 0;
+                for (uint32_t r = 0; r < in.instanceRegCount; ++r)
+                    at += std::snprintf(regs + at, sizeof(regs) - (size_t)at, r ? ",%u" : "%u",
+                                        (unsigned)in.instanceRegs[r]);
+                std::printf("DEKO_VARIANT_PASS vs=%016llx ps=%016llx depth=0x%x atest=%u inst=%u:%s\n",
+                            (unsigned long long)vs, (unsigned long long)ps, in.depthSamplerMask,
+                            in.alphaTest ? 1u : 0u, in.instanceRegCount, regs);
+                ++passes;
+            });
+        }
+        std::printf("DEKO_VARIANT_PASSES zone=%s materials=%u remapped=%u passes=%u ok=%u\n", argv[argc - 1], count,
+                    remapped, passes, ok ? 1u : 0u);
         for (auto it = zoneIndices.rbegin(); it != zoneIndices.rend(); ++it)
             ok = DB_RetailZoneEnd(*it) && ok;
         return ok ? 0 : 1;
@@ -1203,6 +1578,7 @@ int main(int argc, char **argv)
                         result.zoneIndex);
             if (code != RETAIL_WALK_LOAD_OK)
                 return false;
+            if (!ExportCharacterSkinInputs()) return false;
             {
                 uint32_t fxEffects = 0, fxElems = 0;
                 const char *firstBad = nullptr;
@@ -4943,13 +5319,10 @@ int main(int argc, char **argv)
         // instance, resolve the cell its world-space lighting origin
         // quantizes to, and the entry/colours/primary that cell's own row
         // and RLE bytes carry, using only the grid's mins/maxs/rowAxis/
-        // colAxis and row data (RetailLightGridCellForOrigin above).  The
-        // production guest line KILLHOUSE_LIGHTGRID_APPLY reports what the
-        // real R_LightGridLookup returned for the same origin; a verifier
-        // joins name/smodel and requires the same entry index and
-        // coloursIndex, so byte-perfect grid data sampled at the wrong cell
-        // fails here.  `sun=` prints the grid/world primary-light facts the
-        // zero-sun-weight question needs.  Host-side only.
+        // colAxis and row data (RetailLightGridCellForOrigin above), so a
+        // run of the real R_LightGridLookup on the same origin can be
+        // compared by entry index and coloursIndex.  `sun=` prints the
+        // grid/world primary-light facts.  Host-side only.
         {
             const GfxLightGrid &grid = world->lightGrid;
             uint32_t namedRows = 0;

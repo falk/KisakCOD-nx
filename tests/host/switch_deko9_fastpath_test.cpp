@@ -8,6 +8,7 @@
 #include "src/deko9/deko9_fastpath.h"
 #include "src/deko9/deko9_hazard_model.h"
 #include "src/deko9/deko9_lock.h"
+#include "src/deko9/deko9_shader_stats.h"
 #include "src/gfx_d3d/r_image_live_memo.h"
 
 #include <algorithm>
@@ -17,6 +18,7 @@
 #include <cstdlib>
 #include <map>
 #include <random>
+#include <cstring>
 #include <set>
 #include <thread>
 #include <vector>
@@ -33,6 +35,57 @@ void Check(bool ok, const char *name)
         std::printf("FAIL:DEKO9_FASTPATH %s\n", name);
         ++g_failures;
     }
+}
+
+// ---- shader build accounting ----------------------------------------------------
+
+// Pack hits/misses, compile time and max, the slow-compile log budget, bake
+// and first-bind lock time, the window reset and the perf-line fields.
+void TestShaderBuildStats()
+{
+    using deko9::ShaderBuildStats;
+    ShaderBuildStats stats;
+    stats.NotePackLookup(true);
+    stats.NotePackLookup(true);
+    stats.NotePackLookup(false);
+    stats.NoteTranslate(400000);
+    bool logged[7];
+    for (int i = 0; i < 7; ++i)
+        logged[i] = stats.NoteCompile(i == 0 ? 1000000 : 6000000 + (uint64_t)i * 1000); // 1 fast, 6 slow
+    Check(!logged[0], "shader stats: a fast compile is not logged");
+    Check(logged[1] && logged[2] && logged[3] && logged[4], "shader stats: the first slow compiles are logged");
+    Check(!logged[5] && !logged[6], "shader stats: slow compiles past the window budget are not logged");
+    stats.NoteBake(7000000, true);
+    stats.NoteBake(2000, false);
+    stats.NoteFirstBind(7000000);
+    stats.NoteFirstBind(0);
+    // Concurrent adds from several threads (relaxed atomics).
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t)
+        threads.emplace_back([&stats] {
+            for (int i = 0; i < 1000; ++i)
+                stats.NotePackLookup(true);
+        });
+    for (std::thread &t : threads)
+        t.join();
+    const deko9::ShaderBuildWindow w = stats.Take();
+    Check(w.packHits == 4002 && w.packMisses == 1, "shader stats: pack hits/misses");
+    Check(w.compiles == 7 && w.compileMaxNs == 6006000, "shader stats: compile count and max");
+    Check(w.slowCompiles == 6 && w.slowUnlogged == 2, "shader stats: slow compile count / unlogged");
+    Check(w.bakes == 2 && w.bakesUnlocked == 1 && w.bakeMaxNs == 7000000, "shader stats: bakes");
+    Check(w.firstBinds == 2 && w.firstBindBakeNs == 7000000 && w.firstBindBakeMaxNs == 7000000,
+          "shader stats: first binds");
+    char line[400];
+    ShaderBuildStats::Format(w, line, sizeof(line));
+    Check(std::strstr(line, " spHits=4002 spMisses=1 translates=1 translateUs=400 compiles=7 ") == line,
+          "shader stats: perf-line prefix");
+    Check(std::strstr(line, " compileMaxUs=6006 bakes=2 bakeUs=7002 bakeMaxUs=7000 bakesUnlocked=1 firstBinds=2 "
+                            "firstBindBakeUs=7000 firstBindBakeMaxUs=7000 slowCompiles=6 slowUnlogged=2") != nullptr,
+          "shader stats: perf-line fields");
+    // The window resets, and the log budget with it.
+    const deko9::ShaderBuildWindow empty = stats.Take();
+    Check(empty.packHits == 0 && empty.compiles == 0 && empty.compileMaxNs == 0, "shader stats: window reset");
+    Check(stats.NoteCompile(ShaderBuildStats::kSlowCompileNs), "shader stats: budget renews per window");
 }
 
 // ---- device lock ----------------------------------------------------------------
@@ -359,6 +412,23 @@ void TestCompactKey()
         row[field] = 1;
         Check(!deko9::CompactSamplerKey(row, false, &a), "compact: non-default extra field falls back");
     }
+    // The engine LOD bias (-k/8, k 1..15) packs; any other bias falls back.
+    {
+        DefaultRow(row);
+        uint32_t plain, biased, other;
+        Check(deko9::CompactSamplerKey(row, false, &plain), "compact: unbiased row packs");
+        const float steps[3] = {-3.0f / 8.0f, -15.0f / 8.0f, -0.3f};
+        std::memcpy(&row[deko9::kSampMipLodBias], &steps[0], 4);
+        Check(deko9::CompactSamplerKey(row, false, &biased) && biased != plain && biased < (1u << 31),
+              "compact: -3/8 bias packs into its own key");
+        std::memcpy(&row[deko9::kSampMipLodBias], &steps[1], 4);
+        Check(deko9::CompactSamplerKey(row, false, &other) && other != biased, "compact: -15/8 bias packs");
+        std::memcpy(&row[deko9::kSampMipLodBias], &steps[2], 4);
+        Check(!deko9::CompactSamplerKey(row, false, &other), "compact: an off-step bias falls back");
+        const float positive = 0.5f;
+        std::memcpy(&row[deko9::kSampMipLodBias], &positive, 4);
+        Check(!deko9::CompactSamplerKey(row, false, &other), "compact: a positive bias falls back");
+    }
     DefaultRow(row);
     row[deko9::kSampAddressU] = 8;
     Check(!deko9::CompactSamplerKey(row, false, &a), "compact: out-of-range address falls back");
@@ -540,14 +610,33 @@ void TestConstantFileRegs(const char *name)
     file.Reset();
     static float ubo[Regs][4];
     std::memset(ubo, 0x7f, sizeof(ubo)); // garbage: the first flush must cover everything
-    bool invariant = true, chunked = true, tight = true, noOverlap = true;
+    bool invariant = true, chunked = true, tight = true, noOverlap = true, sameTrace = true;
     uint64_t pushedRegs = 0, changedRegs = 0;
     auto flush = [&] {
         std::vector<bool> dirty(Regs);
         for (uint32_t r = 0; r < Regs; ++r)
             dirty[r] = file.IsDirty(r);
+        // Scalar reference preserves the previous coalescing and chunk order.
+        std::vector<std::pair<uint32_t, uint32_t>> expected, actual;
+        for (uint32_t r = 0; r < Regs; )
+        {
+            while (r < Regs && !dirty[r]) ++r;
+            if (r == Regs) break;
+            uint32_t end = r + 1, next = end;
+            for (;;)
+            {
+                next = end;
+                while (next < Regs && !dirty[next]) ++next;
+                if (next == Regs || next - end > File::kMergeGapRegs) break;
+                end = next + 1;
+            }
+            for (uint32_t first = r; first < end; first += File::kMaxPushRegs)
+                expected.emplace_back(first, std::min(end - first, File::kMaxPushRegs));
+            r = next;
+        }
         std::vector<bool> covered(Regs);
         file.Flush([&](uint32_t reg, uint32_t n) {
+            actual.emplace_back(reg, n);
             chunked &= n >= 1 && n <= File::kMaxPushRegs && reg + n <= Regs;
             for (uint32_t r = reg; r < reg + n; ++r)
             {
@@ -557,6 +646,7 @@ void TestConstantFileRegs(const char *name)
             std::memcpy(ubo[reg], file.regs[reg], n * 16);
             pushedRegs += n;
         });
+        sameTrace &= actual == expected;
         // Every dirty register pushed; a clean one only inside a merge gap of
         // at most kMergeGapRegs between dirty ones.
         for (uint32_t r = 0; r < Regs; ++r)
@@ -602,6 +692,8 @@ void TestConstantFileRegs(const char *name)
     char label[96];
     std::snprintf(label, sizeof(label), "constants<%s>: UBO equals the file after every flush", name);
     Check(invariant, label);
+    std::snprintf(label, sizeof(label), "constants<%s>: exact scalar push order/ranges preserved", name);
+    Check(sameTrace, label);
     std::snprintf(label, sizeof(label), "constants<%s>: pushes chunked to 1 KB", name);
     Check(chunked, label);
     std::snprintf(label, sizeof(label), "constants<%s>: only dirty registers and short gaps pushed", name);
@@ -614,6 +706,8 @@ void TestConstantFile()
 {
     TestConstantFileRegs<256>("vs");
     TestConstantFileRegs<224>("ps");
+    TestConstantFileRegs<65>("partial-word");
+    TestConstantFileRegs<1>("single-register");
     // The review case: c0 and c60 dirty -> two 1-register pushes, not 61.
     static deko9::ConstantFile<256> file;
     file.Flush([](uint32_t, uint32_t) {});
@@ -771,6 +865,7 @@ int main()
     TestLiveMemo();
     TestConstantFile();
     TestStaticHazardModel();
+    TestShaderBuildStats();
     std::printf("%s:DEKO9_FASTPATH\n", g_failures ? "FAIL" : "PASS");
     return g_failures ? 1 : 0;
 }

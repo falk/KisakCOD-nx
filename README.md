@@ -12,7 +12,7 @@ Learn about the Development of KisakCOD here: [https://lwss.github.io/Duty-Of-Ki
 
 ## Nintendo Switch port (work in progress)
 
-<img width="1280" height="720" alt="image" src="https://github.com/user-attachments/assets/a60bd86b-fc9b-461f-96b5-5497ee30eb56" />
+<img width="1280" height="720" alt="Cargoship on Switch OLED, native 720p at 60 fps" src="https://github.com/user-attachments/assets/a60bd86b-fc9b-461f-96b5-5497ee30eb56" />
 
 This fork runs the single-player campaign on the Nintendo Switch as a homebrew NRO.
 It is single-player only for now: multiplayer is not ported yet.
@@ -46,7 +46,38 @@ The target is **720p at 60 fps** on a stock handheld Switch. It is not there in 
 - Play-testing the full campaign. Most missions have only been loaded, not played through.
 - A steady 60 fps at 720p in the busiest scenes. A temporal upscaler is planned.
 - Docked mode tuning. Only handheld has been tested.
-- Known issues: an occasional GPU fault still under investigation, and a crash on one mission (Bog) in some runs.
+- The known issues listed below.
+
+### Known issues (Switch)
+
+- **Occasional GPU fault.** Now and then the GPU reports an error (Atmosphère error report `2520-0000`, a pushbuffer fault) and the game exits. It has happened between about two minutes and an hour into play, on a Switch OLED in handheld mode, and so far only in runs with dynamic resolution and the temporal upscaler (TAAU) on. The cause is not known. Short runs at a fixed render scale (`r_dynres 0`, `r_renderScale 0.75`) have not shown it, but that is not proof it avoids it.
+- **Crash on one mission** (Bog) in some runs.
+- **Slow first start.** With an empty shader cache, the first launch compiles shaders while loading, which adds roughly half a minute once. They are cached in `deko9-cache/` afterwards.
+- **Busy scenes can drop below 60 fps**, more so at a fixed 0.75 render scale than with dynamic resolution, because more pixels are drawn.
+- **Temporal upscaler shimmer.** After fast camera movement, or when new surfaces come into view, TAAU can shimmer briefly while it rebuilds its history.
+- **Brightness does nothing.** The gamma ramp is ignored, so `r_gamma` has no effect.
+- **Dynamic resolution applies at startup.** Changing `r_dynres` in the menu takes effect after a restart.
+- **Handheld only.** Docked mode has not been tested, and applet mode is not supported.
+
+### Switch controls
+
+| Control | Action |
+|---|---|
+| Left stick | Move; click to sprint, or hold while scoped to steady aim |
+| Right stick | Look; click to melee |
+| ZR / ZL | Fire / aim down sights |
+| R / L | Frag grenade / smoke |
+| Y / X | Use, pick up, reload / switch weapons |
+| B | Tap to crouch, hold to go prone |
+| D-pad | Action slots 1-4 (up, down, left, right) |
+| Plus | Pause |
+| Minus | Tap to quicksave, hold for objectives |
+
+Hold B again to stand from prone. Minus also quickloads while a menu is open.
+In menus, A confirms and B goes back. Gyro aiming is enabled while aiming
+down sights by default.
+
+With C4 selected, ZL or R throws a charge and ZR detonates placed charges.
 
 ### Building for Switch
 

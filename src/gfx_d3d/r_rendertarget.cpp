@@ -579,9 +579,9 @@ _D3DFORMAT __cdecl R_InitFrameBufferRenderTarget()
 
     R_InitFrameBufferRenderTarget_Win32(&gfxRenderTargets[R_RENDERTARGET_FRAME_BUFFER]);
     gfxRenderTargets[R_RENDERTARGET_FRAME_BUFFER].surface.color->GetDesc(&surfaceDesc);
-    // r_dynres: the scene has its own colour + depth target, sized per
+    // Scene layout: the scene has its own colour + depth target, sized per
     // frame, upscaled into the back buffer before the 2D pass (r_dynres.h).
-    if (R_DynResEnabled() && !g_allocateMinimalResources)
+    if (R_SceneLayoutEnabled() && !g_allocateMinimalResources)
         R_DynResInitSceneTarget(&gfxRenderTargets[R_RENDERTARGET_SCENE], (uint32_t)surfaceDesc.Format);
     else
         R_ShareRenderTarget(R_RENDERTARGET_FRAME_BUFFER, R_RENDERTARGET_SCENE);

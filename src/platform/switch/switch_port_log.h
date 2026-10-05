@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 // One shared diagnostic fan-out (seam 13): stdout (nxlink) + svcOutputDebugString
 // (emulator/debugger guest log), with a line that starts "FAIL:" also
 // flushed to an SD file so it survives a dropped nxlink stream or a hang.
@@ -23,6 +25,17 @@ void Port_Log(const char *line);
 // the SD-card write; a caller that wants that write and forgets the
 // prefix should add it, not rely on the function name alone.
 void Port_Fail(const char *line);
+
+// Hardware only (no-ops elsewhere). Start redirects stdout/stderr into the
+// in-memory log ring and starts the drain thread that feeds the nxlink
+// socket `netFd` (-1 for none; made non-blocking) and the SD ring file.
+// Flush asks the drain thread to push everything queued to the card and
+// waits at most maxWaitMs. Shutdown is the final bounded flush at exit.
+void Port_LogStart(int netFd);
+// Straight into the ring (no stdio lock) for the stall watchdog.
+void Port_LogRaw(const char *line);
+void Port_LogFlush(uint32_t maxWaitMs);
+void Port_LogShutdown(void);
 
 #ifdef __cplusplus
 }

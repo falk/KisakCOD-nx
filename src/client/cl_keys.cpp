@@ -1239,9 +1239,13 @@ int32_t __cdecl Key_GetCommandAssignmentInternal(int32_t localClientNum, const c
 
 bool __cdecl Key_IsCommandBound(int32_t localClientNum, const char *command)
 {
+#ifdef __SWITCH__
+    return Switch_InputPadBindingName(command) != nullptr;
+#else
     int32_t keys[2]; // [esp+0h] [ebp-Ch] BYREF
 
     return Key_GetCommandAssignment(localClientNum, command, keys) > 0;
+#endif
 }
 
 void __cdecl Key_Unbind_f()
@@ -2141,20 +2145,25 @@ int32_t __cdecl CL_GetKeyBindingInternal(int32_t localClientNum, const char *com
     int32_t keys[2]; // [esp+0h] [ebp-Ch] BYREF
     int32_t bindCount; // [esp+8h] [ebp-4h]
 
-    (*keyNames)[128] = 0;
+    keyNames[1][0] = 0;
 #ifdef __SWITCH__
     {
         // The Switch pad performs these commands from fixed buttons
         // (CL_SwitchPadMove), not through the key binding table, so hint
         // strings ("Press [{+activate}] to pick up", PLATFORM_* hints, script
         // key hints) name the pad button instead of a keyboard default.
-        const char *padName = Switch_InputPadButtonName(Switch_InputPadButtonForCommand(command));
+        const char *padName = Switch_InputPadBindingName(command);
         if (padName)
         {
             I_strncpyz(keyNames[0], padName, 128);
             keyNames[1][0] = 0;
             return 1;
         }
+        // Keyboard profiles cannot supply a physical controller binding.
+        // Returning unbound lets scripts select a supported action variant.
+        I_strncpyz(keyNames[0], "KEY_UNBOUND", 128);
+        keyNames[1][0] = 0;
+        return 0;
     }
 #endif
     bindCount = Key_GetCommandAssignmentInternal(localClientNum, command, keys);
@@ -2164,7 +2173,7 @@ int32_t __cdecl CL_GetKeyBindingInternal(int32_t localClientNum, const char *com
     {
         Key_KeynumToStringBuf(keys[0], (char *)keyNames, 128);
         if (bindCount == 2)
-            Key_KeynumToStringBuf(keys[1], &(*keyNames)[128], 128);
+            Key_KeynumToStringBuf(keys[1], keyNames[1], 128);
     }
     else
     {

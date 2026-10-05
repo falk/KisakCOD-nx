@@ -8,6 +8,9 @@
 #include <qcommon/mem_track.h>
 #include <database/database.h>
 #include <cgame/cg_local.h>
+#ifdef __SWITCH__
+#include <port/switch_ui_menus.h>
+#endif
 
 #include <algorithm>
 #include <universal/profile.h>
@@ -36,6 +39,8 @@ int g_debugMode;
 extern itemDef_s *g_bindItem;
 void(__cdecl *captureFunc)(UiContext *, void *);
 void *captureData;
+
+static void Menu_EnsureControllerSelection(UiContext *dc, menuDef_t *menu);
 
 struct commandDef_t // sizeof=0x8
 {                                       // ...
@@ -790,6 +795,7 @@ void __cdecl Menu_GainFocusDueToClose(UiContext *dc, menuDef_t *menu)
         MyAssertHandler(".\\ui\\ui_shared.cpp", 907, 0, "%s", "!Window_HasFocus( dc->localClientNum, &menu->window )");
     Window_AddDynamicFlags(dc->localClientNum, &menu->window, 2);
     Menu_CallOnFocusDueToOpen(dc, menu);
+    Menu_EnsureControllerSelection(dc, menu);
 }
 
 void __cdecl Menu_CallOnFocusDueToOpen(UiContext *dc, menuDef_t *menu)
@@ -1545,6 +1551,11 @@ itemDef_s *__cdecl Menu_FocusFirstSelectableItem(UiContext *dc, menuDef_t *menu)
     uint32_t cursor; // [esp+Ch] [ebp-4h]
     int cursora; // [esp+Ch] [ebp-4h]
 
+    if (menu->itemCount <= 0)
+    {
+        Menu_SetCursorItem(dc->localClientNum, menu, -1);
+        return 0;
+    }
     if (Menu_HandleMouseMove(dc, menu))
     {
         localClientNum = dc->localClientNum;
@@ -1577,9 +1588,26 @@ itemDef_s *__cdecl Menu_FocusFirstSelectableItem(UiContext *dc, menuDef_t *menu)
                 return menu->items[cursora];
             Menu_SetCursorItem(dc->localClientNum, menu, ++cursora);
         }
-        Menu_SetCursorItem(dc->localClientNum, menu, 0);
+        Menu_SetCursorItem(dc->localClientNum, menu, -1);
         return 0;
     }
+}
+
+static void Menu_EnsureControllerSelection(UiContext *dc, menuDef_t *menu)
+{
+    if (dc->isCursorVisible || Menu_GetFocused(dc) != menu)
+        return;
+    for (int i = 0; i < menu->itemCount; ++i)
+    {
+        itemDef_s *candidate = menu->items[i];
+        if (Window_HasFocus(dc->localClientNum, &candidate->window)
+            && Item_SetFocus(dc, candidate, dc->cursor.x, dc->cursor.y))
+            return;
+    }
+    // Open/close scripts can change eligibility. Keep authored selection when
+    // valid; otherwise choose a controller target after those scripts finish.
+    Menu_ClearFocus(dc, menu);
+    Menu_FocusFirstSelectableItem(dc, menu);
 }
 
 void __cdecl Script_SetFocus(UiContext *dc, itemDef_s *item, const char **args)
@@ -2254,6 +2282,10 @@ void __cdecl Item_TextField_BeginEdit(int localClientNum, itemDef_s *item)
 
     if (!item)
         MyAssertHandler(".\\ui\\ui_shared.cpp", 3290, 0, "%s", "item");
+#ifdef __SWITCH__
+    if (Switch_UI_QueueTextEdit(item))
+        return;
+#endif
     editPtr = Item_GetEditFieldDef(item);
     if (editPtr)
         editPtr->paintOffset = 0;
@@ -2314,6 +2346,7 @@ void __cdecl Menus_Open(UiContext *dc, menuDef_t *menu)
         item.parent = menu;
         Item_RunScript(dc, &item, (char*)menu->onOpen);
     }
+    Menu_EnsureControllerSelection(dc, menu);
     if (menu->soundName)
         UI_PlayLocalSoundAliasByName(dc->localClientNum, menu->soundName);
 }
@@ -2521,9 +2554,9 @@ bool __cdecl Item_TextField_HandleKey(UiContext *dc, itemDef_s *item, int key)
                     if (editPtr->maxCharsGotoNext)
                     {
                         newItema = Menu_SetNextCursorItem(dc, item->parent);
-                        newItema->cursorPos[dc->localClientNum] = 0;
                         if (newItema)
                         {
+                            newItema->cursorPos[dc->localClientNum] = 0;
                             if (Item_IsTextField(newItema))
                                 g_editItem = newItema;
                         }
@@ -4645,6 +4678,7 @@ void __cdecl Item_Text_GetSubtitle(StringTable *table, char *outText)
 }
 #endif
 
+const char *__cdecl UI_GetSavegameInfo();
 const float MY_SUBTITLE_GLOWCOLOR[4] = { 0.0f, 0.3f, 0.0f, 1.0f };
 void __cdecl Item_Text_Paint(UiContext *dc, itemDef_s *item)
 {
@@ -4673,6 +4707,10 @@ void __cdecl Item_Text_Paint(UiContext *dc, itemDef_s *item)
 		return;
 #endif
 	}
+    else if ((item->itemFlags & 1) != 0 && item->text)
+    {
+        textPtr = (char *)UI_GetSavegameInfo(); // textsavegame
+    }
     else if (item->text)
     {
         textPtr = (char *)item->text;
@@ -6360,6 +6398,9 @@ void __cdecl UI_AddMenuList(UiContext *dc, MenuList *menuList)
     {
         for (i = 0; i < menuList->menuCount; ++i)
             UI_AddMenu(dc, menuList->menus[i]);
+#ifdef __SWITCH__
+        Switch_UI_OnMenusAdded(dc);
+#endif
     }
 }
 
@@ -6371,6 +6412,9 @@ void __cdecl UI_AddMenu(UiContext *dc, menuDef_t *menu)
         MyAssertHandler(".\\ui\\ui_shared.cpp", 6297, 0, "%s", "menu");
     if (!menu)
         return;
+#ifdef __SWITCH__
+    UI_RemoveUnsupportedSwitchOptions(menu);
+#endif
     if (dc->menuCount >= 0x280u)
         MyAssertHandler(
             ".\\ui\\ui_shared.cpp",

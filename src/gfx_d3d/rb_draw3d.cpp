@@ -23,6 +23,7 @@
 #include "rb_gpupass.h"
 #include "rb_ab_tour.h"
 #include "rb_halfres_particles.h"
+#include "r_taau.h"
 #include "rb_floatz_native.h"
 #include "rb_spotshadow.h"
 #include "rb_shade.h"
@@ -735,9 +736,11 @@ void R_DrawEmissive(const GfxViewInfo *viewInfo, GfxCmdBuf *cmdBuf)
     R_InitCmdBufSourceState(&v4, &viewInfo->input, 1);
     R_SetRenderTargetSize(&v4, R_RENDERTARGET_SCENE);
     R_SetViewportStruct(&v4, &viewInfo->sceneViewport);
+    RB_TaauBeforeEmissive(viewInfo);
     RB_HrpBeginView(viewInfo);
     R_DrawCall(R_DrawEmissiveCallback, viewInfo, &v4, viewInfo, &viewInfo->emissiveInfo, &viewInfo->viewParms, cmdBuf, 0);
     RB_HrpEndView();
+    RB_TaauAfterEmissive(viewInfo);
 }
 
 void __cdecl RB_Draw3DCommon()
@@ -792,7 +795,7 @@ GfxCmdBufSourceState *RB_DebugShaderDrawCommandsCommon()
         memset(gfxCmdBufContext.state->vertexShaderConstState, 0, sizeof(gfxCmdBufContext.state->vertexShaderConstState));
         memset(gfxCmdBufContext.state->pixelShaderConstState, 0, sizeof(gfxCmdBufContext.state->pixelShaderConstState));
         R_SetResolvedScene(gfxCmdBufContext);
-        // r_dynres: scene -> back buffer before the view's 2D.
+        // Scene layout: scene -> back buffer before the view's 2D.
         RB_DynResResolveView(viewInfo, viewInfoIndex == 0);
         R_BeginView(gfxCmdBufContext.source, &viewInfo->sceneDef, &viewInfo->viewParms);
         R_SetViewportStruct(gfxCmdBufContext.source, &viewInfo->displayViewport);
@@ -826,10 +829,10 @@ void RB_StandardDrawCommandsCommon()
             R_SetResolvedScene(gfxCmdBufContext);
             R_BeginView(&gfxCmdBufSourceState, &viewInfo->sceneDef, &viewInfo->viewParms);
             // Post effects and sunpost draw into the scene target: with
-            // r_dynres its viewport is the scene one (smaller than the
+            // the scene layout its viewport is the scene one (smaller than the
             // display); without it the two are the same rectangle.
             R_SetViewportStruct(&gfxCmdBufSourceState,
-                                R_DynResEnabled() ? &viewInfo->sceneViewport : &viewInfo->displayViewport);
+                                R_SceneLayoutEnabled() ? &viewInfo->sceneViewport : &viewInfo->displayViewport);
             RB_GPU_PASS(PostFx);
             if (viewInfo->isRenderingFullScreen)
             {
@@ -845,7 +848,7 @@ void RB_StandardDrawCommandsCommon()
             R_SetRenderTarget(gfxCmdBufContext, R_RENDERTARGET_POST);
             RB_GPU_PASS(SunPost);
             RB_DrawSunPostEffects(viewInfo->localClientNum);
-            // r_dynres: the finished scene -> the back buffer (upscaled), so
+            // Scene layout: the finished scene -> the back buffer (upscaled), so
             // the view's 2D and the HUD draw at the output size.
             RB_DynResResolveView(viewInfo, viewInfoIndex == 0);
             memcpy(&gfxCmdBufState, &gfxCmdBufState, sizeof(gfxCmdBufState));

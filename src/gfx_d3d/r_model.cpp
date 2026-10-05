@@ -15,6 +15,7 @@
 #include "r_utils.h"
 #include <cgame/cg_local.h>
 #include "r_model_pose.h"
+#include "r_skin_cache_fallback.h"
 
 const int boxVerts[24][3] =
 {
@@ -409,7 +410,9 @@ void __cdecl R_LockSkinnedCache()
     IDirect3DVertexBuffer9 *vb; // [esp+30h] [ebp-4h]
 
     iassert( !gfxBuf.skinnedCacheLockAddr );
-    if (!dx.deviceLost)
+    // Without a lockable cache this frame's DObjs skin into the temp skin
+    // buffer (see R_SkinnedCacheLockable).
+    if (R_SkinnedCacheLockable(dx.deviceLost, frontEndDataOut->skinnedCacheVb))
     {
         vb = frontEndDataOut->skinnedCacheVb->buffer;
 
@@ -418,7 +421,7 @@ void __cdecl R_LockSkinnedCache()
         PROF_SCOPED("LockSkinnedCache");
 
         gfxBuf.skinnedCacheLockAddr = (unsigned char *)R_LockVertexBuffer(vb, 0, 0, 0x2000);
-        if (((uint32_t)(intptr_t)gfxBuf.skinnedCacheLockAddr & 0xF) != 0)
+        if (R_SkinnedCacheLockMisaligned(gfxBuf.skinnedCacheLockAddr))
         {
             R_UnlockVertexBuffer(vb);
             gfxBuf.skinnedCacheLockAddr = 0;

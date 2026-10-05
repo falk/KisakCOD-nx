@@ -20,7 +20,8 @@
 // of the mutex is only that it is never the D3D9 DeviceLock (deko9_lock.h),
 // so a producer thread's allocation never queues behind a draw-surface
 // batch (2.2 "Risks": "allocation is CPU-only; no recording or submit from
-// producers").
+// producers"). Only a grow (a brand-new chunk) calls the factory, which may
+// take the device lock; it runs with the arena mutex released.
 
 #include <cstdint>
 #include <functional>
@@ -90,7 +91,7 @@ public:
             return false;
         if (!align)
             align = 1;
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::unique_lock<std::mutex> lock(m_mutex);
 
         auto cur = m_current.find(thread);
         if (cur != m_current.end())
@@ -123,9 +124,15 @@ public:
 
         // Grow: a new chunk, sized to the request when it exceeds the
         // default chunk size (2.2 "large requests get a dedicated chunk").
+        // The factory runs without the arena mutex: it may take the device
+        // lock, and the device lock's holder retires chunks (RetireThrough)
+        // under it, so holding both here would invert that order.
         ArenaChunkMemory mem;
         const uint32_t wantSize = bytes > m_chunkBytes ? bytes : m_chunkBytes;
-        if (!m_factory || !m_factory(wantSize, &mem) || mem.size < bytes)
+        lock.unlock();
+        const bool made = m_factory && m_factory(wantSize, &mem) && mem.size >= bytes;
+        lock.lock();
+        if (!made)
             return false;
         m_chunks.push_back({mem, frame, bytes});
         const uint32_t idx = (uint32_t)m_chunks.size() - 1;

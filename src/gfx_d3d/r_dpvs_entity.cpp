@@ -3,6 +3,10 @@
 #include "r_model_pose.h"
 #include "r_dobj_skin.h"
 #include <cgame/cg_local.h>
+#include "r_scene.h"
+#include "r_sunshadow.h"
+
+#include <port/switch_perf.h>
 
 
 
@@ -23,6 +27,8 @@ void __cdecl R_AddEntitySurfacesInFrustumCmd(const DpvsEntityCmd *dpvsData)
     // address 0 in the first bounding pass after spawn.
     sceneEnt = dpvsData->sceneEnt;
     boneMatrix = R_UpdateSceneEntBounds(sceneEnt, &localSceneEnt, &obj, 1);
+    if (KISAK_PERF_ACTIVE)
+        SwitchPerf_AddEvent(SWITCH_PERF_EV_ENT_TESTED, 1);
     if (boneMatrix)
     {
         iassert( localSceneEnt );
@@ -55,18 +61,30 @@ void __cdecl R_AddEntitySurfacesInFrustumCmd(const DpvsEntityCmd *dpvsData)
 #ifndef KISAK_RADIANT
             CG_CullIn(localSceneEnt->info.pose);
 #endif
+            if (KISAK_PERF_ACTIVE)
+                SwitchPerf_AddEvent(dpvsData->entVisData == scene.dpvs.entVisData[SCENE_VIEW_CAMERA]
+                                        ? SWITCH_PERF_EV_ENT_VISIBLE_CAMERA
+                                        : SWITCH_PERF_EV_ENT_VISIBLE_SHADOW,
+                                    1);
             R_SkinSceneDObj(sceneEnt, localSceneEnt, obj, boneMatrix, 0);
             iassert( localSceneEnt->entnum != gfxCfg.entnumNone );
             dpvsData->entVisData[localSceneEnt->entnum] = 1;
         }
         else
         {
+            if (KISAK_PERF_ACTIVE)
+                SwitchPerf_AddEvent(SWITCH_PERF_EV_ENT_CULLED, 1);
 #ifndef KISAK_RADIANT
             CG_UsedDObjCalcPose(localSceneEnt->info.pose);
 #endif
         }
     }
-    else if (localSceneEnt)
+    else
+    {
+        if (KISAK_PERF_ACTIVE)
+            SwitchPerf_AddEvent(SWITCH_PERF_EV_ENT_CULLED, 1);
+    }
+    if (!boneMatrix && localSceneEnt)
     {
 #ifndef KISAK_RADIANT
         CG_UsedDObjCalcPose(localSceneEnt->info.pose);

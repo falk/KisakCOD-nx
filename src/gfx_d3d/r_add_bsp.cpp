@@ -15,7 +15,6 @@ void __cdecl R_InitBspDrawSurf(GfxBspDrawSurfData* surfData)
     R_InitDelayedCmdBuf(&surfData->delayedCmdBuf);
 }
 
-#ifdef __SWITCH__
 // switch_perfTrace: how a world pretess batch splits into sub-draws, and how
 // many sub-draws it would issue if firstVertex-only splits were merged by
 // rebasing the copied indices (same lightmap, probe and layer-data offset,
@@ -78,7 +77,6 @@ static void R_PreTessCountBatch(const uint16_t *list, uint32_t count, bool copie
     SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_SPLIT_LMAP, splitLmap);
     SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_DRAWS_REBASED, drawsRebased);
 }
-#endif
 
 // r_deko9StaticPretess (r_pretess.h): record the batch as runs of the static
 // world index buffer instead of copying its indices. A run ends where the
@@ -117,13 +115,11 @@ static char R_PreTessBspDrawSurfsStatic(
         runs[runCount - 1].totalTriCount = (uint16_t)(runs[runCount - 1].totalTriCount + triCount);
         nextIndex = surf->tris.baseIndex + 3u * triCount;
     }
-#ifdef __SWITCH__
-    if (SwitchPerf_g_enabled)
+    if (KISAK_PERF_ACTIVE)
     {
         R_PreTessCountBatch(list, count, false);
         SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_STATIC_SURFS, count);
     }
-#endif
     drawSurf.fields.surfType = SF_TRIANGLES_PRETESS;
     if (R_AllocDrawSurf(&surfData->delayedCmdBuf, drawSurf, &surfData->drawSurfList, runCount + 2))
     {
@@ -168,10 +164,8 @@ char __cdecl R_PreTessBspDrawSurfs(
 
     if (!preTessIndices)
         return 0;
-#ifdef __SWITCH__
-    if (SwitchPerf_g_enabled)
+    if (KISAK_PERF_ACTIVE)
         R_PreTessCountBatch(list, count, true);
-#endif
 
     {
         PROF_SCOPED("R_memcpy");
@@ -232,10 +226,8 @@ void __cdecl R_AddBspDrawSurfs(
     v4 = !dx.deviceLost && r_pretess->current.enabled;
     if (!v4 || !R_PreTessBspDrawSurfs(drawSurf, (const uint16_t *)list, count, surfData))
     {
-#ifdef __SWITCH__
-        if (SwitchPerf_g_enabled)
+        if (KISAK_PERF_ACTIVE)
             SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_FALLBACK, count);
-#endif
         if (R_AllocDrawSurf(&surfData->delayedCmdBuf, drawSurf, &surfData->drawSurfList, ((count + 1) >> 1) + 1))
         {
             R_WritePrimDrawSurfInt(&surfData->delayedCmdBuf, count);
@@ -508,9 +500,7 @@ void __cdecl R_AddAllBspDrawSurfacesSpotShadow(uint32_t spotShadowIndex, uint32_
     int drawSurfCount; // [esp+154h] [ebp-4h]
 
     iassert( rgp.world );
-#ifdef __SWITCH__
     SWITCH_PERF_SCOPE(SWITCH_PERF_SCENE_BSP_SPOTSHADOW);
-#endif
     surfaceMaterials = rgp.world->dpvs.surfaceMaterials;
     stage = 3 * spotShadowIndex + 21;
     R_InitBspDrawSurf(&surfData);

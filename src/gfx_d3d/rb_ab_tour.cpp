@@ -11,11 +11,13 @@
 #include <universal/com_files.h>
 
 #include "r_dvars.h"
+#include "r_dynres.h"
 #include "r_init.h"
 #include "rb_backend.h"
 #include "r_material.h"
 #include "r_scene.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -127,10 +129,11 @@ bool RB_EmissiveSkipMaterial(const Material *material)
     return false;
 }
 
-void RB_DrawCensusLabel(const Material *material, const MaterialTechnique *technique, const MaterialPixelShader *ps)
+void RB_DrawCensusLabel(const Material *material, const MaterialTechnique *technique, const MaterialPixelShader *ps,
+                        const MaterialVertexShader *vs)
 {
     Deko9_CensusLabel(dx.device, material ? material->info.name : nullptr, technique ? technique->name : nullptr,
-                      ps ? ps->name : nullptr, ps ? (const void *)ps->prog.ps : nullptr);
+                      ps ? ps->name : nullptr, vs ? vs->name : nullptr, ps ? (const void *)ps->prog.ps : nullptr);
 }
 
 void RB_DrawCensusLight(uint32_t lightIndex, uint32_t viewLights)
@@ -140,6 +143,12 @@ void RB_DrawCensusLight(uint32_t lightIndex, uint32_t viewLights)
 
 void RB_AbTourBackendFrame()
 {
+    // Registered here, not with the renderer's dvars: an A/B knob of the black box.
+    static const dvar_t *cmdChunkKB = Dvar_RegisterInt(
+        "r_deko9CmdChunkKB", 0, DvarLimits(0, 4096), DVAR_NOFLAG,
+        "deko3d renderer: command-memory chunk size in KiB (0 = 256). Every chunk switch starts a new GPFIFO entry: "
+        "1-4 puts dozens into each list, 4096 keeps whole lists in one chunk. Diagnostics");
+    Deko9_SetCmdChunkBytes(dx.device, (uint32_t)cmdChunkKB->current.integer << 10);
     const int mode = r_deko9DrawCensus ? r_deko9DrawCensus->current.integer : 0;
     Deko9_SetDrawCensus(dx.device, (uint32_t)mode, mode ? ParsePasses(r_deko9DrawCensusPasses->current.string) : 0u);
     g_drawCensusOn = mode != 0;
@@ -166,7 +175,7 @@ namespace
 {
 struct TourSpot
 {
-    float v[5]; // x y z yaw pitch
+    float v[6]; // x y z yaw pitch, turn (degrees per second of +left, negative = +right; 0 = still)
     bool here;  // "here": stay where the player is (no teleport)
 };
 
@@ -221,7 +230,7 @@ struct Tour
     std::vector<std::string> shotsOn, shotsOff; // per dvar: the "on" and "off" values
     std::vector<std::string> shotsRestore;      // per dvar: the value at setup, set again after the shots
     // name=v1|v2|...: one shot per value instead of the on/off A/B (e.g. the
-    // r_dynresForceScale sweep); per dvar the value list (one entry = its on
+    // r_renderScale sweep); per dvar the value list (one entry = its on
     // value at every step), and the step script built at setup.
     std::vector<std::vector<std::string>> shotsValues;
     std::vector<std::string> shotSteps;
@@ -243,7 +252,7 @@ bool ParseSpots(const char *text, std::vector<TourSpot> *out)
             continue;
         }
         const std::vector<std::string> f = Split(spot, ',');
-        if (f.size() < 3 || f.size() > 5)
+        if (f.size() < 3 || f.size() > 6)
             return false;
         TourSpot s{};
         for (size_t i = 0; i < f.size(); ++i)
@@ -329,11 +338,38 @@ void ApplyGroup(int group, bool on)
     }
 }
 
+// A spot's turn: the view keeps turning (the +left/+right keys at
+// cl_yawspeed) through its phases, so the A/B sees camera motion; the
+// teleport at each phase start brings it back to the spot's yaw.
+void SetTurn(float degreesPerSecond)
+{
+    Cbuf_AddText(0, "-left\n-right\n");
+    if (degreesPerSecond != 0.0f)
+        Cbuf_AddText(0, va("set cl_yawspeed %g\n%s\n", std::fabs(degreesPerSecond),
+                           degreesPerSecond > 0.0f ? "+left" : "+right"));
+}
+
+// The dynamic-resolution controller would change the scene size with the very
+// load an A/B changes and mask it, so a tour never leaves it running: every
+// phase, baselines included, renders at r_renderScale (set to r_dynresMax
+// when the controller is held).
+void PinDynResScale()
+{
+    if (R_RenderScaleMode() != render_scale::Mode::Adaptive)
+        return;
+    Dvar_SetFloatByName("r_renderScale", r_dynresMax ? r_dynresMax->current.value : 1.0f);
+    R_DynResHoldController();
+    Com_Printf(CON_CHANNEL_SYSTEM, "EMISSIVE_TOUR_PIN r_renderScale=%g\n", r_renderScale->current.value);
+}
+
 void StartPhase(uint32_t now)
 {
     const TourPhase &p = s_tour.phases[s_tour.phase];
     const TourSpot &s = s_tour.spots[p.spot];
     ApplyGroup(p.group, true);
+    PinDynResScale();
+    if (!s_tour.phase || s_tour.phases[s_tour.phase - 1].spot != p.spot)
+        SetTurn(s.v[5]);
     // The census serializes every bracket (timestamps), so it runs in its
     // own phase and never inflates the A/B timings -- unless
     // r_deko9DrawCensusGroups asks for draw counts per group phase.
@@ -341,9 +377,9 @@ void StartPhase(uint32_t now)
     // Still paused at this spot from the previous phase: same frame, no teleport.
     if (!s.here && !s_tour.measurePaused)
         Cbuf_AddText(0, va("setviewpos %g %g %g %g %g\n", s.v[0], s.v[1], s.v[2], s.v[3], s.v[4]));
-    Com_Printf(CON_CHANNEL_SYSTEM, "EMISSIVE_PHASE_BEGIN phase=%u/%u spot=%u org=%g,%g,%g,%g,%g skip=%s\n",
+    Com_Printf(CON_CHANNEL_SYSTEM, "EMISSIVE_PHASE_BEGIN phase=%u/%u spot=%u org=%g,%g,%g,%g,%g turn=%g skip=%s\n",
                s_tour.phase + 1, (unsigned)s_tour.phases.size(), p.spot + 1, s.v[0], s.v[1], s.v[2], s.v[3], s.v[4],
-               PhaseGroupName(p));
+               s.v[5], PhaseGroupName(p));
     s_tour.state = TOUR_SETTLE;
     s_tour.stateStartMs = now;
 }
@@ -394,10 +430,10 @@ void EndMeasure(uint32_t now)
     char label[96];
     snprintf(label, sizeof(label), "spot%u/%s", p.spot + 1, PhaseGroupName(p));
     Com_Printf(CON_CHANNEL_SYSTEM,
-               "EMISSIVE_PHASE phase=%u spot=%u skip=%s frames=%llu fps=%.1f gpu=%.2fms emissive=%.2fms lit=%.2fms "
+               "EMISSIVE_PHASE phase=%u spot=%u skip=%s scale=%g frames=%llu fps=%.1f gpu=%.2fms emissive=%.2fms lit=%.2fms "
                "floatz=%.2fms postfx=%.2fms skipped_lists=%.1f (GPU ms per frame)\n",
-               s_tour.phase + 1, p.spot + 1, PhaseGroupName(p), (unsigned long long)(frames - s_tour.frames0),
-               secs > 0 ? s_tour.measureFrames / secs : 0.0, total / 1e6 / gpuFrames,
+               s_tour.phase + 1, p.spot + 1, PhaseGroupName(p), r_renderScale->current.value,
+               (unsigned long long)(frames - s_tour.frames0), secs > 0 ? s_tour.measureFrames / secs : 0.0, total / 1e6 / gpuFrames,
                (ns[Deko9GpuPass_Emissive] - s_tour.ns0[Deko9GpuPass_Emissive]) / 1e6 / gpuFrames,
                (ns[Deko9GpuPass_Lit] - s_tour.ns0[Deko9GpuPass_Lit]) / 1e6 / gpuFrames,
                (ns[Deko9GpuPass_FloatZ] - s_tour.ns0[Deko9GpuPass_FloatZ]) / 1e6 / gpuFrames,
@@ -433,6 +469,9 @@ void EndMeasure(uint32_t now)
     }
     FX_DrawStatsReport(label); // no-op unless fx_drawStats gathered frames
     ApplyGroup(p.group, false);
+    // The controller stays held once the group's values are undone, before
+    // the next phase's frames, not just at its start.
+    PinDynResScale();
 }
 
 bool TourSetup()
@@ -531,6 +570,7 @@ bool TourSetup()
         }
     }
     Dvar_SetIntByName("r_deko9DrawCensus", 0);
+    PinDynResScale();
     for (uint32_t spot = 0; spot < s_tour.spots.size(); ++spot)
     {
         if (!s_tour.shotsDvar.empty())
@@ -607,7 +647,9 @@ void R_AbTourFrame()
             s_tour.shotStep = 0;
             s_tour.shotFrames = 0;
             s_tour.stateStartMs = now;
-            if (!s_tour.measurePaused)
+            // The pause menu covers the scene on hardware; with
+            // r_deko9EmissiveTourPaused 0 the shots are taken live.
+            if (!s_tour.measurePaused && r_deko9EmissiveTourPaused && r_deko9EmissiveTourPaused->current.enabled)
             {
                 Cbuf_AddText(0, "pause\n");
                 s_tour.measurePaused = true;
@@ -685,7 +727,7 @@ void R_AbTourFrame()
                    s_tour.phases[s_tour.phase].spot + 1, s_tour.shotsDvar.c_str());
         // The spot's census/baseline/group phases follow on the same paused
         // frame (see EndMeasure); unpause only when nothing follows here.
-        if (s_tour.phase + 1 < s_tour.phases.size()
+        if (s_tour.measurePaused && s_tour.phase + 1 < s_tour.phases.size()
             && s_tour.phases[s_tour.phase + 1].spot != s_tour.phases[s_tour.phase].spot)
         {
             Cbuf_AddText(0, "pause\n");
@@ -701,6 +743,7 @@ void R_AbTourFrame()
             Cbuf_AddText(0, "pause\n");
             s_tour.measurePaused = false;
         }
+        SetTurn(0.0f);
         Com_Printf(CON_CHANNEL_SYSTEM, "EMISSIVE_TOUR_DONE phases=%u\n", (unsigned)s_tour.phases.size());
         s_tour.state = TOUR_DONE;
         s_tourActive = false;
@@ -716,6 +759,7 @@ void R_AbTourFrame()
             StartPhase(now);
             return;
         }
+        SetTurn(0.0f);
         Com_Printf(CON_CHANNEL_SYSTEM, "EMISSIVE_TOUR_DONE phases=%u\n", (unsigned)s_tour.phases.size());
         s_tour.state = TOUR_DONE;
         s_tourActive = false;

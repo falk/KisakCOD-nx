@@ -115,6 +115,8 @@ struct server_demo_history_t
 struct SaveImmediate
 {
     void *f;
+    // Set: bytes go here (with f as context) instead of to an FS handle.
+    void (*sink)(void *ctx, const void *data, unsigned int len) = nullptr;
 };
 
 struct FileSkip

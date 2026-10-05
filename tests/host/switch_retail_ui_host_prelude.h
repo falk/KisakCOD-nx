@@ -7,6 +7,9 @@
 #include <time.h>
 #include <strings.h>
 
+struct HWND__;
+struct HINSTANCE__;
+
 typedef void *HWND;
 typedef FILE _iobuf;
 

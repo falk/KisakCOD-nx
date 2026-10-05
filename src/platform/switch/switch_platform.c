@@ -479,10 +479,13 @@ void __cdecl Sys_Print(const char *msg)
     /* Without nxlink, stdout goes nowhere: emulator logs (and the verifiers that
      * parse them) only see svcOutputDebugString, so that stays the path
      * until nxlinkStdio() has redirected stdout to a host. */
+    extern int Switch_PortLogRingActive(void) __attribute__((weak));
     if (Switch_NxlinkStdioActive == NULL || !Switch_NxlinkStdioActive())
     {
         svcOutputDebugString(msg, strlen(msg));
-        return;
+        /* The SD ring log still wants the line (stdout feeds it). */
+        if (Switch_PortLogRingActive == NULL || !Switch_PortLogRingActive())
+            return;
     }
 
     /* stdout is redirected by nxlinkStdio().  Sending the same bytes through

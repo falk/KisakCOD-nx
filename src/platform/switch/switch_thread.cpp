@@ -624,6 +624,12 @@ uint32_t __cdecl Sys_GetCpuCount()
     return Switch_ProcessCoreCount();
 }
 
+namespace
+{
+// Core each spawned frame worker is pinned to (-1: not spawned).
+std::atomic<int> s_workerCpuId[3] = {{-1}, {-1}, {-1}};
+} // namespace
+
 bool __cdecl Sys_SpawnWorkerThread(void (__cdecl *function)(uint32_t), uint32_t threadIndex)
 {
     if (threadIndex > 2)
@@ -636,8 +642,19 @@ bool __cdecl Sys_SpawnWorkerThread(void (__cdecl *function)(uint32_t), uint32_t 
         Fail();
     // Created suspended like threads.cpp's CreateThread(CREATE_SUSPENDED):
     // R_InitHardware/R_UpdateActiveWorkerThreads resume the enabled ones.
-    CreateThreadOn(function, threadContext, WorkerCpuId(threadIndex), false);
+    const int cpuId = WorkerCpuId(threadIndex);
+    CreateThreadOn(function, threadContext, cpuId, false);
+    if (threadHandle[threadContext] != nullptr)
+        s_workerCpuId[threadIndex].store(cpuId, std::memory_order_release);
     return threadHandle[threadContext] != nullptr;
+}
+
+int Switch_WorkerThreadCpuId(uint32_t threadIndex)
+{
+    if (threadIndex >= 3)
+        return -1;
+    const int cpuId = s_workerCpuId[threadIndex].load(std::memory_order_acquire);
+    return cpuId >= 0 ? cpuId : -1;
 }
 
 void __cdecl Sys_WaitForWorkerCmd()

@@ -1,6 +1,7 @@
 #pragma once
 
-// Dynamic render resolution controller (r_dynres).
+// Dynamic render resolution controller (r_dynres): one driver of the scene
+// render scale (r_render_scale.h), replacing r_renderScale while it runs.
 // Pure arithmetic, no engine or deko3d dependency:
 // switch_dynres_test.cpp drives it with synthetic GPU-time sequences.
 //
@@ -48,6 +49,14 @@ namespace dynres
 
 constexpr int kWidthQuantum = 16;
 constexpr int kHeightQuantum = 8;
+
+// GPU budget implied by the frame cap: a 30 fps cap leaves ~31 ms, anything
+// else targets the 60 Hz vsync pace. Derived so no setting mix can pair a
+// 60 fps target with a 30 fps budget.
+inline float BudgetForFrameCap(int maxFps)
+{
+    return maxFps > 0 && maxFps <= 30 ? 31.0f : 15.5f;
+}
 
 struct Config
 {

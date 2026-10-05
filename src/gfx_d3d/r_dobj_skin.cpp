@@ -11,7 +11,9 @@
 #include "r_buffers.h"
 #include "r_model_pose.h"
 #include "r_dpvs.h"
+#include "r_taau.h"
 #include <universal/spin_pause.h>
+#include <port/switch_perf.h>
 
 static void __cdecl R_FlagXModelAsSkinned(GfxSceneEntity *sceneEnt, uint32_t surfaceCount)
 {
@@ -364,6 +366,7 @@ int  R_SkinSceneDObjModels(
         }
     }
 
+    R_TaauNoteDObj(sceneEnt, obj, surfsBuffer, totalSurfaceCount);
     uint32_t totalSurfSize = ((char *)surfPos - (char *)surfsBuffer);
     uint32_t startSurfPos = InterlockedExchangeAdd(&frontEndDataOut->surfPos, totalSurfSize);
 
@@ -385,6 +388,8 @@ int  R_SkinSceneDObjModels(
 
     if (numSkinnedVerts)
     {
+        if (KISAK_PERF_ACTIVE)
+            SwitchPerf_AddEvent(SWITCH_PERF_EV_ENT_SKIN_VERTS, numSkinnedVerts);
         skinCmd.modelSurfs = &frontEndDataOut->surfsBuffer[startSurfPos];
         skinCmd.surfCount = totalSurfaceCount;
         skinCmd.mat = boneMatrix;
@@ -433,6 +438,8 @@ void __cdecl R_SkinSceneDObj(
         {
             surfaceCount = R_SkinSceneDObjModels(localSceneEnt, obj, boneMatrix);
             R_FlagXModelAsSkinned(localSceneEnt, surfaceCount);
+            if (KISAK_PERF_ACTIVE)
+                SwitchPerf_AddEvent(SWITCH_PERF_EV_ENT_SKINNED, 1);
         }
         else if (waitForCullState)
         {

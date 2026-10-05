@@ -20,6 +20,7 @@
 // (SndAr_SpliceEffects / SndAr_UnspliceEffects, snd_audren_reverb.h).
 #if defined(__SWITCH__) && defined(KISAK_OPENAL)
 
+#include <platform/switch/switch_watchdog.h>
 #include <switch.h>
 
 #include "snd_audren_al.h"
@@ -275,6 +276,7 @@ void UpdateThread(void *)
     while (!s_quit.load(std::memory_order_acquire))
     {
         audrenWaitFrame();
+        Watchdog_Crumb(CRUMB_SOUND_MIX);
         if (s_quit.load(std::memory_order_acquire))
             break;
         if (++frame < every)

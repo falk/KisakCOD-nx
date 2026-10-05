@@ -898,6 +898,9 @@ void __cdecl Script_InGameOpen(UiContext *dc, itemDef_s *item, const char **args
 void __cdecl Script_InGameClose(UiContext *dc, itemDef_s *item, const char **args = NULL);
 void __cdecl Script_FocusFirstInMenu(UiContext *dc, itemDef_s *item, const char **args = NULL);
 itemDef_s *__cdecl Menu_FocusFirstSelectableItem(UiContext *dc, menuDef_t *menu);
+#ifdef __SWITCH__
+void UI_RemoveUnsupportedSwitchOptions(menuDef_t *menu);
+#endif
 void __cdecl Script_SetFocus(UiContext *dc, itemDef_s *item, const char **args = NULL);
 void __cdecl Script_SetFocusByDvar(UiContext *dc, itemDef_s *item, const char **args = NULL);
 void __cdecl Script_SetDvar(UiContext *dc, itemDef_s *item, const char **args = NULL);
@@ -2060,4 +2063,3 @@ extern const dvar_t *ui_showMenuOnly;
 extern const dvar_t *ui_cinematicsTimestamp;
 extern const dvar_t *uiscript_debug;
 extern const dvar_t *ui_borderLowLightScale;
-

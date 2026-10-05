@@ -35,6 +35,7 @@ const char kFsrCacheDir[] = "sdmc:/switch/kisakcod/deko9-cache";
 // Bump with any change to the GLSL's meaning that the text hash would not
 // see (the UAM pin).
 constexpr int kFsrCacheVersion = 1;
+} // namespace
 
 bool LoadDkshCached(Device *device, Deko9Stage stage, const char *glsl, ShaderVariant *variant,
                     std::string *error)
@@ -91,8 +92,6 @@ SamplerKey LinearClampKey()
     key.state[D3DSAMP_MAXANISOTROPY] = 1;
     return key;
 }
-
-} // namespace
 
 // Programs, sampler, constant and timestamp memory: the present path loads
 // them at device creation, the dynamic-resolution path on its first call.
@@ -201,12 +200,9 @@ void Device::SetUpscaleMode(uint32_t mode)
     m_fsr.mode = mode;
 }
 
-namespace
-{
-
 // Fixed full-screen state for a native pass into the width x height
 // rectangle at (x, y) of the bound target.
-void BindFullScreenState(DkCmdBuf cmd, uint32_t width, uint32_t height, uint32_t x = 0, uint32_t y = 0)
+void BindFullScreenState(DkCmdBuf cmd, uint32_t width, uint32_t height, uint32_t x, uint32_t y)
 {
     const DkViewport viewport{(float)x, (float)y, (float)width, (float)height, 0.0f, 1.0f};
     const DkScissor scissor{x, y, width, height};
@@ -231,8 +227,6 @@ void BindFullScreenState(DkCmdBuf cmd, uint32_t width, uint32_t height, uint32_t
     dkCmdBufBindVtxAttribState(cmd, nullptr, 0);
     dkCmdBufBindVtxBufferState(cmd, nullptr, 0);
 }
-
-} // namespace
 
 void Device::RecordUpscale(int slot)
 {
@@ -273,13 +267,13 @@ void Device::RecordUpscale(int slot)
     HazardCommit();
     if (m_descriptorsDirty)
     {
-        dkCmdBufBarrier(m_cmd, DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
+        CmdBarrier(DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
         m_descriptorsDirty = false;
     }
     DkImageView swapView;
     dkImageViewDefaults(&swapView, &m_swapImages[slot]);
     const DkImageView *swapTarget = &swapView;
-    dkCmdBufBindRenderTargets(m_cmd, &swapTarget, 1, nullptr);
+    CmdBindTargets(&swapTarget, 1, nullptr);
     BindFullScreenState(m_cmd, kDisplayWidth, kDisplayHeight);
     const ShaderVariant &program = mode == UPSCALE_SGSR            ? m_fsr.sgsr
                                    : mode == UPSCALE_BILINEAR_RCAS ? m_fsr.bilinearRcas
@@ -302,6 +296,7 @@ void Device::RecordUpscale(int slot)
     }
     const DkBufExtents ubo{m_fsr.constants.gpu, 256};
     dkCmdBufBindUniformBuffers(m_cmd, DkStage_Fragment, 1, &ubo, 1);
+    FaultTraceNative(kNativeUpscale);
     dkCmdBufDraw(m_cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
 
     dkCmdBufReportCounter(m_cmd, DkCounter_Timestamp, m_fsr.timestamps.gpu + tsOffset + 16);
@@ -405,13 +400,13 @@ bool Device::UpscaleRect(ImageStore *src, const int32_t srcRect[4], Surface *dst
         HazardCommit();
         if (m_descriptorsDirty)
         {
-            dkCmdBufBarrier(m_cmd, DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
+            CmdBarrier(DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
             m_descriptorsDirty = false;
         }
         DkImageView targetView;
         dstSurface->MakeView(&targetView);
         const DkImageView *targets = &targetView;
-        dkCmdBufBindRenderTargets(m_cmd, &targets, 1, nullptr);
+        CmdBindTargets(&targets, 1, nullptr);
         BindFullScreenState(m_cmd, (uint32_t)dr[2], (uint32_t)dr[3], (uint32_t)dr[0], (uint32_t)dr[1]);
         const DkShader *shaders[2] = {&m_fsr.vs.shader, &program->shader};
         dkCmdBufBindShaders(m_cmd, DkStageFlag_GraphicsMask, shaders, 2);
@@ -439,6 +434,7 @@ bool Device::UpscaleRect(ImageStore *src, const int32_t srcRect[4], Surface *dst
         }
         const DkBufExtents ubo{m_fsr.constants.gpu, 256};
         dkCmdBufBindUniformBuffers(m_cmd, DkStage_Fragment, 1, &ubo, 1);
+        FaultTraceNative(kNativeUpscaleRect);
         dkCmdBufDraw(m_cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
     }
     dkCmdBufReportCounter(m_cmd, DkCounter_Timestamp, m_fsr.rectTimestamps.gpu + tsOffset + 16);
@@ -470,13 +466,13 @@ bool Device::GatherProbe(ImageStore *source, ImageStore *target, int component, 
     HazardCommit();
     if (m_descriptorsDirty)
     {
-        dkCmdBufBarrier(m_cmd, DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
+        CmdBarrier(DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
         m_descriptorsDirty = false;
     }
     DkImageView targetView;
     dkImageViewDefaults(&targetView, &target->image);
     const DkImageView *targets = &targetView;
-    dkCmdBufBindRenderTargets(m_cmd, &targets, 1, nullptr);
+    CmdBindTargets(&targets, 1, nullptr);
     BindFullScreenState(m_cmd, target->width, target->height);
     const DkShader *shaders[2] = {&m_gatherProbe.vs.shader, &m_gatherProbe.ps.shader};
     dkCmdBufBindShaders(m_cmd, DkStageFlag_GraphicsMask, shaders, 2);
@@ -487,6 +483,7 @@ bool Device::GatherProbe(ImageStore *source, ImageStore *target, int component, 
     dkCmdBufPushConstants(m_cmd, m_gatherProbe.constants.gpu, 256, 0, sizeof(constants), &constants);
     const DkBufExtents ubo{m_gatherProbe.constants.gpu, 256};
     dkCmdBufBindUniformBuffers(m_cmd, DkStage_Fragment, 1, &ubo, 1);
+    FaultTraceNative(kNativeGather);
     dkCmdBufDraw(m_cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
     m_listHasWork = true;
     m_dirtyTargets = m_dirtyViewport = m_dirtyRaster = true;
@@ -542,13 +539,13 @@ bool Device::BuildFloatZ(Surface *depthSurface, Surface *targetSurface, const Fl
     HazardCommit();
     if (m_descriptorsDirty)
     {
-        dkCmdBufBarrier(m_cmd, DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
+        CmdBarrier(DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
         m_descriptorsDirty = false;
     }
     DkImageView targetView;
     targetSurface->MakeView(&targetView);
     const DkImageView *targets = &targetView;
-    dkCmdBufBindRenderTargets(m_cmd, &targets, 1, nullptr);
+    CmdBindTargets(&targets, 1, nullptr);
     BindFullScreenState(m_cmd, width, height);
     const DkShader *shaders[2] = {&m_floatZ.vs.shader, &m_floatZ.ps.shader};
     dkCmdBufBindShaders(m_cmd, DkStageFlag_GraphicsMask, shaders, 2);
@@ -559,6 +556,7 @@ bool Device::BuildFloatZ(Surface *depthSurface, Surface *targetSurface, const Fl
     dkCmdBufPushConstants(m_cmd, m_floatZ.constants.gpu, 256, 0, sizeof(constants), &constants);
     const DkBufExtents ubo{m_floatZ.constants.gpu, 256};
     dkCmdBufBindUniformBuffers(m_cmd, DkStage_Fragment, 1, &ubo, 1);
+    FaultTraceNative(kNativeFloatZ);
     dkCmdBufDraw(m_cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
     m_listHasWork = true;
     m_dirtyTargets = m_dirtyViewport = m_dirtyRaster = true;
@@ -651,14 +649,14 @@ bool Device::ParticleDepth(Surface *depthSurface, ImageStore *floatZ, const int3
     HazardCommit();
     if (m_descriptorsDirty)
     {
-        dkCmdBufBarrier(m_cmd, DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
+        CmdBarrier(DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
         m_descriptorsDirty = false;
     }
     DkImageView colorView, depthView;
     dstFloatZSurface->MakeView(&colorView);
     dstDepthSurface->MakeView(&depthView);
     const DkImageView *targets = &colorView;
-    dkCmdBufBindRenderTargets(m_cmd, &targets, 1, &depthView);
+    CmdBindTargets(&targets, 1, &depthView);
     // No clear here: the caller clears the off-screen depth through the
     // device's ordinary Clear first: a clear
     // recorded inside this pass made later zfeather draws of the frame lose
@@ -699,6 +697,7 @@ bool Device::ParticleDepth(Surface *depthSurface, ImageStore *floatZ, const int3
     dkCmdBufPushConstants(m_cmd, m_hrp.depthConstants.gpu, 256, 0, sizeof(constants), constants);
     const DkBufExtents ubo{m_hrp.depthConstants.gpu, 256};
     dkCmdBufBindUniformBuffers(m_cmd, DkStage_Fragment, 1, &ubo, 1);
+    FaultTraceNative(kNativeHrpDepth);
     dkCmdBufDraw(m_cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
     if (m_hrp.rules & DEKO9_HRP_RULE_ZCULL)
     {
@@ -708,7 +707,7 @@ bool Device::ParticleDepth(Surface *depthSurface, ImageStore *floatZ, const int3
         // triangle). Invalidate it, so the off-screen particles' depth tests
         // against this target never cull on stale bounds (some emulators do not
         // emulate zcull: only hardware can show this).
-        dkCmdBufBarrier(m_cmd, DkBarrier_None, DkInvalidateFlags_Zcull);
+        CmdBarrier(DkBarrier_None, DkInvalidateFlags_Zcull);
         ++m_hrp.zcullInvalidates;
     }
     ++m_hrp.depthPasses;
@@ -746,13 +745,13 @@ bool Device::ParticleComposite(ImageStore *color, ImageStore *halfZ, ImageStore 
     HazardCommit();
     if (m_descriptorsDirty)
     {
-        dkCmdBufBarrier(m_cmd, DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
+        CmdBarrier(DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
         m_descriptorsDirty = false;
     }
     DkImageView targetView;
     dstSurface->MakeView(&targetView);
     const DkImageView *targets = &targetView;
-    dkCmdBufBindRenderTargets(m_cmd, &targets, 1, nullptr);
+    CmdBindTargets(&targets, 1, nullptr);
     BindFullScreenState(m_cmd, (uint32_t)dstRect[2], (uint32_t)dstRect[3], (uint32_t)dstRect[0], (uint32_t)dstRect[1]);
     // dst * T + C: colour ONE / SRCALPHA; the scene's alpha is kept.
     DkColorState colorState;
@@ -780,10 +779,24 @@ bool Device::ParticleComposite(ImageStore *color, ImageStore *halfZ, ImageStore 
     dkCmdBufPushConstants(m_cmd, m_hrp.compositeConstants.gpu, 256, 0, sizeof(constants), &constants);
     const DkBufExtents ubo{m_hrp.compositeConstants.gpu, 256};
     dkCmdBufBindUniformBuffers(m_cmd, DkStage_Fragment, 1, &ubo, 1);
+    FaultTraceNative(kNativeHrpComposite);
     dkCmdBufDraw(m_cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
     ++m_hrp.composites;
     EndNativePass();
     return true;
+}
+
+void Device::HrpFullBarrier()
+{
+    CmdBarrier(DkBarrier_Full,
+                    DkInvalidateFlags_Image | DkInvalidateFlags_Shader | DkInvalidateFlags_Descriptors |
+                        DkInvalidateFlags_Zcull | DkInvalidateFlags_L2Cache);
+    ++Stats().barriers;
+    // A barrier: every earlier access is complete (the tracker's clock).
+    ++m_writeClock;
+    m_descriptorsDirty = false;
+    m_listHasWork = true;
+    ++m_hrp.fullBarriers;
 }
 
 } // namespace deko9
@@ -913,4 +926,25 @@ uint64_t Deko9_GetParticleZcullInvalidates(IDirect3DDevice9 *device)
     deko9::Device *d = static_cast<deko9::Device *>(device);
     deko9::DeviceLockGuard lock(d->Lock());
     return d->HrpZcullInvalidates();
+}
+
+void Deko9_ParticleFullBarrier(IDirect3DDevice9 *device)
+{
+    deko9::Device *d = static_cast<deko9::Device *>(device);
+    deko9::DeviceLockGuard lock(d->Lock());
+    d->HrpFullBarrier();
+}
+
+uint64_t Deko9_GetParticleFullBarriers(IDirect3DDevice9 *device)
+{
+    deko9::Device *d = static_cast<deko9::Device *>(device);
+    deko9::DeviceLockGuard lock(d->Lock());
+    return d->HrpFullBarriers();
+}
+
+bool Deko9_ReadParticleConstants(IDirect3DDevice9 *device, uint32_t depth[8], uint32_t composite[12])
+{
+    deko9::Device *d = static_cast<deko9::Device *>(device);
+    deko9::DeviceLockGuard lock(d->Lock());
+    return d->ReadHrpConstants(depth, composite);
 }

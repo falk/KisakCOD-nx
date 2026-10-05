@@ -1,4 +1,4 @@
-// Host proofs for the task/hot-engine2 CPU hot-path slice: every rewritten
+// Host proofs for the rewritten CPU hot-path routines: every rewritten
 // routine against a verbatim copy of the code it replaced, over randomized
 // inputs. Built and run by ./test host under
 // ASan/UBSan (hot_engine2_check), then for AArch64 under qemu.

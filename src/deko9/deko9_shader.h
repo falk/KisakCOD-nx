@@ -108,13 +108,26 @@ uint64_t Deko9_HashBytecode(const void *bytecode, size_t bytes);
 // shaders) are untouched. info->shadowCenterTaps counts the moved lookups.
 constexpr uint32_t DEKO9_MAX_INSTANCE_REGS = 16;
 constexpr uint32_t DEKO9_SHADOW_FILTER_MODES = 2;
+// shaderOpt (r_deko9ShaderOpt): translation choices that change only the
+// Maxwell code, never a result bit (except where noted).
+//   GUARDS: the D3D9 edge-case guards (rcp, rsq, pow, cmp/cnd) as
+//     selects/clamps. MojoShader's `(x == 0) ? FLT_MAX : ...` ternaries and
+//     the cmp selects become if/else diamonds that the compiler predicates
+//     (both sides issue) and that stop it sharing attribute interpolation
+//     across the blocks. rcp keeps the sign of an infinite reciprocal
+//     (IEEE, as D3D9 hardware and DXVK do) where the ternary gave +FLT_MAX
+//     for -0.
+constexpr uint32_t DEKO9_SHADER_OPT_GUARDS = 1u;
+constexpr uint32_t DEKO9_SHADER_OPT_ALL = 1u;
+// Bumped whenever a shaderOpt rewrite's output changes (part of the pack key).
+constexpr uint32_t DEKO9_SHADER_OPT_VERSION = 1;
 // Bumped whenever the shadowFilter rewrite's output changes (part of the
 // cached DKSH name of the filtered variants).
 constexpr uint32_t DEKO9_SHADOW_FILTER_VERSION = 2;
 bool Deko9_TranslateShader(const void *bytecode, size_t bytes, uint32_t shadowSamplerMask,
                            std::string *glsl, Deko9ShaderInfo *info, std::string *error,
                            const uint8_t *instanceRegs = nullptr, uint32_t instanceRegCount = 0,
-                           bool earlyFragmentTests = false, uint32_t shadowFilter = 0);
+                           bool earlyFragmentTests = false, uint32_t shadowFilter = 0, uint32_t shaderOpt = 0);
 
 // Compiles translated GLSL to a DKSH image. Serialized internally: UAM's
 // GLSL front end keeps global state.
@@ -171,5 +184,6 @@ struct Deko9DkshStats
     uint32_t ipa;    // attribute interpolations
     uint32_t tex;    // texture instructions
     uint32_t mufu;   // transcendental unit instructions
+    uint32_t branches; // BRA, SSY, SYNC: control flow the program runs
 };
 bool Deko9_DkshStats(const uint8_t *dksh, size_t size, Deko9DkshStats *out);

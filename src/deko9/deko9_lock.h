@@ -56,7 +56,10 @@ inline uint64_t LockClockNs()
 class DeviceLock
 {
 public:
-    void lock()
+    // `caller` names the call site for the waiter table (CallerStats): a
+    // static string. The default is the calling function's name (GCC/Clang
+    // evaluate __builtin_FUNCTION() at the call site of a default argument).
+    void lock(const char *caller = __builtin_FUNCTION())
     {
         const uintptr_t self = ThreadTag();
         // Only this thread ever stores `self`, so a relaxed load that sees
@@ -74,6 +77,8 @@ public:
         // end holds across a draw-surface list, and the back end queues
         // behind main's uploads. The counters are written only after the
         // mutex is taken, so no other writer races them.
+        bool contended = false;
+        uint64_t waited = 0;
         if (!m_mutex.try_lock())
         {
             const uint64_t t0 = LockClockNs();
@@ -84,16 +89,25 @@ public:
             m_waiters.fetch_add(1, std::memory_order_acq_rel);
             m_mutex.lock();
             m_waiters.fetch_sub(1, std::memory_order_acq_rel);
-            const uint64_t waited = LockClockNs() - t0;
+            waited = LockClockNs() - t0;
             const bool draw = self == m_drawTag;
             ++m_contended[draw];
             m_waitNs[draw] += waited;
             AddSiteWait(holderSite, waited);
+            contended = true;
         }
         m_owner.store(self, std::memory_order_release);
         m_depth = 1;
         ++m_acquisitions;
         ++m_entries;
+        // Every real acquisition by a thread other than the one recording
+        // draws is attributed to its call site, contended or not: in steady
+        // state those threads (main, workers) should take none at all.
+        if (self != m_drawTag)
+        {
+            ++m_otherAcquisitions;
+            AddCallerWait(caller, contended, waited);
+        }
     }
 
     // Threads blocked in lock() right now (the contended path only).
@@ -116,7 +130,7 @@ public:
         // the draw thread.
         for (int spin = 0; spin < 200 && HasWaiters() && m_owner.load(std::memory_order_acquire) == 0; ++spin)
             std::this_thread::yield();
-        ReacquireAfterBlocking(depth);
+        ReacquireAfterBlocking(depth, "handoff");
         ++m_handoffs;
     }
     uint64_t HandOffs() const { return m_handoffs; }
@@ -134,9 +148,9 @@ public:
         m_mutex.unlock();
         return depth;
     }
-    void ReacquireAfterBlocking(uint32_t depth)
+    void ReacquireAfterBlocking(uint32_t depth, const char *caller = "reacquire")
     {
-        lock();
+        lock(caller);
         m_depth = depth;
     }
 
@@ -159,6 +173,24 @@ public:
     };
     // Read while owned.
     const SiteWait *SiteWaits() const { return m_siteWaits; }
+
+    // Waiter-site attribution (DEKO9 perf waiters): every non-recursive
+    // acquisition by a thread other than the draw thread, per call site
+    // (the `caller` passed to lock()), with how many blocked and for how
+    // long. Sites past the table's size share the last slot ("overflow").
+    static constexpr uint32_t kCallerSlots = 32;
+    struct CallerStats
+    {
+        const char *site;
+        uint64_t acquisitions;
+        uint64_t contended;
+        uint64_t ns;
+    };
+    // Read while owned.
+    const CallerStats *Callers() const { return m_callers; }
+    // Non-recursive acquisitions by threads other than the draw thread.
+    // Read while owned.
+    uint64_t OtherAcquisitions() const { return m_otherAcquisitions; }
 
     void unlock()
     {
@@ -197,7 +229,28 @@ private:
     std::atomic<uint32_t> m_waiters{0};
     std::atomic<const char *> m_site{nullptr};
     SiteWait m_siteWaits[kSiteSlots] = {}; // owner-only (written right after taking the mutex)
+    CallerStats m_callers[kCallerSlots] = {}; // owner-only (written right after taking the mutex)
+    uint64_t m_otherAcquisitions = 0;         // owner-only
     std::mutex m_mutex;
+
+    void AddCallerWait(const char *site, bool contended, uint64_t ns)
+    {
+        if (!site)
+            site = "unnamed";
+        uint32_t i = 0;
+        for (; i + 1 < kCallerSlots; ++i)
+        {
+            if (m_callers[i].site == site || !m_callers[i].site)
+                break;
+        }
+        if (i + 1 == kCallerSlots && m_callers[i].site != site)
+            site = "overflow";
+        CallerStats &c = m_callers[i];
+        c.site = site;
+        ++c.acquisitions;
+        c.contended += contended;
+        c.ns += ns;
+    }
 
     void AddSiteWait(const char *site, uint64_t ns)
     {
@@ -230,13 +283,30 @@ private:
     const char *m_prev;
 };
 
-using DeviceLockGuard = std::lock_guard<DeviceLock>;
+// Scoped DeviceLock that names its call site for the waiter table (the
+// calling function by default).
+class DeviceLockGuard
+{
+public:
+    explicit DeviceLockGuard(DeviceLock &lock, const char *caller = __builtin_FUNCTION()) : m_lock(lock)
+    {
+        m_lock.lock(caller);
+    }
+    ~DeviceLockGuard() { m_lock.unlock(); }
+    DeviceLockGuard(const DeviceLockGuard &) = delete;
+    DeviceLockGuard &operator=(const DeviceLockGuard &) = delete;
+
+private:
+    DeviceLock &m_lock;
+};
 
 // Single-submitter rule. SubmitOpenList (its fence-slot reuse wait), the
 // present's swapchain acquire and the frames-in-flight wait block on the GPU
-// with the device lock released (DeviceUnlockScope). That is only correct
-// while no other thread submits in the meantime: two submits would
-// interleave on the one command buffer and fence ring. The rule is the
+// with the device lock released (DeviceUnlockScope), so another thread can
+// submit the open list in the meantime. Each of them re-derives what it
+// read before the wait (SubmitOpenList its fence slot: ReserveListSlot),
+// so such a submit keeps the fence ring intact, but it cuts the owner's
+// list at an arbitrary call and is reported. The rule is the
 // engine's render ownership, not "the thread that drew last": the thread
 // that renders a frame (RB_BeginFrame: the back end with r_smp_backend 1,
 // main inline otherwise, the render thread for loading screens) and main
@@ -292,7 +362,7 @@ public:
     }
     ~DeviceUnlockScope()
     {
-        m_lock.ReacquireAfterBlocking(m_depth);
+        m_lock.ReacquireAfterBlocking(m_depth, m_site ? m_site : "reacquire");
         m_lock.SetSite(m_site);
     }
     DeviceUnlockScope(const DeviceUnlockScope &) = delete;
