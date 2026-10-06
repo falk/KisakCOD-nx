@@ -61,6 +61,17 @@ enum
  * is + (K_ESCAPE) in gameplay. */
 #define SWITCH_INPUT_GAMEPLAY_BUTTON_COUNT 10
 
+/* Menu auto-repeat: a held direction (d-pad, or the left stick pushed past
+ * the engage threshold) re-sends its arrow key after the initial delay, then
+ * at the repeat interval.  The initial delay matches the menu list box's own
+ * auto-scroll start.  Menu only: nothing repeats while gameplayActive. */
+#define SWITCH_INPUT_MENU_REPEAT_DELAY_MS 500
+#define SWITCH_INPUT_MENU_REPEAT_INTERVAL_MS 100
+/* The stick engages a direction at 0.6 and releases it at 0.4 so a stick
+ * hovering at the threshold does not chatter. */
+#define SWITCH_INPUT_MENU_STICK_ENGAGE 0.6f
+#define SWITCH_INPUT_MENU_STICK_RELEASE 0.4f
+
 typedef void (*SwitchInputEventSink)(void *context, uint32_t timestamp, int key, int pressed);
 
 typedef struct
@@ -74,6 +85,13 @@ typedef struct
      * against this field rather than `buttons`, which the frame's gameplay
      * fill overwrites before translation. */
     uint64_t previousButtons;
+    /* Pad buttons plus the stick-derived d-pad bits as of the last
+     * translation; the menu key edges and the repeat follow this mask. */
+    uint64_t previousMenuButtons;
+    /* Direction button currently auto-repeating (0 = none) and the
+     * millisecond timestamp its next repeat is due. */
+    uint64_t repeatButton;
+    uint32_t repeatNextMs;
     /* Normalized, deadzoned stick axes in [-1,1]: [0] = x, [1] = y. */
     float leftStick[2];
     float rightStick[2];

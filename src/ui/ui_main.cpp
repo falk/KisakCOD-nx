@@ -1955,6 +1955,8 @@ void __cdecl UI_LoadSavegames(int /*unused*/)
 #endif
 
     uiInfo.savegameCount = 0;
+    // A save may have been rewritten with a new thumbnail: draw re-requests it.
+    uiInfo.sshotImageName[0] = 0;
     if (saveFiles)
     {
         for (int i = 0; i < saveCount && uiInfo.savegameCount < 512; ++i)
@@ -2030,6 +2032,8 @@ void __cdecl UI_DelSavegame()
         FS_Delete(path);
 #else
         Com_BuildPlayerProfilePath(path, 64, "save/%s.jpg", file);
+        FS_DeleteInDir(path, (char*)"players");
+        Com_BuildPlayerProfilePath(path, 64, "save/%s.svt", file);
         FS_DeleteInDir(path, (char*)"players");
 #endif
         UI_LoadSavegames(0);

@@ -201,6 +201,8 @@ public:
     }
 
     bool OwnedByCaller() const { return m_owner.load(std::memory_order_relaxed) == ThreadTag(); }
+    // The holding thread's tag (0 when free): racy by design outside the owner.
+    uintptr_t OwnerTag() const { return m_owner.load(std::memory_order_relaxed); }
     uint32_t Depth() const { return m_depth; }
     // Non-recursive acquisitions (the underlying mutex was taken), for the
     // per-60-frame perf line. Written only while owned.

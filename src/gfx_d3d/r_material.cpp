@@ -1,3 +1,4 @@
+#include <port/switch_save_writer.h>
 #include <universal/q_shared.h>
 #include <universal/surfaceflags.h>
 #include "r_material.h"
@@ -1135,5 +1136,12 @@ Material *Material_RegisterRawImage(const char *name, int imageTrack)
     iassert(name);
     iassert(rgp.defaultMaterial);
 
+#ifdef __SWITCH__
+    // `name` is a listed save's file name (a saved-game thumbnail); null when
+    // it has none, so the caller keeps its placeholder.
+    (void)imageTrack;
+    return SwitchSaveThumb_Material(name);
+#else
     return rgp.defaultMaterial;
+#endif
 }

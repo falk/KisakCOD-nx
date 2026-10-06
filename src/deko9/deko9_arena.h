@@ -19,8 +19,7 @@
 // per draw), so there is no lock-free fast path worth giving up; the point
 // of the mutex is only that it is never the D3D9 DeviceLock (deko9_lock.h),
 // so a producer thread's allocation never queues behind a draw-surface
-// batch (2.2 "Risks": "allocation is CPU-only; no recording or submit from
-// producers"). Only a grow (a brand-new chunk) calls the factory, which may
+// batch (allocation is CPU-only; producers never record or submit). Only a grow (a brand-new chunk) calls the factory, which may
 // take the device lock; it runs with the arena mutex released.
 
 #include <cstdint>
@@ -34,7 +33,7 @@ namespace deko9
 
 // The dynamic VB/IB rings are on the order of 1-2 MB each, so one span is
 // usually one chunk; a request bigger than the chunk size gets a dedicated
-// chunk of its own (2.2 "Model").
+// chunk of its own.
 constexpr uint32_t kArenaChunkBytes = 1u << 20;
 
 // Opaque real memory for one chunk. FrameArena only ever copies these
@@ -101,7 +100,6 @@ public:
             if (c.owner == frame && (uint64_t)offset + bytes <= c.mem.size)
             {
                 c.used = offset + bytes;
-                ++m_reuses;
                 return Fill(c, offset, bytes, out);
             }
         }
@@ -117,13 +115,12 @@ public:
                 c.owner = frame;
                 c.used = bytes;
                 m_current[thread] = idx;
-                ++m_refills;
                 return Fill(c, 0, bytes, out);
             }
         }
 
         // Grow: a new chunk, sized to the request when it exceeds the
-        // default chunk size (2.2 "large requests get a dedicated chunk").
+        // default chunk size (a large request gets a dedicated chunk).
         // The factory runs without the arena mutex: it may take the device
         // lock, and the device lock's holder retires chunks (RetireThrough)
         // under it, so holding both here would invert that order.
@@ -137,7 +134,6 @@ public:
         m_chunks.push_back({mem, frame, bytes});
         const uint32_t idx = (uint32_t)m_chunks.size() - 1;
         m_current[thread] = idx;
-        ++m_grows;
         return Fill(m_chunks[idx], 0, bytes, out);
     }
 
@@ -173,24 +169,6 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         return (uint32_t)m_free.size();
     }
-    // Diagnostics (r_deko9Census-style before/after evidence): chunks
-    // created from the factory ("heap churn"), pulled from the free list,
-    // and plain bumps into an already-owned chunk.
-    uint64_t Grows() const
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_grows;
-    }
-    uint64_t Refills() const
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_refills;
-    }
-    uint64_t Reuses() const
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_reuses;
-    }
 
 private:
     struct Chunk
@@ -216,7 +194,6 @@ private:
     std::vector<Chunk> m_chunks;
     std::vector<uint32_t> m_free;
     std::unordered_map<uintptr_t, uint32_t> m_current; // thread -> current chunk index
-    uint64_t m_grows = 0, m_refills = 0, m_reuses = 0;
 };
 
 } // namespace deko9

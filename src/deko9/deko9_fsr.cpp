@@ -35,6 +35,8 @@ const char kFsrCacheDir[] = "sdmc:/switch/kisakcod/deko9-cache";
 // Bump with any change to the GLSL's meaning that the text hash would not
 // see (the UAM pin).
 constexpr int kFsrCacheVersion = 1;
+// Program block (at most 64 bytes) plus the gamma ramp (GammaConstants).
+constexpr uint32_t kFsrConstantBytes = 64 + sizeof(GammaConstants);
 } // namespace
 
 bool LoadDkshCached(Device *device, Deko9Stage stage, const char *glsl, ShaderVariant *variant,
@@ -106,7 +108,7 @@ bool Device::EnsureUpscaler(std::string *error)
         !LoadDkshCached(this, DEKO9_STAGE_PIXEL, kBilinearGlsl, &m_fsr.bilinear, &detail))
         return *error = "upscaler program: " + detail, false;
     m_fsr.sampler = SamplerDescriptor(LinearClampKey());
-    if (!AllocMemory(POOL_BUFFER, 256, DK_UNIFORM_BUF_ALIGNMENT, &m_fsr.constants) ||
+    if (!AllocMemory(POOL_BUFFER, kFsrConstantBytes, DK_UNIFORM_BUF_ALIGNMENT, &m_fsr.constants) ||
         !AllocMemory(POOL_DYNAMIC, 3 * 32, 256, &m_fsr.timestamps) ||
         !AllocMemory(POOL_DYNAMIC, Upscaler::kRectSlots * 32, 256, &m_fsr.rectTimestamps))
         return *error = "upscaler constant/timestamp memory allocation failed", false;
@@ -169,7 +171,8 @@ void Device::ReleaseUpscaler()
     m_fsr.backDescriptor = UINT32_MAX;
     for (ShaderVariant *variant : {&m_fsr.vs, &m_fsr.sgsr, &m_fsr.bilinearRcas, &m_fsr.bilinear,
                                    &m_fsr.sgsrRect, &m_fsr.bilinearRcasRect, &m_fsr.bilinearRect,
-                                   &m_gatherProbe.vs, &m_gatherProbe.ps,
+                                   &m_fsr.gamma[0], &m_fsr.gamma[1], &m_fsr.gamma[2], &m_fsr.gammaCurve[0],
+                                   &m_fsr.gammaCurve[1], &m_fsr.gammaCurve[2], &m_gatherProbe.vs, &m_gatherProbe.ps,
                                    &m_floatZ.vs, &m_floatZ.ps})
         FreeVariant(this, variant, m_openSeq);
     for (GpuAlloc *alloc : {&m_fsr.constants, &m_fsr.timestamps, &m_fsr.rectTimestamps, &m_gatherProbe.constants,
@@ -180,7 +183,74 @@ void Device::ReleaseUpscaler()
         *alloc = {};
     }
     m_fsr.active = false;
+    m_fsr.gammaOnly = false;
     m_fsr.loaded = false;
+}
+
+void Device::PushGammaRamp(DkGpuAddr buffer, uint32_t bufferBytes, uint32_t offset)
+{
+    if (GammaIsCurve())
+    {
+        dkCmdBufPushConstants(Rec(), buffer, bufferBytes, offset, sizeof(m_gamma.curve), &m_gamma.curve);
+        return;
+    }
+    // The table in kGammaPushBytes pieces: Ryujinx aborts on a larger single push.
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&m_gamma.lut);
+    for (uint32_t at = 0; at < (uint32_t)sizeof(GammaConstants); at += kGammaPushBytes)
+        dkCmdBufPushConstants(Rec(), buffer, bufferBytes, offset + at,
+                              std::min<uint32_t>(kGammaPushBytes, (uint32_t)sizeof(GammaConstants) - at), bytes + at);
+}
+
+// Called once per present: makes the present pass exist when a gamma ramp is
+// set and the back buffer already has the display size (no upscale pass to
+// fold it into), and drops it again when the ramp returns to identity.
+// Returns whether the pass applies the ramp this frame.
+bool Device::PrepareGammaPass()
+{
+    const bool upscaling = m_params.BackBufferWidth != kDisplayWidth || m_params.BackBufferHeight != kDisplayHeight;
+    if (!m_gamma.on)
+    {
+        if (m_fsr.gammaOnly)
+        {
+            FreeImageDescriptorAfter(m_fsr.backDescriptor, m_openSeq);
+            m_fsr.backDescriptor = UINT32_MAX;
+            m_fsr.active = false;
+            m_fsr.gammaOnly = false;
+            Log("gamma ramp identity: present blit restored");
+        }
+        return false;
+    }
+    std::string error;
+    if (!m_fsr.active && !upscaling)
+    {
+        if (!EnsureUpscaler(&error))
+            return Fail("GAMMA_PASS", "%s", error.c_str()), false;
+        const ImageStore &back = *m_backBuffer->Store();
+        DkImageView view;
+        m_backBuffer->MakeView(&view);
+        std::copy(back.format->swizzle, back.format->swizzle + 4, view.swizzle);
+        m_fsr.backDescriptor = AllocImageDescriptor(view);
+        if (m_fsr.backDescriptor == UINT32_MAX)
+            return Fail("GAMMA_PASS", "back buffer descriptor allocation failed"), false;
+        m_fsr.active = true;
+        m_fsr.gammaOnly = true;
+        Log("gamma ramp set: present applies it at %ux%u", m_params.BackBufferWidth, m_params.BackBufferHeight);
+    }
+    if (!m_fsr.active)
+        return false;
+    const uint32_t mode = m_fsr.gammaOnly ? UPSCALE_BILINEAR : m_fsr.mode;
+    ShaderVariant &variant = GammaProgram(mode);
+    if (!variant.code)
+    {
+        const char *glsl = mode == UPSCALE_SGSR            ? kSgsrGlsl
+                           : mode == UPSCALE_BILINEAR_RCAS ? kBilinearRcasGlsl
+                                                           : kBilinearGlsl;
+        const std::string text = GammaVariant(glsl, GammaIsCurve());
+        std::string detail;
+        if (text.empty() || !LoadDkshCached(this, DEKO9_STAGE_PIXEL, text.c_str(), &variant, &detail))
+            return Fail("GAMMA_PROGRAM", "mode %s: %s", UpscaleModeName(mode), detail.c_str()), false;
+    }
+    return true;
 }
 
 void Device::SetUpscaleSharpness(float stops)
@@ -231,7 +301,10 @@ void BindFullScreenState(DkCmdBuf cmd, uint32_t width, uint32_t height, uint32_t
 void Device::RecordUpscale(int slot)
 {
     ImageStore *back = m_backBuffer->Store().get();
-    const uint32_t mode = m_fsr.mode;
+    // A back buffer at display size only gets a pass for the gamma ramp, and
+    // that is a plain 1:1 copy.
+    const uint32_t mode = m_fsr.gammaOnly ? (uint32_t)UPSCALE_BILINEAR : m_fsr.mode;
+    const bool gamma = m_gamma.on && GammaProgram(mode).code;
 
     // GPU time of the pass. PresentFrame keeps at most two frames in flight,
     // so the report slot written three frames ago is complete. A slot counts
@@ -258,48 +331,47 @@ void Device::RecordUpscale(int slot)
             (unsigned long long)m_fsr.samples);
         m_fsr.gpuNs = m_fsr.samples = 0;
     }
-    dkCmdBufReportCounter(m_cmd, DkCounter_Timestamp, m_fsr.timestamps.gpu + tsOffset);
+    dkCmdBufReportCounter(Rec(), DkCounter_Timestamp, m_fsr.timestamps.gpu + tsOffset);
 
     // Back buffer -> swapchain image (acquire already ordered it after the
     // compositor's read).
     HazardBegin();
     HazardAdd(back, Access::Sample);
     HazardCommit();
-    if (m_descriptorsDirty)
-    {
-        CmdBarrier(DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
-        m_descriptorsDirty = false;
-    }
+    FlushDescriptors();
     DkImageView swapView;
     dkImageViewDefaults(&swapView, &m_swapImages[slot]);
     const DkImageView *swapTarget = &swapView;
     CmdBindTargets(&swapTarget, 1, nullptr);
-    BindFullScreenState(m_cmd, kDisplayWidth, kDisplayHeight);
-    const ShaderVariant &program = mode == UPSCALE_SGSR            ? m_fsr.sgsr
+    BindFullScreenState(Rec(), kDisplayWidth, kDisplayHeight);
+    const ShaderVariant &program = gamma                           ? GammaProgram(mode)
+                                   : mode == UPSCALE_SGSR            ? m_fsr.sgsr
                                    : mode == UPSCALE_BILINEAR_RCAS ? m_fsr.bilinearRcas
                                                                    : m_fsr.bilinear;
     const DkShader *shaders[2] = {&m_fsr.vs.shader, &program.shader};
-    dkCmdBufBindShaders(m_cmd, DkStageFlag_GraphicsMask, shaders, 2);
+    dkCmdBufBindShaders(Rec(), DkStageFlag_GraphicsMask, shaders, 2);
     const DkResHandle backHandle = dkMakeTextureHandle(m_fsr.backDescriptor, m_fsr.sampler);
-    dkCmdBufBindTextures(m_cmd, DkStage_Fragment, 0, &backHandle, 1);
+    dkCmdBufBindTextures(Rec(), DkStage_Fragment, 0, &backHandle, 1);
     if (mode == UPSCALE_SGSR)
     {
         SgsrConstants sgsr;
         SgsrSetup(&sgsr, (int)m_params.BackBufferWidth, (int)m_params.BackBufferHeight);
-        dkCmdBufPushConstants(m_cmd, m_fsr.constants.gpu, 256, 0, sizeof(sgsr), &sgsr);
+        dkCmdBufPushConstants(Rec(), m_fsr.constants.gpu, 256, 0, sizeof(sgsr), &sgsr);
     }
     else if (mode == UPSCALE_BILINEAR_RCAS)
     {
         BilinearRcasConstants rcas;
         BilinearRcasSetup(&rcas, m_fsr.sharpness, (int)kDisplayWidth, (int)kDisplayHeight);
-        dkCmdBufPushConstants(m_cmd, m_fsr.constants.gpu, 256, 0, sizeof(rcas), &rcas);
+        dkCmdBufPushConstants(Rec(), m_fsr.constants.gpu, 256, 0, sizeof(rcas), &rcas);
     }
-    const DkBufExtents ubo{m_fsr.constants.gpu, 256};
-    dkCmdBufBindUniformBuffers(m_cmd, DkStage_Fragment, 1, &ubo, 1);
+    if (gamma)
+        PushGammaRamp(m_fsr.constants.gpu, kFsrConstantBytes, GammaLutOffset(mode));
+    const DkBufExtents ubo{m_fsr.constants.gpu, gamma ? kFsrConstantBytes : 256};
+    dkCmdBufBindUniformBuffers(Rec(), DkStage_Fragment, 1, &ubo, 1);
     FaultTraceNative(kNativeUpscale);
-    dkCmdBufDraw(m_cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
+    dkCmdBufDraw(Rec(), DkPrimitive_Triangles, 3, 1, 0, 0);
 
-    dkCmdBufReportCounter(m_cmd, DkCounter_Timestamp, m_fsr.timestamps.gpu + tsOffset + 16);
+    dkCmdBufReportCounter(Rec(), DkCounter_Timestamp, m_fsr.timestamps.gpu + tsOffset + 16);
     m_listHasWork = true;
     // Everything the engine's draws record was replaced: re-record it all.
     m_dirtyTargets = m_dirtyViewport = m_dirtyRaster = true;
@@ -376,7 +448,7 @@ bool Device::UpscaleRect(ImageStore *src, const int32_t srcRect[4], Surface *dst
             (unsigned long long)m_fsr.rectSamples, (unsigned long long)m_fsr.rectCopies);
         m_fsr.rectGpuNs = m_fsr.rectSamples = m_fsr.rectCopies = 0;
     }
-    dkCmdBufReportCounter(m_cmd, DkCounter_Timestamp, m_fsr.rectTimestamps.gpu + tsOffset);
+    dkCmdBufReportCounter(Rec(), DkCounter_Timestamp, m_fsr.rectTimestamps.gpu + tsOffset);
 
     if (copy)
     {
@@ -389,7 +461,7 @@ bool Device::UpscaleRect(ImageStore *src, const int32_t srcRect[4], Surface *dst
         dstSurface->MakeView(&dv);
         const DkImageRect srcBox{(uint32_t)sr[0], (uint32_t)sr[1], 0, (uint32_t)sr[2], (uint32_t)sr[3], 1};
         const DkImageRect dstBox{(uint32_t)dr[0], (uint32_t)dr[1], 0, (uint32_t)dr[2], (uint32_t)dr[3], 1};
-        dkCmdBufBlitImage(m_cmd, &sv, &srcBox, &dv, &dstBox, DkBlitFlag_FilterNearest, 0);
+        dkCmdBufBlitImage(Rec(), &sv, &srcBox, &dv, &dstBox, DkBlitFlag_FilterNearest, 0);
         ++Stats().blits;
     }
     else
@@ -398,46 +470,42 @@ bool Device::UpscaleRect(ImageStore *src, const int32_t srcRect[4], Surface *dst
         HazardAdd(src, Access::Sample);
         HazardAdd(dst, Access::Render);
         HazardCommit();
-        if (m_descriptorsDirty)
-        {
-            CmdBarrier(DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
-            m_descriptorsDirty = false;
-        }
+        FlushDescriptors();
         DkImageView targetView;
         dstSurface->MakeView(&targetView);
         const DkImageView *targets = &targetView;
         CmdBindTargets(&targets, 1, nullptr);
-        BindFullScreenState(m_cmd, (uint32_t)dr[2], (uint32_t)dr[3], (uint32_t)dr[0], (uint32_t)dr[1]);
+        BindFullScreenState(Rec(), (uint32_t)dr[2], (uint32_t)dr[3], (uint32_t)dr[0], (uint32_t)dr[1]);
         const DkShader *shaders[2] = {&m_fsr.vs.shader, &program->shader};
-        dkCmdBufBindShaders(m_cmd, DkStageFlag_GraphicsMask, shaders, 2);
+        dkCmdBufBindShaders(Rec(), DkStageFlag_GraphicsMask, shaders, 2);
         const DkResHandle handle = dkMakeTextureHandle(src->descriptor, m_fsr.sampler);
-        dkCmdBufBindTextures(m_cmd, DkStage_Fragment, 0, &handle, 1);
+        dkCmdBufBindTextures(Rec(), DkStage_Fragment, 0, &handle, 1);
         UpscaleSource source;
         UpscaleSourceSetup(&source, texW, texH, sr[0], sr[1], sr[2], sr[3]);
         if (mode == UPSCALE_SGSR)
         {
             SgsrConstants c;
             SgsrSetup(&c, texW, texH, source);
-            dkCmdBufPushConstants(m_cmd, m_fsr.constants.gpu, 256, 0, sizeof(c), &c);
+            dkCmdBufPushConstants(Rec(), m_fsr.constants.gpu, 256, 0, sizeof(c), &c);
         }
         else if (mode == UPSCALE_BILINEAR_RCAS)
         {
             BilinearRcasConstants c;
             BilinearRcasSetup(&c, m_fsr.sharpness, dr[2], dr[3], source);
-            dkCmdBufPushConstants(m_cmd, m_fsr.constants.gpu, 256, 0, sizeof(c), &c);
+            dkCmdBufPushConstants(Rec(), m_fsr.constants.gpu, 256, 0, sizeof(c), &c);
         }
         else
         {
             BilinearConstants c;
             BilinearSetup(&c, source);
-            dkCmdBufPushConstants(m_cmd, m_fsr.constants.gpu, 256, 0, sizeof(c), &c);
+            dkCmdBufPushConstants(Rec(), m_fsr.constants.gpu, 256, 0, sizeof(c), &c);
         }
         const DkBufExtents ubo{m_fsr.constants.gpu, 256};
-        dkCmdBufBindUniformBuffers(m_cmd, DkStage_Fragment, 1, &ubo, 1);
+        dkCmdBufBindUniformBuffers(Rec(), DkStage_Fragment, 1, &ubo, 1);
         FaultTraceNative(kNativeUpscaleRect);
-        dkCmdBufDraw(m_cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
+        dkCmdBufDraw(Rec(), DkPrimitive_Triangles, 3, 1, 0, 0);
     }
-    dkCmdBufReportCounter(m_cmd, DkCounter_Timestamp, m_fsr.rectTimestamps.gpu + tsOffset + 16);
+    dkCmdBufReportCounter(Rec(), DkCounter_Timestamp, m_fsr.rectTimestamps.gpu + tsOffset + 16);
     m_listHasWork = true;
     m_dirtyTargets = m_dirtyViewport = m_dirtyRaster = true;
     m_dirtyInput = m_dirtyShaders = m_dirtyTextures = m_dirtyAttribs = true;
@@ -464,27 +532,23 @@ bool Device::GatherProbe(ImageStore *source, ImageStore *target, int component, 
     HazardAdd(source, Access::Sample);
     HazardAdd(target, Access::Render);
     HazardCommit();
-    if (m_descriptorsDirty)
-    {
-        CmdBarrier(DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
-        m_descriptorsDirty = false;
-    }
+    FlushDescriptors();
     DkImageView targetView;
     dkImageViewDefaults(&targetView, &target->image);
     const DkImageView *targets = &targetView;
     CmdBindTargets(&targets, 1, nullptr);
-    BindFullScreenState(m_cmd, target->width, target->height);
+    BindFullScreenState(Rec(), target->width, target->height);
     const DkShader *shaders[2] = {&m_gatherProbe.vs.shader, &m_gatherProbe.ps.shader};
-    dkCmdBufBindShaders(m_cmd, DkStageFlag_GraphicsMask, shaders, 2);
+    dkCmdBufBindShaders(Rec(), DkStageFlag_GraphicsMask, shaders, 2);
     const DkResHandle handle = dkMakeTextureHandle(source->descriptor, SamplerDescriptor(LinearClampKey()));
-    dkCmdBufBindTextures(m_cmd, DkStage_Fragment, 0, &handle, 1);
+    dkCmdBufBindTextures(Rec(), DkStage_Fragment, 0, &handle, 1);
     GatherProbeConstants constants{};
     constants.component[0] = component;
-    dkCmdBufPushConstants(m_cmd, m_gatherProbe.constants.gpu, 256, 0, sizeof(constants), &constants);
+    dkCmdBufPushConstants(Rec(), m_gatherProbe.constants.gpu, 256, 0, sizeof(constants), &constants);
     const DkBufExtents ubo{m_gatherProbe.constants.gpu, 256};
-    dkCmdBufBindUniformBuffers(m_cmd, DkStage_Fragment, 1, &ubo, 1);
+    dkCmdBufBindUniformBuffers(Rec(), DkStage_Fragment, 1, &ubo, 1);
     FaultTraceNative(kNativeGather);
-    dkCmdBufDraw(m_cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
+    dkCmdBufDraw(Rec(), DkPrimitive_Triangles, 3, 1, 0, 0);
     m_listHasWork = true;
     m_dirtyTargets = m_dirtyViewport = m_dirtyRaster = true;
     m_dirtyInput = m_dirtyShaders = m_dirtyTextures = m_dirtyAttribs = true;
@@ -537,27 +601,23 @@ bool Device::BuildFloatZ(Surface *depthSurface, Surface *targetSurface, const Fl
     HazardAdd(depth, Access::Sample);
     HazardAdd(target, Access::Render);
     HazardCommit();
-    if (m_descriptorsDirty)
-    {
-        CmdBarrier(DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
-        m_descriptorsDirty = false;
-    }
+    FlushDescriptors();
     DkImageView targetView;
     targetSurface->MakeView(&targetView);
     const DkImageView *targets = &targetView;
     CmdBindTargets(&targets, 1, nullptr);
-    BindFullScreenState(m_cmd, width, height);
+    BindFullScreenState(Rec(), width, height);
     const DkShader *shaders[2] = {&m_floatZ.vs.shader, &m_floatZ.ps.shader};
-    dkCmdBufBindShaders(m_cmd, DkStageFlag_GraphicsMask, shaders, 2);
+    dkCmdBufBindShaders(Rec(), DkStageFlag_GraphicsMask, shaders, 2);
     SamplerKey key = LinearClampKey();
     key.state[D3DSAMP_MAGFILTER] = key.state[D3DSAMP_MINFILTER] = D3DTEXF_POINT;
     const DkResHandle handle = dkMakeTextureHandle(depth->descriptor, SamplerDescriptor(key));
-    dkCmdBufBindTextures(m_cmd, DkStage_Fragment, 0, &handle, 1);
-    dkCmdBufPushConstants(m_cmd, m_floatZ.constants.gpu, 256, 0, sizeof(constants), &constants);
+    dkCmdBufBindTextures(Rec(), DkStage_Fragment, 0, &handle, 1);
+    dkCmdBufPushConstants(Rec(), m_floatZ.constants.gpu, 256, 0, sizeof(constants), &constants);
     const DkBufExtents ubo{m_floatZ.constants.gpu, 256};
-    dkCmdBufBindUniformBuffers(m_cmd, DkStage_Fragment, 1, &ubo, 1);
+    dkCmdBufBindUniformBuffers(Rec(), DkStage_Fragment, 1, &ubo, 1);
     FaultTraceNative(kNativeFloatZ);
-    dkCmdBufDraw(m_cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
+    dkCmdBufDraw(Rec(), DkPrimitive_Triangles, 3, 1, 0, 0);
     m_listHasWork = true;
     m_dirtyTargets = m_dirtyViewport = m_dirtyRaster = true;
     m_dirtyInput = m_dirtyShaders = m_dirtyTextures = m_dirtyAttribs = true;
@@ -647,11 +707,7 @@ bool Device::ParticleDepth(Surface *depthSurface, ImageStore *floatZ, const int3
     HazardAdd(dstDepth, Access::Render);
     HazardAdd(dstZ, Access::Render);
     HazardCommit();
-    if (m_descriptorsDirty)
-    {
-        CmdBarrier(DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
-        m_descriptorsDirty = false;
-    }
+    FlushDescriptors();
     DkImageView colorView, depthView;
     dstFloatZSurface->MakeView(&colorView);
     dstDepthSurface->MakeView(&depthView);
@@ -662,9 +718,9 @@ bool Device::ParticleDepth(Surface *depthSurface, ImageStore *floatZ, const int3
     // recorded inside this pass made later zfeather draws of the frame lose
     // float-Z intermittently on some emulators). Every covered texel is written.
     const DkScissor scissor{0, 0, w, h};
-    dkCmdBufSetScissors(m_cmd, 0, &scissor, 1);
+    dkCmdBufSetScissors(Rec(), 0, &scissor, 1);
     const DkViewport viewport{0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};
-    dkCmdBufSetViewports(m_cmd, 0, &viewport, 1);
+    dkCmdBufSetViewports(Rec(), 0, &viewport, 1);
     DkRasterizerState raster;
     dkRasterizerStateDefaults(&raster);
     raster.cullMode = DkFace_None;
@@ -678,27 +734,27 @@ bool Device::ParticleDepth(Surface *depthSurface, ImageStore *floatZ, const int3
     ds.depthWriteEnable = true;
     ds.depthCompareOp = DkCompareOp_Always;
     ds.stencilTestEnable = false;
-    dkCmdBufBindRasterizerState(m_cmd, &raster);
-    dkCmdBufBindColorState(m_cmd, &color);
-    dkCmdBufBindColorWriteState(m_cmd, &colorWrite);
-    dkCmdBufBindDepthStencilState(m_cmd, &ds);
-    dkCmdBufBindVtxAttribState(m_cmd, nullptr, 0);
-    dkCmdBufBindVtxBufferState(m_cmd, nullptr, 0);
+    dkCmdBufBindRasterizerState(Rec(), &raster);
+    dkCmdBufBindColorState(Rec(), &color);
+    dkCmdBufBindColorWriteState(Rec(), &colorWrite);
+    dkCmdBufBindDepthStencilState(Rec(), &ds);
+    dkCmdBufBindVtxAttribState(Rec(), nullptr, 0);
+    dkCmdBufBindVtxBufferState(Rec(), nullptr, 0);
     const DkShader *shaders[2] = {&m_hrp.vs.shader, &m_hrp.depthPs.shader};
-    dkCmdBufBindShaders(m_cmd, DkStageFlag_GraphicsMask, shaders, 2);
+    dkCmdBufBindShaders(Rec(), DkStageFlag_GraphicsMask, shaders, 2);
     SamplerKey key = LinearClampKey();
     key.state[D3DSAMP_MAGFILTER] = key.state[D3DSAMP_MINFILTER] = D3DTEXF_POINT;
     const uint32_t sampler = SamplerDescriptor(key);
     const DkResHandle handles[2] = {dkMakeTextureHandle(depth->descriptor, sampler),
                                     dkMakeTextureHandle(floatZ->descriptor, sampler)};
-    dkCmdBufBindTextures(m_cmd, DkStage_Fragment, 0, handles, 2);
+    dkCmdBufBindTextures(Rec(), DkStage_Fragment, 0, handles, 2);
     const int32_t constants[8] = {rect[0], rect[1], rect[0] + rect[2] - 1, rect[1] + rect[3] - 1, (int32_t)factor - 1,
                                   0, 0, 0};
-    dkCmdBufPushConstants(m_cmd, m_hrp.depthConstants.gpu, 256, 0, sizeof(constants), constants);
+    dkCmdBufPushConstants(Rec(), m_hrp.depthConstants.gpu, 256, 0, sizeof(constants), constants);
     const DkBufExtents ubo{m_hrp.depthConstants.gpu, 256};
-    dkCmdBufBindUniformBuffers(m_cmd, DkStage_Fragment, 1, &ubo, 1);
+    dkCmdBufBindUniformBuffers(Rec(), DkStage_Fragment, 1, &ubo, 1);
     FaultTraceNative(kNativeHrpDepth);
-    dkCmdBufDraw(m_cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
+    dkCmdBufDraw(Rec(), DkPrimitive_Triangles, 3, 1, 0, 0);
     if (m_hrp.rules & DEKO9_HRP_RULE_ZCULL)
     {
         // Zcull cannot follow depth a fragment shader writes: its region for
@@ -743,44 +799,40 @@ bool Device::ParticleComposite(ImageStore *color, ImageStore *halfZ, ImageStore 
     HazardAdd(fullZ, Access::Sample);
     HazardAdd(dst, Access::Render);
     HazardCommit();
-    if (m_descriptorsDirty)
-    {
-        CmdBarrier(DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
-        m_descriptorsDirty = false;
-    }
+    FlushDescriptors();
     DkImageView targetView;
     dstSurface->MakeView(&targetView);
     const DkImageView *targets = &targetView;
     CmdBindTargets(&targets, 1, nullptr);
-    BindFullScreenState(m_cmd, (uint32_t)dstRect[2], (uint32_t)dstRect[3], (uint32_t)dstRect[0], (uint32_t)dstRect[1]);
+    BindFullScreenState(Rec(), (uint32_t)dstRect[2], (uint32_t)dstRect[3], (uint32_t)dstRect[0], (uint32_t)dstRect[1]);
     // dst * T + C: colour ONE / SRCALPHA; the scene's alpha is kept.
     DkColorState colorState;
     dkColorStateDefaults(&colorState);
     dkColorStateSetBlendEnable(&colorState, 0, true);
-    dkCmdBufBindColorState(m_cmd, &colorState);
+    dkCmdBufBindColorState(Rec(), &colorState);
     DkBlendState blend;
     dkBlendStateDefaults(&blend);
     dkBlendStateSetFactors(&blend, DkBlendFactor_One, DkBlendFactor_SrcAlpha, DkBlendFactor_Zero, DkBlendFactor_One);
     dkBlendStateSetOps(&blend, DkBlendOp_Add, DkBlendOp_Add);
-    dkCmdBufBindBlendStates(m_cmd, 0, &blend, 1);
+    dkCmdBufBindBlendStates(Rec(), 0, &blend, 1);
     DkColorWriteState colorWrite;
     dkColorWriteStateDefaults(&colorWrite);
     dkColorWriteStateSetMask(&colorWrite, 0, DkColorMask_RGB);
-    dkCmdBufBindColorWriteState(m_cmd, &colorWrite);
+    dkCmdBufBindColorWriteState(Rec(), &colorWrite);
     const DkShader *shaders[2] = {&m_hrp.vs.shader, &m_hrp.compositePs.shader};
-    dkCmdBufBindShaders(m_cmd, DkStageFlag_GraphicsMask, shaders, 2);
+    dkCmdBufBindShaders(Rec(), DkStageFlag_GraphicsMask, shaders, 2);
     SamplerKey key = LinearClampKey();
     key.state[D3DSAMP_MAGFILTER] = key.state[D3DSAMP_MINFILTER] = D3DTEXF_POINT;
     const uint32_t sampler = SamplerDescriptor(key);
     const DkResHandle handles[3] = {dkMakeTextureHandle(color->descriptor, sampler),
                                     dkMakeTextureHandle(halfZ->descriptor, sampler),
                                     dkMakeTextureHandle(fullZ->descriptor, sampler)};
-    dkCmdBufBindTextures(m_cmd, DkStage_Fragment, 0, handles, 3);
-    dkCmdBufPushConstants(m_cmd, m_hrp.compositeConstants.gpu, 256, 0, sizeof(constants), &constants);
+    dkCmdBufBindTextures(Rec(), DkStage_Fragment, 0, handles, 3);
+    dkCmdBufPushConstants(Rec(), m_hrp.compositeConstants.gpu, 256, 0, sizeof(constants), &constants);
     const DkBufExtents ubo{m_hrp.compositeConstants.gpu, 256};
-    dkCmdBufBindUniformBuffers(m_cmd, DkStage_Fragment, 1, &ubo, 1);
+    dkCmdBufBindUniformBuffers(Rec(), DkStage_Fragment, 1, &ubo, 1);
     FaultTraceNative(kNativeHrpComposite);
-    dkCmdBufDraw(m_cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
+    dkCmdBufDraw(Rec(), DkPrimitive_Triangles, 3, 1, 0, 0);
     ++m_hrp.composites;
     EndNativePass();
     return true;

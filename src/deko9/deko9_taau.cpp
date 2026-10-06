@@ -122,42 +122,38 @@ bool Device::TaauOpaque(ImageStore *color, const int32_t srcRect[4], bool after,
     HazardAdd(color, Access::Sample);
     HazardAdd(opaque, Access::Render);
     HazardCommit();
-    if (m_descriptorsDirty)
-    {
-        CmdBarrier(DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
-        m_descriptorsDirty = false;
-    }
+    FlushDescriptors();
     DkImageView view;
     dkImageViewDefaults(&view, &opaque->image);
     const DkImageView *target = &view;
     CmdBindTargets(&target, 1, nullptr);
-    BindFullScreenState(m_cmd, rect[2], rect[3], rect[0], rect[1]);
+    BindFullScreenState(Rec(), rect[2], rect[3], rect[0], rect[1]);
     if (after)
     {
         // dst = luma now - luma before: the transparents' change, signed.
         DkColorState blend;
         dkColorStateDefaults(&blend);
         dkColorStateSetBlendEnable(&blend, 0, true);
-        dkCmdBufBindColorState(m_cmd, &blend);
+        dkCmdBufBindColorState(Rec(), &blend);
         DkBlendState state;
         dkBlendStateDefaults(&state);
         dkBlendStateSetFactors(&state, DkBlendFactor_One, DkBlendFactor_One, DkBlendFactor_One, DkBlendFactor_One);
         dkBlendStateSetOps(&state, DkBlendOp_Sub, DkBlendOp_Sub);
-        dkCmdBufBindBlendStates(m_cmd, 0, &state, 1);
+        dkCmdBufBindBlendStates(Rec(), 0, &state, 1);
     }
     const DkShader *shaders[2] = {&m_fsr.vs.shader, &program->shader};
-    dkCmdBufBindShaders(m_cmd, DkStageFlag_GraphicsMask, shaders, 2);
+    dkCmdBufBindShaders(Rec(), DkStageFlag_GraphicsMask, shaders, 2);
     SamplerKey pointKey = LinearClampKey();
     pointKey.state[D3DSAMP_MAGFILTER] = pointKey.state[D3DSAMP_MINFILTER] = D3DTEXF_POINT;
     const DkResHandle handle =
         dkMakeTextureHandle(color->descriptor, half ? m_fsr.sampler : SamplerDescriptor(pointKey));
-    dkCmdBufBindTextures(m_cmd, DkStage_Fragment, 0, &handle, 1);
-    dkCmdBufDraw(m_cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
+    dkCmdBufBindTextures(Rec(), DkStage_Fragment, 0, &handle, 1);
+    dkCmdBufDraw(Rec(), DkPrimitive_Triangles, 3, 1, 0, 0);
     if (after)
     {
         DkColorState plain;
         dkColorStateDefaults(&plain);
-        dkCmdBufBindColorState(m_cmd, &plain);
+        dkCmdBufBindColorState(Rec(), &plain);
     }
     (after ? m_taau.reactiveReady : m_taau.opaqueReady) = true;
     EndNativePass();
@@ -238,32 +234,32 @@ bool Device::TaauMotion(Surface *depthSurface, const int32_t srcRect[4], const T
     const DkImageView *targets = &motionView;
     CmdBindTargets(&targets, 1, &depthView);
     const DkScissor whole{0, 0, depth->width, depth->height};
-    dkCmdBufSetScissors(m_cmd, 0, &whole, 1);
+    dkCmdBufSetScissors(Rec(), 0, &whole, 1);
     const float none[4] = {kTaauMotionNone, kTaauMotionNone, 0.0f, 0.0f};
-    dkCmdBufClearColor(m_cmd, 0, DkColorMask_RGBA, none);
+    dkCmdBufClearColor(Rec(), 0, DkColorMask_RGBA, none);
     ++m_cc.clears;
     const DkScissor scissor{(uint32_t)sr[0], (uint32_t)sr[1], (uint32_t)sr[2], (uint32_t)sr[3]};
-    dkCmdBufSetScissors(m_cmd, 0, &scissor, 1);
+    dkCmdBufSetScissors(Rec(), 0, &scissor, 1);
 
     DkRasterizerState raster;
     dkRasterizerStateDefaults(&raster);
     raster.cullMode = DkFace_None;
     raster.depthBiasEnableMask = DkPolygonFlag_All;
-    dkCmdBufBindRasterizerState(m_cmd, &raster);
-    dkCmdBufSetDepthBias(m_cmd, kTaauMotionDepthBias, 0.0f, kTaauMotionSlopeBias);
+    dkCmdBufBindRasterizerState(Rec(), &raster);
+    dkCmdBufSetDepthBias(Rec(), kTaauMotionDepthBias, 0.0f, kTaauMotionSlopeBias);
     DkColorState color;
     dkColorStateDefaults(&color);
-    dkCmdBufBindColorState(m_cmd, &color);
+    dkCmdBufBindColorState(Rec(), &color);
     DkColorWriteState colorWrite;
     dkColorWriteStateDefaults(&colorWrite);
-    dkCmdBufBindColorWriteState(m_cmd, &colorWrite);
+    dkCmdBufBindColorWriteState(Rec(), &colorWrite);
     DkDepthStencilState ds;
     dkDepthStencilStateDefaults(&ds);
     ds.depthTestEnable = true;
     ds.depthWriteEnable = false;
     ds.depthCompareOp = DkCompareOp_Lequal;
     ds.stencilTestEnable = false;
-    dkCmdBufBindDepthStencilState(m_cmd, &ds);
+    dkCmdBufBindDepthStencilState(Rec(), &ds);
     DkVtxAttribState attribs[2]{};
     for (uint32_t a = 0; a < 2; ++a)
     {
@@ -271,11 +267,11 @@ bool Device::TaauMotion(Surface *depthSurface, const int32_t srcRect[4], const T
         attribs[a].size = DkVtxAttribSize_3x32;
         attribs[a].type = DkVtxAttribType_Float;
     }
-    dkCmdBufBindVtxAttribState(m_cmd, attribs, 2);
+    dkCmdBufBindVtxAttribState(Rec(), attribs, 2);
     const DkShader *shaders[2] = {&m_taau.motionVs.shader, &m_taau.motionPs.shader};
-    dkCmdBufBindShaders(m_cmd, DkStageFlag_GraphicsMask, shaders, 2);
+    dkCmdBufBindShaders(Rec(), DkStageFlag_GraphicsMask, shaders, 2);
     const DkBufExtents ubo{m_taau.motionConstants.gpu, 256};
-    dkCmdBufBindUniformBuffers(m_cmd, DkStage_Vertex, 0, &ubo, 1);
+    dkCmdBufBindUniformBuffers(Rec(), DkStage_Vertex, 0, &ubo, 1);
 
     // D3D9 pixel centres, as the scene's own draws (deko9_draw.cpp).
     constexpr float kPixelCentre = 0.5f - 1.0f / 128.0f;
@@ -293,13 +289,13 @@ bool Device::TaauMotion(Surface *depthSurface, const int32_t srcRect[4], const T
             const float *z = d.viewmodel ? view.viewmodelDepth : view.sceneDepth;
             const DkViewport vp{(float)sr[0] + kPixelCentre, (float)sr[1] + kPixelCentre, (float)sr[2], (float)sr[3],
                                 z[0], z[1]};
-            dkCmdBufSetViewports(m_cmd, 0, &vp, 1);
+            dkCmdBufSetViewports(Rec(), 0, &vp, 1);
         }
         if (d.stride != stride)
         {
             stride = d.stride;
             const DkVtxBufferState states[2] = {{stride, 0}, {stride, 0}};
-            dkCmdBufBindVtxBufferState(m_cmd, states, 2);
+            dkCmdBufBindVtxBufferState(Rec(), states, 2);
         }
         // The device lock keeps validated buffer objects alive through recording.
         // Resolve their addresses directly instead of allocating per-pass scratch.
@@ -309,25 +305,25 @@ bool Device::TaauMotion(Surface *depthSurface, const int32_t srcRect[4], const T
         const uint32_t prevOffset = d.prevVb ? d.prevVbOffset : d.vbOffset;
         const DkBufExtents vbs[2] = {{vb->Gpu() + d.vbOffset, vb->Size() - d.vbOffset},
                                      {prev->Gpu() + prevOffset, prev->Size() - prevOffset}};
-        dkCmdBufBindVtxBuffers(m_cmd, 0, vbs, 2);
+        BindVtxBuffers(Rec(), 0, vbs, 2);
         if (ib->Gpu() != indexAddress)
         {
             indexAddress = ib->Gpu();
-            dkCmdBufBindIdxBuffer(m_cmd, DkIdxFormat_Uint16, indexAddress);
+            dkCmdBufBindIdxBuffer(Rec(), DkIdxFormat_Uint16, indexAddress);
         }
         vb->StampUse(this, m_openSeq);
         prev->StampUse(this, m_openSeq);
         ib->StampUse(this, m_openSeq);
         TaauMotionConstants constants;
         TaauMotionSetup(&constants, d, view);
-        dkCmdBufPushConstants(m_cmd, m_taau.motionConstants.gpu, 256, 0, sizeof(constants), &constants);
-        dkCmdBufDrawIndexed(m_cmd, DkPrimitive_Triangles, d.indexCount, 1, d.firstIndex, 0, 0);
+        dkCmdBufPushConstants(Rec(), m_taau.motionConstants.gpu, 256, 0, sizeof(constants), &constants);
+        dkCmdBufDrawIndexed(Rec(), DkPrimitive_Triangles, d.indexCount, 1, d.firstIndex, 0, 0);
     }
     m_taau.motionDraws += drawn;
     m_taau.motionReady = true;
     // Slot 0 is the engine's vertex constant block, bound once per list.
     const DkBufExtents vsUbo{m_vsUbo.gpu, m_vsUbo.size};
-    dkCmdBufBindUniformBuffers(m_cmd, DkStage_Vertex, 0, &vsUbo, 1);
+    dkCmdBufBindUniformBuffers(Rec(), DkStage_Vertex, 0, &vsUbo, 1);
     EndNativePass();
     return true;
 }
@@ -427,7 +423,7 @@ bool Device::TaauResolve(ImageStore *color, Surface *depthSurface, const int32_t
             (unsigned long long)m_taau.motionAllocs, (unsigned long long)m_taau.opaqueAllocs);
         m_taau.gpuNs = m_taau.samples = m_taau.resets = m_taau.motionDraws = m_taau.motionSkips = 0;
     }
-    dkCmdBufReportCounter(m_cmd, DkCounter_Timestamp, m_taau.timestamps.gpu + tsOffset);
+    dkCmdBufReportCounter(Rec(), DkCounter_Timestamp, m_taau.timestamps.gpu + tsOffset);
 
     HazardBegin();
     HazardAdd(color, Access::Sample);
@@ -440,19 +436,15 @@ bool Device::TaauResolve(ImageStore *color, Surface *depthSurface, const int32_t
     HazardAdd(next, Access::Render);
     HazardAdd(dst, Access::Render);
     HazardCommit();
-    if (m_descriptorsDirty)
-    {
-        CmdBarrier(DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
-        m_descriptorsDirty = false;
-    }
+    FlushDescriptors();
     DkImageView dstView, histView;
     dstSurface->MakeView(&dstView);
     dkImageViewDefaults(&histView, &next->image);
     const DkImageView *both[2] = {&dstView, &histView};
     CmdBindTargets(both, 2, nullptr);
-    BindFullScreenState(m_cmd, (uint32_t)dr[2], (uint32_t)dr[3], (uint32_t)dr[0], (uint32_t)dr[1]);
+    BindFullScreenState(Rec(), (uint32_t)dr[2], (uint32_t)dr[3], (uint32_t)dr[0], (uint32_t)dr[1]);
     const DkShader *shaders[2] = {&m_fsr.vs.shader, &program->shader};
-    dkCmdBufBindShaders(m_cmd, DkStageFlag_GraphicsMask, shaders, 2);
+    dkCmdBufBindShaders(Rec(), DkStageFlag_GraphicsMask, shaders, 2);
     SamplerKey pointKey = LinearClampKey();
     pointKey.state[D3DSAMP_MAGFILTER] = pointKey.state[D3DSAMP_MINFILTER] = D3DTEXF_POINT;
     const uint32_t point = SamplerDescriptor(pointKey);
@@ -464,14 +456,14 @@ bool Device::TaauResolve(ImageStore *color, Surface *depthSurface, const int32_t
                                     dkMakeTextureHandle((motion ? motion : color)->descriptor, point),
                                     dkMakeTextureHandle((opaque ? opaque : color)->descriptor,
                                                         opaqueHalf ? m_fsr.sampler : point)};
-    dkCmdBufBindTextures(m_cmd, DkStage_Fragment, 0, handles, 5);
+    dkCmdBufBindTextures(Rec(), DkStage_Fragment, 0, handles, 5);
     TaauConstants constants;
     TaauSetup(&constants, sr, dr, color->width, color->height, dst->width, dst->height, f);
-    dkCmdBufPushConstants(m_cmd, m_taau.constants.gpu, 256, 0, sizeof(constants), &constants);
+    dkCmdBufPushConstants(Rec(), m_taau.constants.gpu, 256, 0, sizeof(constants), &constants);
     const DkBufExtents ubo{m_taau.constants.gpu, 256};
-    dkCmdBufBindUniformBuffers(m_cmd, DkStage_Fragment, 1, &ubo, 1);
-    dkCmdBufDraw(m_cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
-    dkCmdBufReportCounter(m_cmd, DkCounter_Timestamp, m_taau.timestamps.gpu + tsOffset + 16);
+    dkCmdBufBindUniformBuffers(Rec(), DkStage_Fragment, 1, &ubo, 1);
+    dkCmdBufDraw(Rec(), DkPrimitive_Triangles, 3, 1, 0, 0);
+    dkCmdBufReportCounter(Rec(), DkCounter_Timestamp, m_taau.timestamps.gpu + tsOffset + 16);
     m_taau.next ^= 1;
     m_taau.valid = true;
     EndNativePass();
@@ -485,11 +477,11 @@ bool Deko9_TaauMotion(IDirect3DDevice9 *device, IDirect3DSurface9 *depth, const 
 {
     deko9::Device *d = static_cast<deko9::Device *>(device);
     deko9::DeviceLockGuard lock(d->Lock());
-    std::string error = "no view, rectangle or draws";
+    std::string error;
     if (!view || !srcRect || (count && !draws) ||
         !d->TaauMotion(static_cast<deko9::Surface *>(depth), srcRect, *view, draws, count, &error))
     {
-        deko9::Fail("TAAU_MOTION", "%s", error.c_str());
+        deko9::Fail("TAAU_MOTION", "%s", error.empty() ? "no view, rectangle or draws" : error.c_str());
         return false;
     }
     return true;
@@ -502,10 +494,10 @@ bool Deko9_TaauOpaque(IDirect3DDevice9 *device, IDirect3DBaseTexture9 *color, co
     deko9::DeviceLockGuard lock(d->Lock());
     deko9::ImageStore *store =
         color && color->GetType() == D3DRTYPE_TEXTURE ? static_cast<deko9::Texture2D *>(color)->Store().get() : nullptr;
-    std::string error = "no rectangle";
+    std::string error;
     if (!srcRect || !d->TaauOpaque(store, srcRect, after, half, &error))
     {
-        deko9::Fail("TAAU_OPAQUE", "%s", error.c_str());
+        deko9::Fail("TAAU_OPAQUE", "%s", error.empty() ? "no rectangle" : error.c_str());
         return false;
     }
     return true;
@@ -519,12 +511,12 @@ bool Deko9_TaauResolve(IDirect3DDevice9 *device, IDirect3DBaseTexture9 *color, I
     deko9::DeviceLockGuard lock(d->Lock());
     deko9::ImageStore *store =
         color && color->GetType() == D3DRTYPE_TEXTURE ? static_cast<deko9::Texture2D *>(color)->Store().get() : nullptr;
-    std::string error = "no frame or rectangles";
+    std::string error;
     if (!frame || !srcRect || !dstRect ||
         !d->TaauResolve(store, static_cast<deko9::Surface *>(depth), srcRect, static_cast<deko9::Surface *>(dst),
                         dstRect, *frame, &error))
     {
-        deko9::Fail("TAAU", "%s", error.c_str());
+        deko9::Fail("TAAU", "%s", error.empty() ? "no frame or rectangles" : error.c_str());
         return false;
     }
     return true;

@@ -126,6 +126,12 @@ void __cdecl G_UpdateAllEntities();
 void G_CheckAllEntities();
 void __cdecl G_SaveInitState(SaveGame *save);
 void __cdecl G_SaveMainState(bool savegame, SaveGame *save);
+#ifdef KISAK_SP
+#define HUDELEM_SAVE_RECORD_BYTES 172
+#define HUDELEM_SAVE_BYTES 44032
+void __cdecl G_SaveHudElems(SaveGame *save);
+void __cdecl G_LoadHudElems(SaveGame *save);
+#endif
 void __cdecl G_SaveState(bool savegame, SaveGame *save);
 int __cdecl G_IsSavePossible(SaveType saveType);
 int __cdecl G_WriteGame(const PendingSave *pendingSave, int checksum, SaveGame *save);

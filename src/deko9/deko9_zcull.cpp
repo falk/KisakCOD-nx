@@ -108,7 +108,7 @@ void Device::ZcullRecordMark(uint32_t slot)
     uint32_t *words = reinterpret_cast<uint32_t *>(m_zcullStamps.cpu + slot * 16);
     for (int i = 0; i < 4; ++i)
         words[i] = kZcullUnwritten;
-    dkCmdBufReportCounter(m_cmd, DkCounter_ZcullStats, m_zcullStamps.gpu + slot * 16);
+    dkCmdBufReportCounter(Rec(), DkCounter_ZcullStats, m_zcullStamps.gpu + slot * 16);
 }
 
 void Device::ZcullRetireMark(uint32_t slot, const PassMark &mark)

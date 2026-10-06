@@ -1,3 +1,6 @@
+#include <mutex>
+#include <atomic>
+#include <port/switch_save_thumb.h>
 #include <platform/switch/switch_watchdog.h>
 #include "r_dynres.h"
 #include <deko9/deko9_native.h>
@@ -153,7 +156,20 @@ bool RB_WriteBackbufferPng(const char *filename, const D3DLOCKED_RECT &locked,
 char s_requestedScreenshot[256] = "";
 bool s_requestedScreenshotDone = false;
 bool s_requestedScreenshotOk = false;
+// Saved-game thumbnail request (switch_save_thumb.cpp): its own slot so a
+// console screenshot and a save can be pending together. Written by the
+// game thread, consumed by whichever thread presents.
+std::mutex s_thumbMutex;
+char s_thumbPath[256] = "";
+std::atomic<bool> s_thumbPending{false};
 } // namespace
+
+void RB_RequestSaveThumbnail(const char *ospath)
+{
+    std::lock_guard<std::mutex> lock(s_thumbMutex);
+    snprintf(s_thumbPath, sizeof(s_thumbPath), "%s", ospath);
+    s_thumbPending.store(true, std::memory_order_release);
+}
 
 void RB_RequestScreenshot(const char *ospath)
 {
@@ -2912,21 +2928,9 @@ static void RB_ApplyDeko9FrameSettings()
     Deko9_ClaimSubmitThread(device);
     Deko9_SetVerify(device, r_deko9Verify && r_deko9Verify->current.enabled);
     Deko9_SetEarlyZ(device, !r_deko9EarlyZ || r_deko9EarlyZ->current.enabled);
-    Deko9_SetPerDraw(device, ((!r_deko9HazardCache || r_deko9HazardCache->current.enabled) ? DEKO9_PERDRAW_HAZARD : 0u) |
-                                 ((!r_deko9ConstFast || r_deko9ConstFast->current.enabled) ? DEKO9_PERDRAW_CONSTS : 0u) |
-                                 ((!r_deko9TexIncremental || r_deko9TexIncremental->current.enabled)
-                                      ? DEKO9_PERDRAW_TEXTURES
-                                      : 0u) |
-                                 ((!r_deko9StaticHazard || r_deko9StaticHazard->current.enabled)
-                                      ? DEKO9_PERDRAW_STATICTEX
-                                      : 0u));
     // These take effect at the next Present, so a frame is recorded whole.
     Deko9_SetGpuPasses(device, (r_deko9GpuPasses && r_deko9GpuPasses->current.enabled) || RB_HrpWantsGpuPasses());
-    Deko9_SetDrawProbe(device, r_deko9DrawProbe ? (uint32_t)r_deko9DrawProbe->current.integer : 0u,
-                       r_deko9DrawSplit ? (uint32_t)r_deko9DrawSplit->current.integer : 1u);
     RB_HrpFrameUpdate();
-    Deko9_SetBarrierMode(device, r_deko9LightBarriers ? (uint32_t)r_deko9LightBarriers->current.integer : 0);
-    Deko9_SetTiledCache(device, r_deko9TiledCache ? (uint32_t)r_deko9TiledCache->current.integer : 0);
     Deko9_SetZcullStats(device, r_deko9ZcullStats && r_deko9ZcullStats->current.enabled);
     Deko9_SetShadowFilter(device, r_shadowFilter ? (uint32_t)r_shadowFilter->current.integer : 0);
     Deko9_SetShaderOpt(device, r_deko9ShaderOpt ? (uint32_t)r_deko9ShaderOpt->current.integer : DEKO9_DEFAULT_SHADER_OPT);
@@ -3009,11 +3013,6 @@ GfxIndexBufferState *RB_SwapBuffers()
     {
         PROF_SCOPED("Present");
 #ifdef __SWITCH__
-        char pbuf[128];
-        std::snprintf(pbuf, sizeof(pbuf), "RB_SwapBuffers: targetWin=%d, winCount=%d, sc=%p\n",
-                      dx.targetWindowIndex, dx.windowCount,
-                      (dx.targetWindowIndex >= 0 && dx.targetWindowIndex < dx.windowCount) ? dx.windows[dx.targetWindowIndex].swapChain : nullptr);
-
         // Rolling screenshot ring buffer for the external screenshot server:
         // captures one frame every kScreenshotInterval presented frames into a fixed set of
         // kScreenshotRingSize files, cycling filenames so the SD card only ever holds the
@@ -3027,9 +3026,10 @@ GfxIndexBufferState *RB_SwapBuffers()
         // duration can write hundreds of MB even though only
         // kScreenshotRingSize files ever exist on disk at once.
         const bool requestedShot = s_requestedScreenshot[0] != '\0';
+        const bool thumbShot = s_thumbPending.load(std::memory_order_acquire);
         const bool ringShot =
             r_captureRing && r_captureRing->current.enabled && (s_dumpFrame % kScreenshotInterval) == 0;
-        if (requestedShot || ringShot)
+        if (requestedShot || ringShot || thumbShot)
         {
             int slot = (s_dumpFrame / kScreenshotInterval) % kScreenshotRingSize;
             IDirect3DSurface9 *backBuffer = nullptr;
@@ -3048,73 +3048,28 @@ GfxIndexBufferState *RB_SwapBuffers()
                         D3DLOCKED_RECT locked;
                         if (SUCCEEDED(sysSurface->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
                         {
-                            snprintf(pbuf, sizeof(pbuf),
-                                     "RB_SwapBuffers: capture desc=%ux%u fmt=%u pitch=%d (expected>=%u)\n",
-                                     desc.Width, desc.Height, (unsigned)desc.Format, locked.Pitch, desc.Width * 4);
-                            // Decisive bind/present-coherence probe: sample the captured
-                            // backbuffer pixels directly (center + corners) and compare
-                            // against the currently-bound render target's content.
-                            {
-                                auto pxAt = [&](uint32_t x, uint32_t y) -> uint32_t {
-                                    if (x >= desc.Width || y >= desc.Height)
-                                        return 0xdeadbeef;
-                                    const uint8_t *row = (const uint8_t *)locked.pBits + y * locked.Pitch;
-                                    uint32_t v = 0;
-                                    memcpy(&v, row + x * 4, 4);
-                                    return v;
-                                };
-                                uint32_t c = pxAt(desc.Width / 2, desc.Height / 2);
-                                uint32_t tl = pxAt(0, 0);
-                                uint32_t tr = pxAt(desc.Width - 1, 0);
-                                uint32_t bl = pxAt(0, desc.Height - 1);
-                                uint32_t br = pxAt(desc.Width - 1, desc.Height - 1);
-                                snprintf(pbuf, sizeof(pbuf),
-                                         "RB_SwapBuffers: bb0 px center=0x%08x tl=0x%08x tr=0x%08x bl=0x%08x br=0x%08x bb=%p\n",
-                                         c, tl, tr, bl, br, (void *)backBuffer);
-                            }
-                            IDirect3DSurface9 *boundRT = nullptr;
-                            if (SUCCEEDED(dx.device->GetRenderTarget(0, &boundRT)) && boundRT)
-                            {
-                                snprintf(pbuf, sizeof(pbuf),
-                                         "RB_SwapBuffers: boundRT=%p bb0=%p same=%d\n",
-                                         (void *)boundRT, (void *)backBuffer, boundRT == backBuffer);
-                                IDirect3DSurface9 *rtSys = nullptr;
-                                if (SUCCEEDED(dx.device->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format, D3DPOOL_SYSTEMMEM, &rtSys, nullptr)) && rtSys)
-                                {
-                                    if (SUCCEEDED(dx.device->GetRenderTargetData(boundRT, rtSys)))
-                                    {
-                                        D3DLOCKED_RECT rtLocked;
-                                        if (SUCCEEDED(rtSys->LockRect(&rtLocked, nullptr, D3DLOCK_READONLY)))
-                                        {
-                                            auto rtPxAt = [&](uint32_t x, uint32_t y) -> uint32_t {
-                                                if (x >= desc.Width || y >= desc.Height)
-                                                    return 0xdeadbeef;
-                                                const uint8_t *row = (const uint8_t *)rtLocked.pBits + y * rtLocked.Pitch;
-                                                uint32_t v = 0;
-                                                memcpy(&v, row + x * 4, 4);
-                                                return v;
-                                            };
-                                            uint32_t c = rtPxAt(desc.Width / 2, desc.Height / 2);
-                                            uint32_t tl = rtPxAt(0, 0);
-                                            uint32_t br = rtPxAt(desc.Width - 1, desc.Height - 1);
-                                            snprintf(pbuf, sizeof(pbuf),
-                                                     "RB_SwapBuffers: boundRT px center=0x%08x tl=0x%08x br=0x%08x\n",
-                                                     c, tl, br);
-                                            rtSys->UnlockRect();
-                                        }
-                                    }
-                                    else
-                                    {
-                                    }
-                                    rtSys->Release();
-                                }
-                                boundRT->Release();
-                            }
                             char filename[256];
                             if (requestedShot)
                                 snprintf(filename, sizeof(filename), "%s", s_requestedScreenshot);
                             else
                                 snprintf(filename, sizeof(filename), "sdmc:/switch/kisakcod/screenshot_%02d.png", slot);
+                            if (thumbShot)
+                            {
+                                char thumbPath[256];
+                                {
+                                    std::lock_guard<std::mutex> lock(s_thumbMutex);
+                                    snprintf(thumbPath, sizeof(thumbPath), "%s", s_thumbPath);
+                                    s_thumbPending.store(false, std::memory_order_release);
+                                }
+                                static uint8_t thumb[kSaveThumbBgraBytes];
+                                const bool thumbOk =
+                                    SaveThumb_FromFrame(static_cast<const uint8_t *>(locked.pBits), desc.Width,
+                                                        desc.Height, static_cast<uint32_t>(locked.Pitch), thumb) &&
+                                    SaveThumb_WriteFile(thumbPath, thumb);
+                                Com_Printf(CON_CHANNEL_GFX, "SAVE_THUMB %s %s\n", thumbOk ? "wrote" : "FAILED", thumbPath);
+                            }
+                            if (requestedShot || ringShot)
+                            {
                             const bool wrote = RB_WriteBackbufferPng(filename, locked, desc.Width, desc.Height);
                             if (requestedShot)
                             {
@@ -3122,10 +3077,6 @@ GfxIndexBufferState *RB_SwapBuffers()
                                 s_requestedScreenshotOk = wrote;
                                 s_requestedScreenshotDone = true;
                             }
-                            if (wrote)
-                            {
-                                snprintf(pbuf, sizeof(pbuf), "RB_SwapBuffers: dumped guest backbuffer to %s (frame=%d, format=%u, %ux%u)\n",
-                                         filename, s_dumpFrame, (unsigned)desc.Format, desc.Width, desc.Height);
                             }
                             sysSurface->UnlockRect();
                         }
@@ -3143,9 +3094,6 @@ GfxIndexBufferState *RB_SwapBuffers()
             Deko9_SetUpscaleMode(dx.device, r_fsrMode ? (uint32_t)r_fsrMode->current.integer : 0u);
             hr = dx.windows[dx.targetWindowIndex].swapChain->Present(0, 0, 0, 0, 0);
         }
-#ifdef __SWITCH__
-        std::snprintf(pbuf, sizeof(pbuf), "RB_SwapBuffers: swapChain->Present returned hr=0x%08x\n", (unsigned int)hr);
-#endif
         // r_renderResolution below the display: the ring shot above is the
         // render-size back buffer; also dump what reached the screen (the
         // upscaled front buffer) as screenshot_NN_fsr.png.

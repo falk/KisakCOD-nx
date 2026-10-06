@@ -83,9 +83,11 @@ int main(void)
         Switch_InputFrameUpdate(&frame, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f,
                                 SWITCH_INPUT_BUTTON_RIGHT | SWITCH_INPUT_BUTTON_A, 1,
                                 300, RecordEvent, &frameEvents);
-        if (frameEvents.count != 2 ||
-            !CheckEvent(&frameEvents, 0, 300, SWITCH_INPUT_K_RIGHTARROW, 1) ||
-            !CheckEvent(&frameEvents, 1, 300, SWITCH_INPUT_K_ENTER, 1))
+        // The full forward left stick also engages the menu UP direction.
+        if (frameEvents.count != 3 ||
+            !CheckEvent(&frameEvents, 0, 300, SWITCH_INPUT_K_UPARROW, 1) ||
+            !CheckEvent(&frameEvents, 1, 300, SWITCH_INPUT_K_RIGHTARROW, 1) ||
+            !CheckEvent(&frameEvents, 2, 300, SWITCH_INPUT_K_ENTER, 1))
             return 1;
         if (frame.buttons != (SWITCH_INPUT_BUTTON_RIGHT | SWITCH_INPUT_BUTTON_A) ||
             frame.previousButtons != frame.buttons || frame.connected != 1 ||
@@ -95,14 +97,15 @@ int main(void)
         Switch_InputFrameUpdate(&frame, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f,
                                 SWITCH_INPUT_BUTTON_RIGHT | SWITCH_INPUT_BUTTON_A, 1,
                                 301, RecordEvent, &frameEvents);
-        if (frameEvents.count != 2)
+        if (frameEvents.count != 3)
             return 1;
 
         Switch_InputFrameUpdate(&frame, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
                                 0, 1, 302, RecordEvent, &frameEvents);
-        if (frameEvents.count != 4 ||
-            !CheckEvent(&frameEvents, 2, 302, SWITCH_INPUT_K_RIGHTARROW, 0) ||
-            !CheckEvent(&frameEvents, 3, 302, SWITCH_INPUT_K_ENTER, 0))
+        if (frameEvents.count != 6 ||
+            !CheckEvent(&frameEvents, 3, 302, SWITCH_INPUT_K_UPARROW, 0) ||
+            !CheckEvent(&frameEvents, 4, 302, SWITCH_INPUT_K_RIGHTARROW, 0) ||
+            !CheckEvent(&frameEvents, 5, 302, SWITCH_INPUT_K_ENTER, 0))
             return 1;
     }
 
@@ -207,6 +210,105 @@ int main(void)
             return 1;
         if (Switch_InputPadButtonName(SWITCH_INPUT_BUTTON_Y | SWITCH_INPUT_BUTTON_X) != NULL)
             return 1;
+    }
+
+    {
+        // Menu auto-repeat over simulated 16 ms frames.
+        SwitchInputState rep;
+        InputEvents r = { 0 };
+        uint32_t t;
+        size_t downs;
+        size_t first = 0, second = 0;
+        Switch_InputInit(&rep);
+        rep.gameplayActive = 0;
+
+        // Hold D-pad down from t=1000 to t=2000.
+        for (t = 1000; t <= 2000; t += 16)
+        {
+            Switch_InputFrameUpdate(&rep, 0, 0, 0, 0, 0, 0, SWITCH_INPUT_BUTTON_DOWN, 1, t, RecordEvent, &r);
+        }
+        downs = 0;
+        for (size_t i = 0; i < r.count; ++i)
+        {
+            if (r.events[i].key == SWITCH_INPUT_K_DOWNARROW && r.events[i].pressed)
+            {
+                if (downs == 1)
+                    first = r.events[i].timestamp;
+                if (downs == 2)
+                    second = r.events[i].timestamp;
+                ++downs;
+            }
+        }
+        // initial press + repeats: the first repeat is not before the delay,
+        // spacing afterwards is at least the interval (frame-quantized).
+        if (r.events[0].timestamp != 1000 || !r.events[0].pressed || downs < 6 ||
+            first < 1000 + SWITCH_INPUT_MENU_REPEAT_DELAY_MS || first > 1000 + SWITCH_INPUT_MENU_REPEAT_DELAY_MS + 16 ||
+            second - first < SWITCH_INPUT_MENU_REPEAT_INTERVAL_MS || second - first > SWITCH_INPUT_MENU_REPEAT_INTERVAL_MS + 16)
+            return 1;
+
+        // Release: one release event, then no more repeats; a fresh press
+        // restarts the initial delay.
+        {
+            size_t before;
+            Switch_InputFrameUpdate(&rep, 0, 0, 0, 0, 0, 0, 0, 1, 2016, RecordEvent, &r);
+            before = r.count;
+            if (r.events[r.count - 1].key != SWITCH_INPUT_K_DOWNARROW || r.events[r.count - 1].pressed != 0)
+                return 1;
+            for (t = 2032; t < 3000; t += 16)
+                Switch_InputFrameUpdate(&rep, 0, 0, 0, 0, 0, 0, 0, 1, t, RecordEvent, &r);
+            if (r.count != before || rep.repeatButton != 0)
+                return 1;
+        }
+
+        // Gameplay: nothing repeats and no menu keys.
+        {
+            SwitchInputState g;
+            InputEvents ge = { 0 };
+            Switch_InputInit(&g);
+            g.gameplayActive = 1;
+            for (t = 5000; t < 7000; t += 16)
+                Switch_InputFrameUpdate(&g, 0, 0.9f, 0, 0, 0, 0, SWITCH_INPUT_BUTTON_UP, 1, t, RecordEvent, &ge);
+            if (ge.count != 0 || g.repeatButton != 0)
+                return 1;
+        }
+
+        // Held while gameplay starts: the repeat is cancelled.
+        {
+            SwitchInputState g;
+            InputEvents ge = { 0 };
+            size_t pre;
+            Switch_InputInit(&g);
+            Switch_InputFrameUpdate(&g, 0, 0, 0, 0, 0, 0, SWITCH_INPUT_BUTTON_UP, 1, 100, RecordEvent, &ge);
+            pre = ge.count;
+            g.gameplayActive = 1;
+            for (t = 116; t < 1500; t += 16)
+                Switch_InputFrameUpdate(&g, 0, 0, 0, 0, 0, 0, SWITCH_INPUT_BUTTON_UP, 1, t, RecordEvent, &ge);
+            if (ge.count != pre || g.repeatButton != 0)
+                return 1;
+        }
+
+        // Left stick pushed down repeats like the d-pad; hovering between
+        // the release and engage thresholds does not chatter.
+        {
+            SwitchInputState g;
+            InputEvents ge = { 0 };
+            size_t n = 0;
+            Switch_InputInit(&g);
+            // Raw stick is deadzoned+rescaled; 0.8 raw leaves ~0.75 > 0.6.
+            for (t = 0; t < 700; t += 16)
+                Switch_InputFrameUpdate(&g, 0, -0.8f, 0, 0, 0, 0, 0, 1, t, RecordEvent, &ge);
+            for (size_t i = 0; i < ge.count; ++i)
+                n += ge.events[i].key == SWITCH_INPUT_K_DOWNARROW && ge.events[i].pressed;
+            if (n != 3)
+                return 1;
+            // Ease off to ~0.5 raw (inside the hysteresis band): still held.
+            Switch_InputFrameUpdate(&g, 0, -0.55f, 0, 0, 0, 0, 0, 1, 720, RecordEvent, &ge);
+            if (g.repeatButton != SWITCH_INPUT_BUTTON_DOWN)
+                return 1;
+            Switch_InputFrameUpdate(&g, 0, 0.0f, 0, 0, 0, 0, 0, 1, 736, RecordEvent, &ge);
+            if (g.repeatButton != 0 || ge.events[ge.count - 1].pressed != 0)
+                return 1;
+        }
     }
 
     return 0;

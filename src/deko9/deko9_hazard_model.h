@@ -1,12 +1,11 @@
-// Pure model of the deko9 image hazard tracker, old and S4a (task/deko9-static-hazards).
+// Pure model of the deko9 image hazard tracker: per-draw (old) and static-store (new).
 //
-// Both trackers below implement the exact epoch arithmetic of
-// Device::HazardCheck/HazardCommit (deko9_device.cpp) over a plain array of
-// store epochs, with no deko3d/switch dependency, so a host test can drive a
-// long random trace through both and assert they make the same barrier
-// decision (position and kind) at every step -- the S4a brief's equivalence
-// rule: "For every draw, a barrier is recorded iff today's tracker would
-// record one; the kind is identical."
+// Both trackers below implement the epoch arithmetic of the device's
+// HazardCommit over a plain array of store epochs (HazardCheck itself is the
+// device's own function), with no deko3d/switch dependency, so a host test
+// can drive a long random trace through both and assert they make the same
+// barrier decision (position and kind) at every step: for every draw, a
+// barrier is recorded iff the per-draw tracker would record one.
 //
 // OldTracker: today's per-draw model -- every draw adds every currently
 // sampled store (regardless of "static") and every render target to one
@@ -16,7 +15,7 @@
 // current clock as of every draw that samples it, whether or not that draw
 // itself needed a barrier.
 //
-// NewTracker: S4a -- a store flagged `attachment` (ever a render/depth/blit
+// NewTracker: a store flagged `attachment` (ever a render/depth/blit
 // target) still gets the per-draw check. A "static" store (!attachment) is
 // only added to the real hazard batch: (1) the draw it is newly bound (a
 // cache miss, not the same store the slot already held), matching
@@ -28,7 +27,7 @@
 // anything. Two wrong designs this model ruled out, both caught within the
 // first ~40 random ops:
 //   - Re-stamping bound static stores on *any* barrier (including one with
-//     no draw at all, e.g. ReadImage's Barrier(true), or a bare copy/blit
+//     no draw at all, e.g. ReadImage's Barrier(), or a bare copy/blit
 //     commit unrelated to this store) recorded an extra barrier: such a
 //     barrier does not mean any store was "just read", so OldTracker would
 //     not have touched its readEpoch either.
@@ -39,8 +38,7 @@
 //     stamp -- OldTracker's per-entry stamp is unconditional on hit, not on
 //     whether *this* commit barriers.
 //
-// See, brief S4a, and
-// ImageStore::attachment / ::pendingRaw (deko9_internal.h) and PrepareDraw's
+// See ImageStore::attachment / ::pendingRaw (deko9_internal.h) and PrepareDraw's
 // post-HazardCommit restamp (deko9_draw.cpp) for the real implementation
 // this models.
 #pragma once
@@ -66,29 +64,35 @@ struct StoreEpochs
     bool attachment = false;
 };
 
-// Verbatim port of Device::HazardCheck (deko9_device.cpp).
-inline void HazardCheck(const StoreEpochs &s, Access access, uint64_t c, bool *hit, bool *engine)
+// The access check of one pending access against clock c, shared by the
+// device (deko9::ImageStore, Device::Access) and this model: *hit when it
+// needs a barrier, *engine when the copy or 2D engine is involved.
+template <typename Store, typename AccessT>
+inline void HazardCheck(const Store &s, AccessT access, uint64_t c, bool *hit, bool *engine)
 {
     const bool copied = s.copyWriteEpoch == c || s.blitEpoch == c;
     switch (access)
     {
-    case Access::Sample:
+    case AccessT::Sample:
         *hit = copied || s.renderEpoch == c;
         *engine = copied;
         break;
-    case Access::Render:
+    case AccessT::Render:
+        // Render after render needs nothing; after a read, copy or blit it does.
         *hit = copied || s.readEpoch == c;
         *engine = copied || s.copyReadEpoch == c;
         break;
-    case Access::CopyRead:
+    case AccessT::CopyRead:
         *hit = s.renderEpoch == c || copied;
         *engine = true;
         break;
-    case Access::CopyWrite:
+    case AccessT::CopyWrite:
+        // Copy after copy (successive mip uploads) is ordered on the copy
+        // engine; reads, 3D writes and 2D-engine writes conflict.
         *hit = s.readEpoch == c || s.renderEpoch == c || s.blitEpoch == c;
         *engine = true;
         break;
-    case Access::BlitWrite:
+    case AccessT::BlitWrite:
         *hit = s.readEpoch == c || s.renderEpoch == c || s.copyWriteEpoch == c;
         *engine = true;
         break;
@@ -202,7 +206,7 @@ struct OldTracker
     }
 };
 
-// ---- NewTracker: S4a static-store skip -------------------------------------
+// ---- NewTracker: static-store skip ----------------------------------------
 struct NewTracker
 {
     std::vector<StoreEpochs> stores;
@@ -247,7 +251,7 @@ struct NewTracker
         // entry individually hit -- so a store this draw samples gets
         // readEpoch = the current clock whether or not *anything* in this
         // draw conflicted, including a clock some earlier, unrelated event
-        // already advanced. A static store S4a's skip above left out of the
+        // already advanced. A static store the skip above left out of the
         // real batch still needs that same unconditional catch-up, or a
         // later copy-write's WAR check sees a stale epoch and misses a
         // barrier the old tracker would have recorded (this exact miss,

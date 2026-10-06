@@ -46,9 +46,9 @@ char __cdecl R_PreTessStaticModelCachedList(
     uint32_t surfIndexCount; // [esp+54h] [ebp-4h]
 
     xsurf = XModelGetSurface(model, lod, surfaceIndex);
-    if (R_StaticPretessModels() && R_StaticModelSurfHasStaticIndices(xsurf))
+    if (R_StaticModelSurfHasStaticIndices(xsurf))
     {
-        // r_deko9StaticPretess(Models), r_pretess.h: no copy; the draw side
+        // Static pretess (r_pretess.h): no copy; the draw side
         // reads the list and draws the surface's zone index range once per
         // instance with the instance's cache slot as base vertex.
         if (KISAK_PERF_ACTIVE)

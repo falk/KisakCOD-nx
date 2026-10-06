@@ -495,14 +495,6 @@ void __cdecl R_InitFrameBufferRenderTarget_Win32(GfxRenderTarget *renderTarget)
     iassert( renderTarget );
     renderTarget->width = vidConfig.displayWidth;
     renderTarget->height = vidConfig.displayHeight;
-#ifdef __SWITCH__
-    {
-        char dbuf[160];
-        snprintf(dbuf, sizeof(dbuf),
-                 "R_InitFrameBufferRenderTarget_Win32: vidConfig=%dx%d -> renderTarget=%ux%u\n",
-                 vidConfig.displayWidth, vidConfig.displayHeight, renderTarget->width, renderTarget->height);
-    }
-#endif
     hr = dx.device->GetSwapChain(0, &dx.windows[0].swapChain);
     if (hr < 0)
     {

@@ -4,6 +4,7 @@
 
 #include <switch.h>
 
+#include "deko9_hazard_model.h"
 #include "deko9_internal.h"
 #include "deko9_native.h"
 #include <platform/switch/switch_profile_format.h>
@@ -199,11 +200,13 @@ bool Device::Init(std::string *error)
     m_swapChainObject = new SwapChain(this);
     ResetState();
     Flush(true);
+    FrApplySettings(); // publishes the flight recorder, arms the recording-thread check
     return true;
 }
 
 Device::~Device()
 {
+    FrDetach();
     StopWatcher();
     {
         DeviceLockGuard lock(m_lock);
@@ -257,24 +260,77 @@ void Device::AddCmdMemory(void *userData, DkCmdBuf cmd, size_t minSize)
     const uint32_t size = device->m_cmdChunkBytes;
     const uint32_t want = std::max<uint32_t>(size, AlignUp((uint32_t)minSize, 256));
     auto &free = device->m_freeCmdChunks;
-    while (!free.empty() && free.back().size != size)
+    // Oversize or from an earlier chunk size; its list has completed. Reuse
+    // takes the back (most recently freed); with poison on, the oldest one
+    // out of quarantine instead, so mismatched sizes go from anywhere.
+    for (size_t i = free.size(); i-- > 0;)
     {
-        // Oversize or from an earlier chunk size; its list has completed.
-        device->FreeMemoryAfter(free.back(), 0);
-        free.pop_back();
+        if (free[i].size == size || (!device->m_cmdPoison && i + 1 != free.size()))
+            continue;
+        device->FrNoteDrop(free[i]);
+        GpuAlloc whole = free[i];
+        whole.size += kCmdGuardBytes;
+        device->FreeMemoryAfter(whole, 0);
+        free.erase(free.begin() + (ptrdiff_t)i);
     }
-    if (want == size && !free.empty())
+    const int pick = want == size ? device->FrPickFree(size) : -1;
+    uint32_t ev = fr::kEvReuse;
+    if (pick >= 0)
     {
-        chunk = free.back();
-        free.pop_back();
+        chunk = free[(size_t)pick];
+        free.erase(free.begin() + pick);
+        device->CheckCmdGuard(chunk, "reuse", 0);
     }
-    else if (!device->AllocMemory(POOL_CMD, want, 256, &chunk))
+    else if (!device->AllocMemory(POOL_CMD, want + kCmdGuardBytes, 256, &chunk))
     {
         Fail("CMD_MEMORY", "cannot grow command buffer by %zu bytes", minSize);
         return;
     }
+    else
+    {
+        // chunk.size is the command area; the guard words follow it.
+        chunk.size = want;
+        ev = fr::kEvAlloc;
+    }
+    if (chunk.cpu)
+        fr::FillGuard(reinterpret_cast<uint32_t *>(chunk.cpu + chunk.size));
     dkCmdBufAddMemory(cmd, chunk.block, chunk.offset, chunk.size);
     device->m_openCmdChunks.push_back(chunk);
+    device->FrNoteOpen(chunk, ev);
+}
+
+void Device::CheckCmdGuard(const GpuAlloc &chunk, const char *where, uint64_t seq)
+{
+    if (!chunk.cpu)
+        return;
+    const uint32_t *words = reinterpret_cast<const uint32_t *>(chunk.cpu);
+    const uint32_t cmdWords = chunk.size / 4;
+    uint32_t first = 0;
+    const uint32_t dirty = fr::CheckGuard(words + cmdWords, &first);
+    if (!dirty)
+        return;
+    const uint32_t hits = m_cmdGuardHits.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint32_t *g = words + cmdWords + first;
+    const uint32_t *tail = words + cmdWords - 4;
+    const uint32_t n = fr::kGuardWords - first;
+    char detail[384];
+    std::snprintf(detail, sizeof(detail),
+                  "%s seq=%llu open=%llu chunk %u gpu=0x%llx: %u of %u guard words after the %u-word command area "
+                  "were written, first at +%u: %08x %08x %08x %08x; last command words: %08x %08x %08x %08x; "
+                  "a command writer ran past the end of its chunk",
+                  where, (unsigned long long)seq, (unsigned long long)m_openSeq, FrChunkId(chunk),
+                  (unsigned long long)chunk.gpu, dirty, fr::kGuardWords, cmdWords, first, g[0], n > 1 ? g[1] : 0,
+                  n > 2 ? g[2] : 0, n > 3 ? g[3] : 0, tail[0], tail[1], tail[2], tail[3]);
+    if (hits == 1)
+    {
+        Fail("CMD_GUARD", "%s", detail);
+        FrDump("cmd_guard", false);
+    }
+    else if (hits <= 8)
+    {
+        Log("cmd guard hit %u: %s", hits, detail);
+    }
+    fr::FillGuard(const_cast<uint32_t *>(words + cmdWords));
 }
 
 void Device::SetCmdChunkBytes(uint32_t bytes)
@@ -286,39 +342,25 @@ void Device::SetCmdChunkBytes(uint32_t bytes)
 void Device::RecordTimestamp(bool end)
 {
     if (m_timestamps.gpu)
-        dkCmdBufReportCounter(m_cmd, DkCounter_Timestamp,
+        dkCmdBufReportCounter(Rec(), DkCounter_Timestamp,
                               m_timestamps.gpu + (m_openSeq % kFenceRing) * 32 + (end ? 16 : 0));
-}
-
-void Device::TiledSync()
-{
-    // Tiled caching keeps binned work in the cache until a flush: it must be
-    // flushed before anything reads what was rendered (barriers, a target
-    // change, the end of the list).
-    if (m_tiledOn)
-    {
-        dkCmdBufTiledCacheOp(m_cmd, DkTiledCacheOp_Flush);
-        ++m_cc.tiledOps;
-    }
 }
 
 void Device::CmdBarrier(DkBarrier mode, uint32_t invalidate)
 {
-    TiledSync();
     ++m_cc.barrier[mode];
     m_cc.inval[0] += (invalidate & DkInvalidateFlags_L2Cache) != 0;
     m_cc.inval[1] += (invalidate & DkInvalidateFlags_Image) != 0;
     m_cc.inval[2] += (invalidate & DkInvalidateFlags_Shader) != 0;
     m_cc.inval[3] += (invalidate & DkInvalidateFlags_Descriptors) != 0;
     m_cc.inval[4] += (invalidate & DkInvalidateFlags_Zcull) != 0;
-    dkCmdBufBarrier(m_cmd, mode, invalidate);
+    dkCmdBufBarrier(Rec(), mode, invalidate);
 }
 
 void Device::CmdBindTargets(const DkImageView *const colors[], uint32_t count, const DkImageView *depth)
 {
-    TiledSync();
     ++m_cc.targetBinds;
-    dkCmdBufBindRenderTargets(m_cmd, colors, count, depth);
+    dkCmdBufBindRenderTargets(Rec(), colors, count, depth);
 }
 
 void Device::BeginList()
@@ -331,33 +373,17 @@ void Device::BeginList()
     CmdBarrier(DkBarrier_None,
                     DkInvalidateFlags_Image | DkInvalidateFlags_Shader | DkInvalidateFlags_Descriptors |
                         DkInvalidateFlags_L2Cache);
-    if (m_tiledWanted != m_tiledOn)
-    {
-        if (m_tiledWanted)
-        {
-            const uint32_t size = m_tiledWanted == 2 ? 64 : 128;
-            dkCmdBufSetTileSize(m_cmd, size, size);
-            dkCmdBufTiledCacheOp(m_cmd, DkTiledCacheOp_Enable);
-        }
-        else
-        {
-            dkCmdBufTiledCacheOp(m_cmd, DkTiledCacheOp_Flush);
-            dkCmdBufTiledCacheOp(m_cmd, DkTiledCacheOp_Disable);
-        }
-        m_tiledOn = m_tiledWanted;
-        m_cc.tiledOps += 2;
-    }
     // Per-pass timing: the pass that was running when the last list closed
     // continues here (the GPU idle time in between is not counted).
     if (GpuPassesOn())
         RecordPassMark(m_curPass);
-    dkCmdBufBindImageDescriptorSet(m_cmd, m_descriptorMemory.gpu, kImageDescriptors);
-    dkCmdBufBindSamplerDescriptorSet(m_cmd, m_descriptorMemory.gpu + kImageDescriptors * sizeof(DkImageDescriptor),
+    dkCmdBufBindImageDescriptorSet(Rec(), m_descriptorMemory.gpu, kImageDescriptors);
+    dkCmdBufBindSamplerDescriptorSet(Rec(), m_descriptorMemory.gpu + kImageDescriptors * sizeof(DkImageDescriptor),
                                      kSamplerDescriptors);
     const DkBufExtents vs{m_vsUbo.gpu, m_vsUbo.size};
     const DkBufExtents ps{m_psUbo.gpu, m_psUbo.size};
-    dkCmdBufBindUniformBuffers(m_cmd, DkStage_Vertex, 0, &vs, 1);
-    dkCmdBufBindUniformBuffers(m_cmd, DkStage_Fragment, 0, &ps, 1);
+    dkCmdBufBindUniformBuffers(Rec(), DkStage_Vertex, 0, &vs, 1);
+    dkCmdBufBindUniformBuffers(Rec(), DkStage_Fragment, 0, &ps, 1);
     // No hazard-clock bump here: deko3d inserts no wait between submitted
     // lists, so epochs carry across list boundaries and hazards spanning
     // lists still record real barriers.
@@ -475,7 +501,7 @@ void Device::RecordPassMark(uint16_t pass)
         return;
     }
     const uint32_t slot = (uint32_t)(m_passHead % kPassSlots);
-    dkCmdBufReportCounter(m_cmd, DkCounter_Timestamp, m_passStamps.gpu + slot * 16);
+    dkCmdBufReportCounter(Rec(), DkCounter_Timestamp, m_passStamps.gpu + slot * 16);
     m_passMarks[slot] = {m_openSeq, pass, m_zcullStats};
     if (m_zcullStats)
         ZcullRecordMark(slot);
@@ -632,13 +658,13 @@ void Device::SubmitOpenList()
     RecordTimestamp(true);
     if (m_faultTrace)
     {
-        dkCmdBufReportValue(m_cmd, CrumbEnd(m_openSeq), m_crumbs.gpu);
+        dkCmdBufReportValue(Rec(), CrumbEnd(m_openSeq), m_crumbs.gpu);
         FaultTraceTop(CrumbEnd(m_openSeq));
     }
-    TiledSync();
-    const DkCmdList list = dkCmdBufFinishList(m_cmd);
+    const DkCmdList list = dkCmdBufFinishList(Rec());
     if (m_faultTrace)
         NoteListSegments(m_openSeq, list);
+    FrSubmit(list, slot);
     if (dkQueueIsInErrorState(m_queue))
     {
         // A GPU fault (details come from libdeko3dd as FAIL:DEKO9_DK lines).
@@ -699,7 +725,11 @@ void Device::RetireCmdMemory(uint64_t seq)
     // Retire every chunk the list used and hand the command buffer a fresh
     // one before anything else is recorded.
     for (const GpuAlloc &chunk : m_openCmdChunks)
+    {
+        CheckCmdGuard(chunk, "submit", seq);
         m_busyCmdChunks.push_back({chunk, seq});
+        FrNoteBusy(chunk, seq);
+    }
     m_openCmdChunks.clear();
     dkCmdBufClear(m_cmd);
     AddCmdMemory(this, m_cmd, 0);
@@ -840,7 +870,7 @@ EventMarker *Device::RecordEventMarker()
     m_busyMarkers.push_back(marker);
     // No cache flush: the queries only report completion (the occlusion
     // counters are semaphore reports that land before this release).
-    dkCmdBufSignalFence(m_cmd, &marker->fence, false);
+    dkCmdBufSignalFence(Rec(), &marker->fence, false);
     m_listHasWork = true;
     return marker;
 }
@@ -957,34 +987,21 @@ void Device::ReportQueueError()
     BlackBoxDump("queue_error");
 }
 
-void Device::Barrier(bool copyEngine)
+void Device::Barrier()
 {
     ++Stats().barriers;
-    // 3D-only hazards (render -> sample, sample -> render) only need the 3D
-    // pipe drained (DkBarrier_Primitives: WaitForIdle) or the earlier
-    // fragments finished (DkBarrier_Fragments) plus a texture-cache
-    // invalidate; every engine reaches memory through the same L2, so no L2
-    // flush (RSDuck's DuckStation Switch port uses Fragments + image
-    // invalidate for render -> sample on hardware). The lighter pattern once
-    // stalled the queue on some emulators; it stays opt-in
-    // (r_deko9LightBarriers) until verified everywhere. Copy/2D-engine hazards always take the
-    // full barrier: those engines run beside the 3D pipe.
-    if (m_barrierMode && !copyEngine)
-    {
-        CmdBarrier(m_barrierMode == 2 ? DkBarrier_Fragments : DkBarrier_Primitives,
-                        DkInvalidateFlags_Image);
-        ++m_lightBarriers;
-    }
-    else
-        CmdBarrier(DkBarrier_Full, DkInvalidateFlags_Image | DkInvalidateFlags_L2Cache);
+    // Every hazard takes the full barrier plus texture/L2 invalidate. Lighter
+    // 3D-only barriers (Primitives/Fragments) were measured to be of no
+    // value on hardware and once stalled the queue on some emulators.
+    CmdBarrier(DkBarrier_Full, DkInvalidateFlags_Image | DkInvalidateFlags_L2Cache);
     ++m_writeClock;
-    // S4a's static-store readEpoch re-stamp (a bound store OLD's tracker
+    // The static-store readEpoch re-stamp (a bound store OLD's tracker
     // would have re-added, and so re-stamped, every draw) lives in
     // PrepareDraw right after its HazardCommit, not here: Barrier() also
     // fires from copy/blit-only commits (BeforeCopyWrite, StretchRect) and
     // bare calls (ReadImage) that never touched these stores in the old
     // per-draw tracker either, so restamping them here would record a
-    // barrier the old tracker would not have (proven by the S4a host trace:
+    // barrier the old tracker would not have (proven by the host hazard-model trace:
     // a barrier with nothing sampled around it must not touch readEpoch).
     m_listHasWork = true;
 }
@@ -1023,43 +1040,8 @@ void Device::HazardAdd(ImageStore *store, Access access)
     m_hazards[m_hazardCount++] = {store, access};
 }
 
-// Access checks of HazardCommit for one pending access against clock c:
-// *hit when it needs a barrier, *engine when that barrier must be the full
-// one (copy / 2D engine involved).
-static inline void HazardCheck(const ImageStore &s, Device::Access access, uint64_t c, bool *hit, bool *engine)
-{
-    using Access = Device::Access;
-    const bool copied = s.copyWriteEpoch == c || s.blitEpoch == c;
-    switch (access)
-    {
-    case Access::Sample:
-        *hit = copied || s.renderEpoch == c;
-        *engine = copied;
-        break;
-    case Access::Render:
-        // Render after render needs nothing; after a read, copy or blit it does.
-        *hit = copied || s.readEpoch == c;
-        *engine = copied || s.copyReadEpoch == c;
-        break;
-    case Access::CopyRead:
-        *hit = s.renderEpoch == c || copied;
-        *engine = true;
-        break;
-    case Access::CopyWrite:
-        // Copy after copy (successive mip uploads) is ordered on the copy
-        // engine; reads, 3D writes and 2D-engine writes conflict.
-        *hit = s.readEpoch == c || s.renderEpoch == c || s.blitEpoch == c;
-        *engine = true;
-        break;
-    case Access::BlitWrite:
-        *hit = s.readEpoch == c || s.renderEpoch == c || s.copyWriteEpoch == c;
-        *engine = true;
-        break;
-    default:
-        *hit = *engine = false;
-        break;
-    }
-}
+// The access check (the host hazard model runs the same function).
+using deko9_hazard_model::HazardCheck;
 
 bool Device::HazardRolesDisjoint() const
 {
@@ -1107,10 +1089,9 @@ void Device::HazardCommit()
 {
     ++m_hazardSerial; // any evaluation invalidates the previous draw's (DEKO9_PERDRAW_HAZARD)
     const uint64_t c = m_writeClock;
-    // Every access is checked (not just up to the first conflict): the one
-    // barrier must cover the strongest hazard, and a copy/2D-engine one
-    // needs the full barrier even when a 3D-only one was seen first.
-    bool conflict = false, copyEngine = false;
+    // Every access is checked (not just up to the first conflict): each
+    // write-after-read is counted.
+    bool conflict = false;
     for (uint32_t i = 0; i < m_hazardCount; ++i)
     {
         bool hit, engine;
@@ -1118,14 +1099,13 @@ void Device::HazardCommit()
         if (hit)
         {
             conflict = true;
-            copyEngine |= engine;
             const Access a = m_hazards[i].access;
             if ((a == Access::CopyWrite || a == Access::BlitWrite) && m_hazards[i].store->readEpoch == c)
                 ++m_writeAfterReadBarriers;
         }
     }
     if (conflict)
-        Barrier(copyEngine);
+        Barrier();
     // Every access of this operation runs after that barrier: stamp all with
     // the final epoch.
     const uint64_t now = m_writeClock;
@@ -1201,6 +1181,23 @@ void Device::PresentFrame()
     // queued) would otherwise go unreported.
     if (dkQueueIsInErrorState(m_queue))
         ReportQueueError();
+    // One image sentinel per present (round robin, sampled): a GPU write past
+    // an image memblock's end lands there instead of in whatever follows it.
+    {
+        char report[512];
+        if (m_heaps[POOL_IMAGE]->CheckSentinel(m_sentinelCursor++, report, sizeof(report)))
+        {
+            if (m_imageOverruns.fetch_add(1, std::memory_order_relaxed) == 0)
+            {
+                Fail("IMAGE_OVERRUN", "frame=%llu %s", (unsigned long long)m_frames, report);
+                FrDump("image_overrun", false);
+            }
+            else
+            {
+                Log("image overrun frame=%llu %s", (unsigned long long)m_frames, report);
+            }
+        }
+    }
     const uint64_t acquireStart = armTicksToNs(armGetSystemTick());
     if (m_lastPresentNs)
         m_timing.periodNs += acquireStart - m_lastPresentNs;
@@ -1239,6 +1236,7 @@ void Device::PresentFrame()
     }
     if (GpuPassesOn())
         GpuMarker(Deko9GpuPass_Present);
+    PrepareGammaPass();
     if (m_fsr.active)
     {
         RecordUpscale(slot);
@@ -1251,7 +1249,7 @@ void Device::PresentFrame()
         m_backBuffer->MakeView(&src);
         dkImageViewDefaults(&dst, &m_swapImages[slot]);
         const DkImageRect rect{0, 0, 0, m_params.BackBufferWidth, m_params.BackBufferHeight, 1};
-        dkCmdBufBlitImage(m_cmd, &src, &rect, &dst, &rect, DkBlitFlag_FilterNearest, 0);
+        dkCmdBufBlitImage(Rec(), &src, &rect, &dst, &rect, DkBlitFlag_FilterNearest, 0);
         m_listHasWork = true;
         ++Stats().blits;
     }
@@ -1275,6 +1273,7 @@ void Device::PresentFrame()
     }
     ApplyZcullSettings();
     ApplyFaultTraceSettings();
+    FrApplySettings();
     {
         // The open list keeps its chunk; the next chunk it or a later list
         // takes has the new size.
@@ -1388,32 +1387,30 @@ void Device::PresentFrame()
         m_timing.frameWaits += m_lockFree.frameWaits.exchange(0, std::memory_order_relaxed);
         m_timing.frameWaitNs += m_lockFree.frameWaitNs.exchange(0, std::memory_order_relaxed);
         // render= is the latest frame's scene size (the engine's dynamic
-        // resolution tag, else the back buffer): oled-digest groups by it.
+        // resolution tag, else the back buffer): run digests group by it.
         // Shader build totals for the 60-frame window (not per frame).
         char shaderStats[400];
         ShaderBuildStats::Format(m_shaderStats.Take(), shaderStats, sizeof(shaderStats));
         Log("perf frames=60 period=%.1fms gpu=%.1fms drawCpu=%.1fms drawNs/draw=%.0f fenceWait=%.1fms acquire=%.1fms "
             "draws=%llu lists=%llu (per frame) maxInFlight=%llu maxFramesInFlight=%llu frameWaits=%.1f frameWait=%.2fms "
-            "barrierMode=%u lightBarriers=%.1f render=%ux%u "
+            "render=%ux%u "
             "resizes=%llu moves=%llu%s",
             m_timing.periodNs / 60e6, m_timing.gpuNs / 60e6, m_timing.drawCpuNs / 60e6,
             m_timing.draws ? (double)m_timing.drawCpuNs / m_timing.draws : 0.0, m_timing.fenceWaitNs / 60e6,
             m_timing.acquireNs / 60e6, (unsigned long long)(m_timing.draws / 60),
             (unsigned long long)(m_timing.lists / 60), (unsigned long long)m_timing.maxListsInFlight,
             (unsigned long long)m_timing.maxFramesInFlight, m_timing.frameWaits / 60.0, m_timing.frameWaitNs / 60e6,
-            (unsigned)m_barrierMode, m_lightBarriers / 60.0,
             m_frameTagWidth ? m_frameTagWidth : m_params.BackBufferWidth,
             m_frameTagHeight ? m_frameTagHeight : m_params.BackBufferHeight, (unsigned long long)m_resizes,
             (unsigned long long)m_moves, shaderStats);
-        m_lightBarriers = 0;
         {
             const CmdCensus &c = m_cc;
-            Log("perf cmds tiled=%u/%u barriers(none/tiles/frag/prim/full)=%.1f/%.1f/%.1f/%.1f/%.1f "
+            Log("perf cmds barriers(none/tiles/frag/prim/full)=%.1f/%.1f/%.1f/%.1f/%.1f "
                 "inval(l2/image/shader/desc/zcull)=%.1f/%.1f/%.1f/%.1f/%.1f targetBinds=%.1f clears=%.1f "
-                "tiledOps=%.1f submits=%.1f flushes=%.1f (per frame)",
-                m_tiledOn, m_tiledWanted, c.barrier[0] / 60.0, c.barrier[1] / 60.0, c.barrier[2] / 60.0,
+                "submits=%.1f flushes=%.1f (per frame)",
+                c.barrier[0] / 60.0, c.barrier[1] / 60.0, c.barrier[2] / 60.0,
                 c.barrier[3] / 60.0, c.barrier[4] / 60.0, c.inval[0] / 60.0, c.inval[1] / 60.0, c.inval[2] / 60.0,
-                c.inval[3] / 60.0, c.inval[4] / 60.0, c.targetBinds / 60.0, c.clears / 60.0, c.tiledOps / 60.0,
+                c.inval[3] / 60.0, c.inval[4] / 60.0, c.targetBinds / 60.0, c.clears / 60.0,
                 c.submits / 60.0, c.flushes / 60.0);
             m_cc = {};
         }
@@ -1439,12 +1436,11 @@ void Device::PresentFrame()
             m_timing.staticHazardChecks / 60.0, (unsigned)m_perDraw);
         const double draws = m_timing.draws ? (double)m_timing.draws : 1.0;
         Log("perf consts vsBytes/draw=%.0f psBytes/draw=%.0f vsPushes/draw=%.2f psPushes/draw=%.2f "
-            "regsSet=%.0f regsChanged=%.0f vsBytesFrame=%.0f psBytesFrame=%.0f probe=0x%x split=%u "
-            "extraDraws=%.0f (per frame unless /draw)",
+            "regsSet=%.0f regsChanged=%.0f vsBytesFrame=%.0f psBytesFrame=%.0f "
+            "(per frame unless /draw)",
             m_timing.constBytes[0] / draws, m_timing.constBytes[1] / draws, m_timing.constPushes[0] / draws,
             m_timing.constPushes[1] / draws, m_timing.constRegsSet / 60.0, m_timing.constRegsChanged / 60.0,
-            m_timing.constBytes[0] / 60.0, m_timing.constBytes[1] / 60.0, (unsigned)m_probe.flags,
-            (unsigned)m_probe.split, m_timing.probeExtraDraws / 60.0);
+            m_timing.constBytes[0] / 60.0, m_timing.constBytes[1] / 60.0);
         Log("perf sync fencePolls=%.1f fencePollsDone=%.1f seqCacheHits=%.1f collects=%.1f queryGetData=%.1f "
             "queryPending=%.1f bufferLockPolls=%.1f queryWaits=%.1f queryWait=%.2fms (per frame)",
             m_timing.fencePolls / 60.0, m_timing.fencePollsDone / 60.0, m_timing.seqCacheHits / 60.0,
@@ -1631,19 +1627,29 @@ HRESULT Device::GetRasterStatus(UINT, D3DRASTER_STATUS *status)
 
 void Device::SetGammaRamp(UINT, DWORD, const D3DGAMMARAMP *ramp)
 {
-    // Horizon's compositor has no gamma ramp. Only an identity ramp is
-    // exact; report anything else once.
+    // Horizon's compositor has no gamma ramp: the present pass applies it
+    // (deko9_fsr.h GammaVariant). An identity ramp turns the pass off.
     if (!ramp)
         return;
-    for (int i = 0; i < 256; ++i)
+    DeviceLockGuard lock(m_lock);
+    m_gamma.on = !GammaRampIsIdentity(ramp->red, ramp->green, ramp->blue);
+    if (!m_gamma.on)
+        return;
+    // A power curve (the engine's R_CalcGammaRamp) runs as pow(c, e) in
+    // the pass; any other ramp as a table lookup.
+    const float exponent = GammaFitExponent(ramp->red, ramp->green, ramp->blue);
+    if (exponent != m_gamma.exponent)
     {
-        const WORD identity = (WORD)(i * 257);
-        if (ramp->red[i] != identity || ramp->green[i] != identity || ramp->blue[i] != identity)
-        {
-            Fail("GAMMA_RAMP", "non-identity gamma ramp ignored (r_gamma has no effect)");
-            return;
-        }
+        if (exponent != 0.0f)
+            Log("gamma ramp: power curve, exponent %.5f (r_gamma %.4f)", exponent, 1.0f / exponent);
+        else
+            Log("gamma ramp: no single power curve, table lookup");
+        m_gamma.exponent = exponent;
     }
+    if (exponent != 0.0f)
+        GammaCurveSetup(&m_gamma.curve, exponent);
+    else
+        GammaSetup(&m_gamma.lut, ramp->red, ramp->green, ramp->blue);
 }
 
 void Device::GetGammaRamp(UINT, D3DGAMMARAMP *ramp)
@@ -1738,7 +1744,7 @@ HRESULT Device::SetRenderTarget(DWORD index, IDirect3DSurface9 *surface)
     if (s && (!s->Store()->gpu || s->Store()->format->depth || !(s->Store()->usage & D3DUSAGE_RENDERTARGET)))
         return Fail("SET_RENDER_TARGET", "surface is not a color render target");
     if (s)
-        s->Store()->attachment = true; // S4a: latch (already true via usage in practice)
+        s->Store()->attachment = true; // latch (already true via usage in practice)
     Rebind(m_renderTargets[index], s);
     if (!index)
     {
@@ -1772,7 +1778,7 @@ HRESULT Device::SetDepthStencilSurface(IDirect3DSurface9 *surface)
     if (s && (!s->Store()->gpu || !s->Store()->format->depth))
         return Fail("SET_DEPTH_STENCIL", "surface is not a depth-stencil target");
     if (s)
-        s->Store()->attachment = true; // S4a: latch (already true via usage in practice)
+        s->Store()->attachment = true; // latch (already true via usage in practice)
     Rebind(m_depthStencil, s);
     m_dirtyTargets = m_dirtyRaster = true;
     return D3D_OK;
@@ -1921,7 +1927,6 @@ void Device::GetCounters(Deko9Counters *out)
     out->drawsTotal = m_drawsTotal + m_timing.draws;
     out->drawCpuNsTotal = m_drawCpuNsTotal + m_timing.drawCpuNs;
     out->hazardSkips = m_timing.hazardSkips;
-    out->probeExtraDraws = m_timing.probeExtraDraws;
     out->rangeCalls = m_timing.rangeCalls;
     out->rangeDraws = m_timing.rangeDraws;
     out->uploadAfterReadBarriers = m_writeAfterReadBarriers;
@@ -2382,13 +2387,6 @@ void Deko9_ClaimSubmitThread(IDirect3DDevice9 *device)
     d->ClaimSubmitThread();
 }
 
-void Deko9_SetDrawProbe(IDirect3DDevice9 *device, uint32_t flags, uint32_t split)
-{
-    deko9::Device *d = static_cast<deko9::Device *>(device);
-    deko9::DeviceLockGuard lock(d->Lock());
-    d->SetDrawProbe(flags, split < 1 ? 1 : split > 16 ? 16 : split);
-}
-
 void Deko9_SetPerDraw(IDirect3DDevice9 *device, uint32_t flags)
 {
     deko9::Device *d = static_cast<deko9::Device *>(device);
@@ -2517,17 +2515,4 @@ void Deko9_SetShaderOpt(IDirect3DDevice9 *device, uint32_t mask)
     d->SetShaderOpt(mask);
 }
 
-void Deko9_SetTiledCache(IDirect3DDevice9 *device, uint32_t mode)
-{
-    deko9::Device *d = static_cast<deko9::Device *>(device);
-    deko9::DeviceLockGuard lock(d->Lock());
-    d->SetTiledCache(mode);
-}
-
-void Deko9_SetBarrierMode(IDirect3DDevice9 *device, uint32_t mode)
-{
-    deko9::Device *d = static_cast<deko9::Device *>(device);
-    deko9::DeviceLockGuard lock(d->Lock());
-    d->SetBarrierMode(mode);
-}
 

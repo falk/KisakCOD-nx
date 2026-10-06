@@ -3929,16 +3929,6 @@ static bool R_MaterializeImageResource(GfxImage *image, bool strict)
                 image->semantic = donor->semantic;
                 image->delayLoadPixels = false;
                 created = true;
-                {
-                    static int s_iwiAdoptLog = 0;
-                    if (s_iwiAdoptLog < 40)
-                    {
-                        ++s_iwiAdoptLog;
-                        char ibuf[160];
-                        snprintf(ibuf, sizeof(ibuf), "IWI-ADOPT[%d]: image=%s donor=%ux%u\n",
-                                 s_iwiAdoptLog, image->name, donor->width, donor->height);
-                    }
-                }
             }
         }
         // Inline images (no name, no on-disk .iwi -- icons/logos/etc. embedded

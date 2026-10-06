@@ -133,6 +133,65 @@ struct UpscaleSource
 };
 void UpscaleSourceSetup(UpscaleSource *out, int texWidth, int texHeight, int x, int y, int w, int h);
 
+// Display gamma (r_gamma / the menu brightness). The engine hands the device
+// a 256-entry 16-bit ramp per channel (D3DGAMMARAMP); Horizon has no gamma
+// hardware, so the present pass applies it to the whole display, HUD and
+// menus included, as the PC's ramp did: GammaVariant(glsl, curve) is any of
+// the programs above with the ramp applied to its final colour. An identity
+// ramp never reaches the shader (the present path keeps its plain blit /
+// upscale program, so the default costs nothing).
+//
+// Two forms. The engine's ramp is a power curve, 65535 (i / 255) ^ e with
+// e = 1 / r_gamma (GammaFitExponent recovers e from the entries): the
+// program then computes pow(c, e) per channel, two MUFU operations each,
+// which the pass's memory traffic hides. A ramp that is no single power curve
+// is looked up in a 256-entry table (linear between entries); that lookup
+// reads the uniform block at a per-pixel address, which the constant cache
+// serves one unique address at a time, so a warp of 32 pixels pays for every
+// distinct level it holds: on the console the table made the 1:1 pass 0.34
+// -> 1.09 ms at 1280x720. The table stays as the fallback for a ramp from
+// outside R_CalcGammaRamp. Either form is appended to the program's
+// binding-1 block at GammaLutOffset(mode).
+// Table layout: one vec4 per input level (red, green, blue, 0), so the lookup
+// selects the channel statically: UAM compiles a dynamically indexed vec4
+// component of a uniform block to a 16-byte-aligned load, which always reads
+// component x. The slope to the next level sits in a second array at the
+// same index, so both loads share one address register.
+struct GammaConstants
+{
+    float value[256][4]; // output in 0..1 for input level i / 255
+    float slope[256][4]; // value[i + 1] - value[i] (0 at level 255)
+};
+constexpr uint32_t kGammaLutVec4s = 512; // sizeof(GammaConstants) / 16
+// The power-curve form's block: the exponent, then zeros.
+struct GammaCurveConstants
+{
+    float curve[4];
+};
+// The ramp goes to the GPU in pushes of at most this many bytes: Ryujinx
+// caches at most 2 KiB of inline constant data per update and aborts on a
+// larger single push.
+constexpr uint32_t kGammaPushBytes = 1024;
+// Byte offset of the ramp inside the program block (the block's own constants
+// come first): SGSR and bilinear+RCAS use 64 bytes, bilinear 32.
+uint32_t GammaLutOffset(uint32_t mode);
+// True when every entry is the identity i * 257.
+bool GammaRampIsIdentity(const uint16_t *red, const uint16_t *green, const uint16_t *blue);
+void GammaSetup(GammaConstants *out, const uint16_t *red, const uint16_t *green, const uint16_t *blue);
+// The program's lookup on the CPU: the colour channel `v` (0..1) of channel
+// 0..2 through the ramp, in the same float operations.
+float GammaReference(const GammaConstants &c, int channel, float v);
+// The exponent e for which every channel's entry i is 65535 (i / 255) ^ e
+// rounded, within one 16-bit step; 0 when the ramp is not one power curve
+// (the table form applies then). Positive, finite, never the identity's 1.
+float GammaFitExponent(const uint16_t *red, const uint16_t *green, const uint16_t *blue);
+void GammaCurveSetup(GammaCurveConstants *out, float exponent);
+// The power-curve program's output for `v` (0..1) on the CPU.
+float GammaCurveReference(float exponent, float v);
+// `curve`: the power-curve form (uGammaCurve.x the exponent), else the table.
+// Empty when the program lacks the pieces the rewrite needs.
+std::string GammaVariant(const char *glsl, bool curve = false);
+
 // std140 layouts of the fragment uniform blocks.
 struct SgsrConstants
 {

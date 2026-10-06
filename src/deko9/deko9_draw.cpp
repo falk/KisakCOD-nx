@@ -109,7 +109,7 @@ void Device::ApplyViewportScissor()
                               (float)m_viewport.Height,
                               m_viewport.MinZ,
                               m_viewport.MaxZ};
-    dkCmdBufSetViewports(m_cmd, 0, &viewport, 1);
+    dkCmdBufSetViewports(Rec(), 0, &viewport, 1);
     LONG left = 0, top = 0, right = (LONG)width, bottom = (LONG)height;
     if (m_rs[D3DRS_SCISSORTESTENABLE])
     {
@@ -120,7 +120,7 @@ void Device::ApplyViewportScissor()
     }
     const DkScissor scissor{(uint32_t)std::max<LONG>(left, 0), (uint32_t)std::max<LONG>(top, 0),
                             (uint32_t)std::max<LONG>(right - left, 0), (uint32_t)std::max<LONG>(bottom - top, 0)};
-    dkCmdBufSetScissors(m_cmd, 0, &scissor, 1);
+    dkCmdBufSetScissors(Rec(), 0, &scissor, 1);
 }
 
 // A moved-from target holds stale pixels, so its first draw or clear must
@@ -206,14 +206,28 @@ bool Device::Capture(std::vector<uint32_t> *words, Record &&record)
     constexpr uint32_t capacity = sizeof(m_bakeStorage) / sizeof(m_bakeStorage[0]);
     dkCmdBufBeginCaptureCmds(m_bakeCmd, m_bakeStorage, capacity);
     const DkCmdBuf live = m_cmd;
+    // While m_cmd is the capture buffer only this thread may record (Rec()
+    // reports any other): another thread's commands would land in the unit.
+    Rec();
+    m_captureTag = ThreadTag();
     m_cmd = m_bakeCmd;
     record();
     m_cmd = live;
+    m_captureTag = 0;
     const uint32_t count = dkCmdBufEndCaptureCmds(m_bakeCmd);
     words->assign(m_bakeStorage, m_bakeStorage + count);
     if (count >= capacity)
     {
         Fail("BAKE", "capture overflow (%u words)", count);
+        return false;
+    }
+    // A split inside the capture (a control command) restarts deko3d's
+    // capture count, so the words kept would be a truncated stream.
+    const fr::WalkResult walk = fr::WalkWords(m_bakeStorage, count);
+    if (!walk.ok)
+    {
+        Fail("BAKE_WALK", "captured unit does not parse: %u words, header 0x%08x at word %u", count, walk.word,
+             walk.at);
         return false;
     }
     return true;
@@ -222,7 +236,7 @@ bool Device::Capture(std::vector<uint32_t> *words, Record &&record)
 void Device::ReplayWords(const std::vector<uint32_t> &words)
 {
     if (!words.empty())
-        dkCmdBufReplayCmds(m_cmd, words.data(), (uint32_t)words.size());
+        dkCmdBufReplayCmds(Rec(), words.data(), (uint32_t)words.size());
     ++m_timing.bakedReplays;
     m_timing.bakedWords += words.size();
 }
@@ -283,9 +297,9 @@ void Device::RecordRasterState()
         if (m_depthStencil && m_depthStencil->Store()->format->d3d == D3DFMT_D16)
             units = (float)(1u << 16);
         const float bias[2] = {depthBias * units, slopeBias};
-        dkCmdBufSetDepthBias(m_cmd, bias[0], 0.0f, bias[1]);
+        dkCmdBufSetDepthBias(Rec(), bias[0], 0.0f, bias[1]);
     }
-    dkCmdBufBindRasterizerState(m_cmd, &raster);
+    dkCmdBufBindRasterizerState(Rec(), &raster);
 
     DkDepthStencilState ds{};
     dkDepthStencilStateDefaults(&ds);
@@ -325,9 +339,9 @@ void Device::RecordRasterState()
         const uint8_t writeMask = (uint8_t)rs[D3DRS_STENCILWRITEMASK];
         const uint8_t ref = (uint8_t)rs[D3DRS_STENCILREF];
         const uint8_t readMask = (uint8_t)rs[D3DRS_STENCILMASK];
-        dkCmdBufSetStencil(m_cmd, DkFace_FrontAndBack, writeMask, ref, readMask);
+        dkCmdBufSetStencil(Rec(), DkFace_FrontAndBack, writeMask, ref, readMask);
     }
-    dkCmdBufBindDepthStencilState(m_cmd, &ds);
+    dkCmdBufBindDepthStencilState(Rec(), &ds);
 
     DkColorState color{};
     dkColorStateDefaults(&color);
@@ -341,9 +355,9 @@ void Device::RecordRasterState()
             Fail("RENDER_STATE", "ALPHAFUNC=%u", (unsigned)rs[D3DRS_ALPHAFUNC]), alphaOp = DkCompareOp_Always;
         color.alphaCompareOp = alphaOp;
         const float alphaRef = (float)(rs[D3DRS_ALPHAREF] & 0xff) / 255.0f;
-        dkCmdBufSetAlphaRef(m_cmd, alphaRef);
+        dkCmdBufSetAlphaRef(Rec(), alphaRef);
     }
-    dkCmdBufBindColorState(m_cmd, &color);
+    dkCmdBufBindColorState(Rec(), &color);
 
     DkColorWriteState writes{};
     dkColorWriteStateDefaults(&writes);
@@ -351,7 +365,7 @@ void Device::RecordRasterState()
     dkColorWriteStateSetMask(&writes, 1, rs[D3DRS_COLORWRITEENABLE1]);
     dkColorWriteStateSetMask(&writes, 2, rs[D3DRS_COLORWRITEENABLE2]);
     dkColorWriteStateSetMask(&writes, 3, rs[D3DRS_COLORWRITEENABLE3]);
-    dkCmdBufBindColorWriteState(m_cmd, &writes);
+    dkCmdBufBindColorWriteState(Rec(), &writes);
 
     if (blend)
     {
@@ -387,11 +401,11 @@ void Device::RecordRasterState()
             dkBlendStateSetOps(&state, o[0], o[1]);
         }
         const DkBlendState states[4] = {state, state, state, state};
-        dkCmdBufBindBlendStates(m_cmd, 0, states, 4);
+        dkCmdBufBindBlendStates(Rec(), 0, states, 4);
         const D3DCOLOR factor = rs[D3DRS_BLENDFACTOR];
         const float blendConst[4] = {((factor >> 16) & 0xff) / 255.0f, ((factor >> 8) & 0xff) / 255.0f,
                                      (factor & 0xff) / 255.0f, ((factor >> 24) & 0xff) / 255.0f};
-        dkCmdBufSetBlendConst(m_cmd, blendConst[0], blendConst[1], blendConst[2], blendConst[3]);
+        dkCmdBufSetBlendConst(Rec(), blendConst[0], blendConst[1], blendConst[2], blendConst[3]);
     }
 }
 
@@ -419,7 +433,7 @@ void Device::ApplyTextures(Deko9Stage stage, const Deko9ShaderInfo &info, uint32
         if (incremental && cache.valid && cache.dim == (uint8_t)info.samplerDim[s] &&
             !(m_texSlotDirty[st] & (1u << s)))
         {
-            // S4a: same store as the last resolution (a cache hit, not a new
+            // Same store as the last resolution (a cache hit, not a new
             // bind) -- a static store needs no per-draw check unless a copy
             // wrote it while it stayed bound (pendingRaw); PrepareDraw's
             // post-commit restamp keeps its readEpoch current across any
@@ -456,8 +470,8 @@ void Device::ApplyTextures(Deko9Stage stage, const Deko9ShaderInfo &info, uint32
         if (!store)
             store = m_dummy[info.samplerDim[s]];
         // A genuine new bind (cache miss): committed with the targets in
-        // PrepareDraw. S4a: for a static store this is exactly the bind-time
-        // check the brief calls for -- HazardCheck's Sample case reduces to
+        // PrepareDraw. For a static store this is exactly the bind-time
+        // check -- HazardCheck's Sample case reduces to
         // `copyWriteEpoch/blitEpoch == writeClock` (a static store's
         // renderEpoch is never stamped), so this unconditional call already
         // catches a copy-write RAW and (via HazardCommit) stamps readEpoch;
@@ -481,7 +495,7 @@ void Device::ApplyTextures(Deko9Stage stage, const Deko9ShaderInfo &info, uint32
     if (count && (count > m_recorded.textureCount[st] ||
                   std::memcmp(handles, m_recorded.textures[st], count * sizeof(DkResHandle))))
     {
-        dkCmdBufBindTextures(m_cmd, stage == DEKO9_STAGE_VERTEX ? DkStage_Vertex : DkStage_Fragment, 0, handles,
+        dkCmdBufBindTextures(Rec(), stage == DEKO9_STAGE_VERTEX ? DkStage_Vertex : DkStage_Fragment, 0, handles,
                              count);
         // Slots past count keep what was bound; only [0, count) is known.
         std::memcpy(m_recorded.textures[st], handles, count * sizeof(DkResHandle));
@@ -569,7 +583,7 @@ void Device::RecordVertexAttribs(const Deko9ShaderInfo &vsInfo, const InstanceLa
         }
     }
     if (count)
-        dkCmdBufBindVtxAttribState(m_cmd, attribs, count);
+        dkCmdBufBindVtxAttribState(Rec(), attribs, count);
 }
 
 bool Device::ApplyVertexStreams()
@@ -626,15 +640,15 @@ bool Device::ApplyVertexStreams()
     };
     if (streams && (streams != m_recorded.streams || !sameStates()))
     {
-        dkCmdBufBindVtxBufferState(m_cmd, states, streams);
+        dkCmdBufBindVtxBufferState(Rec(), states, streams);
         std::memcpy(m_recorded.streamStates, states, streams * sizeof(DkVtxBufferState));
         m_recorded.streams = streams;
-        dkCmdBufBindVtxBuffers(m_cmd, 0, extents, streams);
+        BindVtxBuffers(Rec(), 0, extents, streams);
         std::memcpy(m_recorded.streamExtents, extents, streams * sizeof(DkBufExtents));
     }
     else if (streams && !sameExtents())
     {
-        dkCmdBufBindVtxBuffers(m_cmd, 0, extents, streams);
+        BindVtxBuffers(Rec(), 0, extents, streams);
         std::memcpy(m_recorded.streamExtents, extents, streams * sizeof(DkBufExtents));
     }
     return true;
@@ -701,7 +715,7 @@ ProgramUnit *Device::BakeProgram(const ProgramKey &key, uint32_t psShadow)
     unit->vs = vs;
     unit->ps = ps;
     const DkShader *shaders[2] = {&vs->shader, &ps->shader};
-    if (!Capture(&unit->shaderWords, [&] { dkCmdBufBindShaders(m_cmd, DkStageFlag_GraphicsMask, shaders, 2); }) ||
+    if (!Capture(&unit->shaderWords, [&] { dkCmdBufBindShaders(Rec(), DkStageFlag_GraphicsMask, shaders, 2); }) ||
         !Capture(&unit->attribWords, [&] { RecordVertexAttribs(m_vs->shader.Info(), instance); }))
         return nullptr;
     unit->bakeNs = LockClockNs() - bakeStart;
@@ -808,7 +822,7 @@ void Device::PushDirtyConstants(ConstantFile<Regs> &file, uint32_t stage, const 
     // chunked to 1 KB by ConstantFile (some emulators limit inline updates).
     float(*shadow)[4] = m_verify ? (stage ? m_psShadow : m_vsShadow) : nullptr;
     m_timing.constPushes[stage] += file.Flush([&](uint32_t reg, uint32_t regs) {
-        dkCmdBufPushConstants(m_cmd, ubo.gpu, ubo.size, reg * 16, regs * 16, file.regs[reg]);
+        dkCmdBufPushConstants(Rec(), ubo.gpu, ubo.size, reg * 16, regs * 16, file.regs[reg]);
         m_timing.constBytes[stage] += regs * 16;
         if (shadow)
             std::memcpy(shadow[reg], file.regs[reg], regs * 16);
@@ -827,16 +841,6 @@ HRESULT Device::PrepareDraw(D3DPRIMITIVETYPE type, UINT primCount, DkPrimitive *
 {
     if (!MapPrimitive(type, primCount, prim, count))
         return Fail("DRAW", "primitive type %d", (int)type);
-    if (m_probe.flags)
-    {
-        // Probe: re-derive state the fast paths would have skipped.
-        if (m_probe.flags & DEKO9_PROBE_CONSTS)
-            m_vsFile.MarkAllDirty(), m_psFile.MarkAllDirty();
-        if (m_probe.flags & DEKO9_PROBE_TEXTURES)
-            m_dirtyTextures = true, m_texSlotDirty[0] = m_texSlotDirty[1] = ~0u;
-        if (m_probe.flags & DEKO9_PROBE_STREAMS)
-            m_dirtyInput = true, m_recorded.indexAddress = 0;
-    }
     if (!m_vs || !m_ps)
         return Fail("UNSUPPORTED", "fixed-function draw (vs=%p ps=%p)", (void *)m_vs, (void *)m_ps);
     if (!m_renderTargets[0])
@@ -871,7 +875,7 @@ HRESULT Device::PrepareDraw(D3DPRIMITIVETYPE type, UINT primCount, DkPrimitive *
     }
     else if (!hazardReuse)
     {
-        // S4a: shaders/textures did not change (ApplyTextures did not run
+        // Shaders/textures did not change (ApplyTextures did not run
         // this draw), so this is a re-check of the same resolution as the
         // last draw's. Only attachment stores need it; a static store is
         // added only if a copy wrote it while it stayed bound (pendingRaw
@@ -932,7 +936,7 @@ HRESULT Device::PrepareDraw(D3DPRIMITIVETYPE type, UINT primCount, DkPrimitive *
             HazardAdd(m_depthStencil->Store().get(), Access::Render);
         const bool disjoint = HazardRolesDisjoint();
         HazardCommit();
-        // S4a, unconditional (not just when this draw's own commit
+        // Unconditional (not just when this draw's own commit
         // barriers): the old tracker adds every currently sampled store to
         // every draw's batch, and HazardCommit's stamp loop gives every
         // entry readEpoch = the resulting clock regardless of whether that
@@ -940,7 +944,7 @@ HRESULT Device::PrepareDraw(D3DPRIMITIVETYPE type, UINT primCount, DkPrimitive *
         // "now" as of every draw, hit or not, even a draw whose own
         // evaluation hits nothing but where the clock had already moved
         // since this store's last real stamp (an unrelated barrier
-        // elsewhere). A static store S4a's skip above left out of this
+        // elsewhere). A static store the skip above left out of this
         // draw's hazard set needs that same unconditional catch-up, or a
         // later copy-write's WAR check against it sees a stale epoch and
         // misses a barrier the old tracker would have recorded (a host
@@ -959,12 +963,7 @@ HRESULT Device::PrepareDraw(D3DPRIMITIVETYPE type, UINT primCount, DkPrimitive *
         m_drawHazardSerial = m_hazardSerial;
         m_drawHazardClock = m_writeClock;
     }
-    if (m_descriptorsDirty)
-    {
-        // New CPU-written descriptors (AllocImageDescriptor/SamplerDescriptor).
-        CmdBarrier(DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
-        m_descriptorsDirty = false;
-    }
+    FlushDescriptors();
     if (m_dirtyTargets)
     {
         ApplyRenderTargets();
@@ -1147,7 +1146,7 @@ void Device::VerifyDraw()
         if (vs && ps)
         {
             const DkShader *shaders[2] = {&vs->shader, &ps->shader};
-            if (Capture(&words, [&] { dkCmdBufBindShaders(m_cmd, DkStageFlag_GraphicsMask, shaders, 2); }) &&
+            if (Capture(&words, [&] { dkCmdBufBindShaders(Rec(), DkStageFlag_GraphicsMask, shaders, 2); }) &&
                 words != m_program->shaderWords)
                 mismatch("baked shader words", (uint32_t)words.size(), (uint32_t)m_program->shaderWords.size());
         }
@@ -1216,7 +1215,7 @@ void Device::VerifyDraw()
         HazardBegin();
     }
 
-    // S4a: a static store's per-draw sample hazard is skipped once bound
+    // A static store's per-draw sample hazard is skipped once bound
     // (ImageStore::attachment / pendingRaw); re-derive it with a real,
     // uncommitted HazardAdd against its actual epochs regardless of whether
     // this draw's fast path skipped it or just committed a pendingRaw
@@ -1266,34 +1265,12 @@ void Device::VerifyDraw()
     m_verifyConstantsSynced = true; // this draw's flush was the full re-push (or later)
 }
 
-// One draw, or with the probe split mode the same triangles as several
-// consecutive draws (same pixels and order, more GPU draws).
 void Device::EmitDraw(bool indexed, DkPrimitive prim, uint32_t count, uint32_t first, int32_t baseVertex)
 {
-    uint32_t parts = m_probe.split;
-    const uint32_t tris = count / 3;
-    if (prim != DkPrimitive_Triangles || count % 3 || parts < 2 || tris < parts)
-        parts = 1;
-    uint32_t done = 0;
-    for (uint32_t i = 0; i < parts; ++i)
-    {
-        const uint32_t n = i + 1 == parts ? tris - done : tris / parts;
-        const uint32_t c = parts == 1 ? count : n * 3;
-        if (i && (m_probe.flags & DEKO9_PROBE_SUBCONSTS))
-        {
-            m_vsFile.MarkAllDirty();
-            m_psFile.MarkAllDirty();
-            ApplyConstants(DEKO9_STAGE_VERTEX);
-            ApplyConstants(DEKO9_STAGE_PIXEL);
-        }
-        const uint32_t at = first + (parts == 1 ? 0 : done * 3);
-        if (indexed)
-            dkCmdBufDrawIndexed(m_cmd, prim, c, 1, at, baseVertex, 0);
-        else
-            dkCmdBufDraw(m_cmd, prim, c, 1, at, 0);
-        done += n;
-    }
-    m_timing.probeExtraDraws += parts - 1;
+    if (indexed)
+        dkCmdBufDrawIndexed(Rec(), prim, count, 1, first, baseVertex, 0);
+    else
+        dkCmdBufDraw(Rec(), prim, count, 1, first, 0);
 }
 
 HRESULT Device::DrawPrimitive(D3DPRIMITIVETYPE type, UINT startVertex, UINT primCount)
@@ -1340,7 +1317,7 @@ HRESULT Device::DrawIndexedPrimitive(D3DPRIMITIVETYPE type, INT baseVertex, UINT
     const DkIdxFormat indexFormat = m_indices->Format() == D3DFMT_INDEX32 ? DkIdxFormat_Uint32 : DkIdxFormat_Uint16;
     if (m_recorded.indexAddress != ib.Gpu() || m_recorded.indexFormat != indexFormat)
     {
-        dkCmdBufBindIdxBuffer(m_cmd, indexFormat, ib.Gpu());
+        dkCmdBufBindIdxBuffer(Rec(), indexFormat, ib.Gpu());
         m_recorded.indexAddress = ib.Gpu();
         m_recorded.indexFormat = indexFormat;
         ++m_timing.indexBinds;
@@ -1467,14 +1444,14 @@ HRESULT Device::DrawInstances(D3DPRIMITIVETYPE type, INT baseVertex, UINT minInd
         const DkIdxFormat indexFormat = indexSize == 4 ? DkIdxFormat_Uint32 : DkIdxFormat_Uint16;
         if (m_recorded.indexAddress != ib.Gpu() || m_recorded.indexFormat != indexFormat)
         {
-            dkCmdBufBindIdxBuffer(m_cmd, indexFormat, ib.Gpu());
+            dkCmdBufBindIdxBuffer(Rec(), indexFormat, ib.Gpu());
             m_recorded.indexAddress = ib.Gpu();
             m_recorded.indexFormat = indexFormat;
             ++m_timing.indexBinds;
         }
         // After the address read: a lock that sees this stamp is ordered after it.
         ib.StampUse(this, m_openSeq);
-        dkCmdBufDrawIndexed(m_cmd, prim, count, instances, startIndex, baseVertex, 0);
+        dkCmdBufDrawIndexed(Rec(), prim, count, instances, startIndex, baseVertex, 0);
         FaultTraceDrawArgsStreams(true, prim, count, instances, startIndex, baseVertex);
         ++m_timing.instancedDraws;
         m_timing.instances += instances;
@@ -1524,7 +1501,7 @@ HRESULT Device::DrawIndexedRanges(UINT numVertices, const ::Deko9IndexRange *ran
     const DkIdxFormat indexFormat = indexSize == 4 ? DkIdxFormat_Uint32 : DkIdxFormat_Uint16;
     if (m_recorded.indexAddress != ib.Gpu() || m_recorded.indexFormat != indexFormat)
     {
-        dkCmdBufBindIdxBuffer(m_cmd, indexFormat, ib.Gpu());
+        dkCmdBufBindIdxBuffer(Rec(), indexFormat, ib.Gpu());
         m_recorded.indexAddress = ib.Gpu();
         m_recorded.indexFormat = indexFormat;
         ++m_timing.indexBinds;
@@ -1532,7 +1509,7 @@ HRESULT Device::DrawIndexedRanges(UINT numVertices, const ::Deko9IndexRange *ran
     // After the address read: a lock that sees this stamp is ordered after it.
     ib.StampUse(this, m_openSeq);
     for (uint32_t i = 0; i < count; ++i)
-        dkCmdBufDrawIndexed(m_cmd, prim, 3 * ranges[i].triCount, 1, ranges[i].firstIndex, ranges[i].baseVertex, 0);
+        dkCmdBufDrawIndexed(Rec(), prim, 3 * ranges[i].triCount, 1, ranges[i].firstIndex, ranges[i].baseVertex, 0);
     // The record keeps the first range; the count says how many followed.
     FaultTraceDrawArgsStreams(true, prim, 3 * ranges[0].triCount, 1, ranges[0].firstIndex, ranges[0].baseVertex,
                               count);
@@ -1569,9 +1546,9 @@ HRESULT Device::DrawPrimitiveUP(D3DPRIMITIVETYPE type, UINT primCount, const voi
         return hr;
     const DkVtxBufferState state{stride, 0};
     const DkBufExtents extent{upload.gpu, upload.size};
-    dkCmdBufBindVtxBufferState(m_cmd, &state, 1);
-    dkCmdBufBindVtxBuffers(m_cmd, 0, &extent, 1);
-    dkCmdBufDraw(m_cmd, prim, count, 1, 0, 0);
+    dkCmdBufBindVtxBufferState(Rec(), &state, 1);
+    BindVtxBuffers(Rec(), 0, &extent, 1);
+    dkCmdBufDraw(Rec(), prim, count, 1, 0, 0);
     FaultTraceDrawArgs(false, prim, count, 1, 0, 0, 0, upload.gpu, upload.size);
     m_streams[0].stride = 0;
     m_dirtyInput = true;
@@ -1611,12 +1588,12 @@ HRESULT Device::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE type, UINT minIndex, UIN
         return hr;
     const DkVtxBufferState state{stride, 0};
     const DkBufExtents extent{vertexUpload.gpu, vertexUpload.size};
-    dkCmdBufBindVtxBufferState(m_cmd, &state, 1);
-    dkCmdBufBindVtxBuffers(m_cmd, 0, &extent, 1);
-    dkCmdBufBindIdxBuffer(m_cmd, indexFormat == D3DFMT_INDEX32 ? DkIdxFormat_Uint32 : DkIdxFormat_Uint16,
+    dkCmdBufBindVtxBufferState(Rec(), &state, 1);
+    BindVtxBuffers(Rec(), 0, &extent, 1);
+    dkCmdBufBindIdxBuffer(Rec(), indexFormat == D3DFMT_INDEX32 ? DkIdxFormat_Uint32 : DkIdxFormat_Uint16,
                           indexUpload.gpu);
     m_recorded.indexAddress = 0; // bound directly
-    dkCmdBufDrawIndexed(m_cmd, prim, count, 1, 0, 0, 0);
+    dkCmdBufDrawIndexed(Rec(), prim, count, 1, 0, 0, 0);
     FaultTraceDrawArgs(true, prim, count, 1, 0, 0, indexUpload.gpu, vertexUpload.gpu, vertexUpload.size);
     m_streams[0].stride = 0;
     m_dirtyInput = true;
@@ -1686,14 +1663,14 @@ HRESULT Device::Clear(DWORD count, const D3DRECT *rects, DWORD flags, D3DCOLOR c
             return D3DERR_INVALIDCALL;
         }
         const DkScissor scissor{(uint32_t)l, (uint32_t)t, (uint32_t)(r - l), (uint32_t)(b - t)};
-        dkCmdBufSetScissors(m_cmd, 0, &scissor, 1);
+        dkCmdBufSetScissors(Rec(), 0, &scissor, 1);
         if (clearColor)
         {
             for (uint32_t rt = 0; rt < 4 && m_renderTargets[rt]; ++rt)
-                dkCmdBufClearColor(m_cmd, rt, DkColorMask_RGBA, rgba), ++m_cc.clears;
+                dkCmdBufClearColor(Rec(), rt, DkColorMask_RGBA, rgba), ++m_cc.clears;
         }
         if (clearDepth || clearStencil)
-            dkCmdBufClearDepthStencil(m_cmd, clearDepth, z, clearStencil ? 0xff : 0, (uint8_t)stencil), ++m_cc.clears;
+            dkCmdBufClearDepthStencil(Rec(), clearDepth, z, clearStencil ? 0xff : 0, (uint8_t)stencil), ++m_cc.clears;
         if (clearDepth && m_zcullStats)
         {
             const ImageStore &ds = *m_depthStencil->Store();
@@ -1726,7 +1703,7 @@ HRESULT Device::StretchRect(IDirect3DSurface9 *srcSurface, const RECT *srcRect, 
     const RECT fullDst = {0, 0, (LONG)d.LevelWidth(dst->Level()), (LONG)d.LevelHeight(dst->Level())};
     const RECT &sr = srcRect ? *srcRect : full;
     const RECT &dr = dstRect ? *dstRect : fullDst;
-    // S4a: a blit destination is no longer "static" -- pendingRaw only
+    // A blit destination is no longer "static" -- pendingRaw only
     // covers copy-engine writes (CopyBufferToImage), not 2D-engine blits, so
     // a store written this way must go back to full per-draw tracking.
     dst->Store()->attachment = true;
@@ -1741,7 +1718,7 @@ HRESULT Device::StretchRect(IDirect3DSurface9 *srcSurface, const RECT *srcRect, 
                              (uint32_t)(sr.bottom - sr.top), 1};
     const DkImageRect dstBox{(uint32_t)dr.left, (uint32_t)dr.top, 0, (uint32_t)(dr.right - dr.left),
                              (uint32_t)(dr.bottom - dr.top), 1};
-    dkCmdBufBlitImage(m_cmd, &sv, &srcBox, &dv, &dstBox,
+    dkCmdBufBlitImage(Rec(), &sv, &srcBox, &dv, &dstBox,
                       filter == D3DTEXF_LINEAR ? DkBlitFlag_FilterLinear : DkBlitFlag_FilterNearest, 0);
     m_listHasWork = true;
     ++Stats().blits;
@@ -1756,7 +1733,7 @@ void Device::CopyBufferToImage(ImageStore *store, uint32_t face, uint32_t level,
                                const DkImageRect &rect)
 {
     BeforeCopyWrite(store);
-    // S4a: also feeds UpdateTexture/UpdateSurface. A static store's per-draw
+    // Also feeds UpdateTexture/UpdateSurface. A static store's per-draw
     // sample check is skipped once bound, so if this copy-write lands while
     // it is still sitting in a sampler-cache slot, flag it: the next draw
     // that samples it (ApplyTextures cache-hit or PrepareDraw's gated loop)
@@ -1774,7 +1751,7 @@ void Device::CopyBufferToImage(ImageStore *store, uint32_t face, uint32_t level,
     if (store->faces > 1)
         target.z = face, target.depth = 1;
     const DkCopyBuf copy{src, 0, 0};
-    dkCmdBufCopyBufferToImage(m_cmd, &copy, &view, &target, 0);
+    dkCmdBufCopyBufferToImage(Rec(), &copy, &view, &target, 0);
     store->uploaded[store->SubIndex(face, level)] = true;
     const uint64_t bytes = (uint64_t)rect.width * rect.height * rect.depth * store->format->blockBytes /
                            (store->format->blockWidth * store->format->blockWidth);
@@ -1793,7 +1770,7 @@ bool Device::ReadImage(ImageStore *store, uint32_t face, uint32_t level, void *d
         return false;
     BeforeCopyRead(store);
     // The copy engine must see every earlier render to this image.
-    Barrier(true);
+    Barrier();
     DkImageView view;
     dkImageViewDefaults(&view, &store->image);
     view.mipLevelOffset = (uint8_t)level;
@@ -1803,7 +1780,7 @@ bool Device::ReadImage(ImageStore *store, uint32_t face, uint32_t level, void *d
     if (store->faces > 1)
         rect.z = face, rect.depth = 1;
     const DkCopyBuf copy{readback.gpu, 0, 0};
-    dkCmdBufCopyImageToBuffer(m_cmd, &view, &rect, &copy, 0);
+    dkCmdBufCopyImageToBuffer(Rec(), &view, &rect, &copy, 0);
     CmdBarrier(DkBarrier_Full, DkInvalidateFlags_L2Cache);
     m_listHasWork = true;
     ++Stats().readbacks;

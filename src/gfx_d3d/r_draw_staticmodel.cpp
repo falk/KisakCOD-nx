@@ -221,7 +221,7 @@ void __cdecl R_SetupStaticModelPrim(XSurface *xsurf, GfxDrawPrimArgs *args, GfxC
 // the reflection probe changes; the draw order is unchanged.
 //
 // Falls back to one draw per model (counted in the DEKO9 perf line as
-// instanceFallbacks) when: r_deko9Instancing is 0; r_portDebugChecks is on
+// instanceFallbacks) when: r_portDebugChecks is on
 // (R_DrawIndexedPrimitive's per-draw debug filters); the pass has no
 // per-prim arguments or more than 16 per-prim registers; a run has one
 // model.
@@ -241,7 +241,7 @@ void R_DrawStaticModelInstance(const GfxStaticModelDrawInst *smodelDrawInst, Gfx
 bool R_DrawStaticModelsInstanced(const uint16_t *list, uint32_t smodelCount, GfxCmdBufContext context,
                                  const GfxDrawPrimArgs &args, bool lit)
 {
-    if (!r_deko9Instancing->current.enabled || r_portDebugChecks->current.enabled || smodelCount < 2)
+    if (!R_StaticModelInstancingEnabled() || smodelCount < 2)
         return false;
     IDirect3DDevice9 *device = context.state->prim.device;
     uint8_t regs[deko9::kMaxInstanceRegs];

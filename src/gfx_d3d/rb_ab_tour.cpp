@@ -149,6 +149,17 @@ void RB_AbTourBackendFrame()
         "deko3d renderer: command-memory chunk size in KiB (0 = 256). Every chunk switch starts a new GPFIFO entry: "
         "1-4 puts dozens into each list, 4096 keeps whole lists in one chunk. Diagnostics");
     Deko9_SetCmdChunkBytes(dx.device, (uint32_t)cmdChunkKB->current.integer << 10);
+    static const dvar_t *cmdPoison = Dvar_RegisterBool(
+        "r_deko9CmdPoison", false, DVAR_NOFLAG,
+        "deko3d renderer: fill freed command memory and the words after each command chunk's end with words the "
+        "GPU rejects that name the chunk and offset (a GPU pushbuffer fault then says whose memory it read), and "
+        "keep freed chunks out of reuse for two lists. Diagnostics; costs CPU writes per list");
+    Deko9_SetCmdPoison(dx.device, cmdPoison->current.enabled);
+    static const dvar_t *cmdOwnerCheck = Dvar_RegisterBool(
+        "r_deko9CmdOwnerCheck", true, DVAR_NOFLAG,
+        "deko3d renderer: report (once, FAIL:DEKO9_CMD_THREAD) a command recorded by a thread that does not hold the "
+        "device lock or into another thread's bake capture");
+    Deko9_SetCmdOwnerCheck(dx.device, cmdOwnerCheck->current.enabled);
     const int mode = r_deko9DrawCensus ? r_deko9DrawCensus->current.integer : 0;
     Deko9_SetDrawCensus(dx.device, (uint32_t)mode, mode ? ParsePasses(r_deko9DrawCensusPasses->current.string) : 0u);
     g_drawCensusOn = mode != 0;

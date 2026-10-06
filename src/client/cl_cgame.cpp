@@ -25,6 +25,9 @@
 #include <game/savememory.h>
 #include <server/sv_game.h>
 #include <qcommon/com_bsp.h>
+#ifdef KISAK_SP
+#include <cgame/cg_rumble.h>
+#endif
 
 char bigConfigString[8192];
 const float g_color_table[8][4]
@@ -262,7 +265,9 @@ void CL_ConfigstringModified()
 void __cdecl CL_Restart()
 {
     SND_ResetPauseSettingsToDefaults();
-    //CG_StopAllRumbles(0); // KISAKTODO: cg_rumble
+#if defined(__SWITCH__) && defined(KISAK_SP)
+    CG_StopAllRumbles(0);
+#endif
     R_Cinematic_StopPlayback();
 
     clientActive_t *cl = CL_GetLocalClientGlobals(0);

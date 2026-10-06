@@ -77,12 +77,16 @@ void R_PrebakeCollectMaterial(XAssetHeader header, void *data)
 }
 } // namespace
 
+bool R_StaticModelInstancingEnabled()
+{
+    return r_portDebugChecks && !r_portDebugChecks->current.enabled;
+}
+
 static void R_PrebakeZoneVariants(const char *zoneName)
 {
     PrebakeCollect collect;
     collect.hardwareShadowmap = gfxMetrics.hasHardwareShadowmap != 0;
-    collect.instancing = r_deko9Instancing && r_deko9Instancing->current.enabled && r_portDebugChecks &&
-                         !r_portDebugChecks->current.enabled;
+    collect.instancing = R_StaticModelInstancingEnabled();
     DB_EnumXAssets(ASSET_TYPE_MATERIAL, R_PrebakeCollectMaterial, &collect, true);
     Deko9PrebakeResult result{};
     if (!Deko9_PrebakeVariants(dx.device, collect.passes.data(), (uint32_t)collect.passes.size(),

@@ -1895,6 +1895,65 @@ uint32_t StubFxVelIntervalZeroCount(uint32_t *effectsOut, uint32_t *elemsOut, co
     return bad;
 }
 
+// One FX_STRING_VISUAL line per sound (elemType 8) and runner (elemType 10)
+// visual of every FX body owned by zoneIndex (canonical or override entry):
+// the sound alias name, or the runner's resolved effect name. A missing
+// string prints "(null)". Returns the number of sound visuals whose name is
+// null; FX_SpawnSound asserts on exactly that.
+static void DumpFxStringVisuals(const char *ff, const FxEffectDef *def, uint32_t *soundOut,
+                                uint32_t *soundNullOut, uint32_t *runnerOut)
+{
+    const int count = def->elemDefCountLooping + def->elemDefCountOneShot + def->elemDefCountEmission;
+    for (int e = 0; e < count && def->elemDefs; ++e)
+    {
+        const FxElemDef *elem = &def->elemDefs[e];
+        if (elem->elemType != 8 && elem->elemType != 10)
+            continue;
+        for (int v = 0; v < elem->visualCount; ++v)
+        {
+            FxElemVisuals visual{};
+            if (elem->visualCount == 1)
+                visual = elem->visuals.instance;
+            else if (elem->visuals.array)
+                visual = elem->visuals.array[v];
+            const char *name = nullptr;
+            if (elem->elemType == 8)
+            {
+                name = visual.soundName;
+                ++*soundOut;
+                *soundNullOut += name == nullptr;
+            }
+            else
+            {
+                name = visual.effectDef.handle ? visual.effectDef.handle->name : nullptr;
+                ++*runnerOut;
+            }
+            std::printf("FX_STRING_VISUAL ff=%s fx=%s elem=%d type=%u visual=%d name=%s\n", ff,
+                        def->name, e, (unsigned)elem->elemType, v, name ? name : "(null)");
+        }
+    }
+}
+
+uint32_t StubFxStringVisualDump(uint32_t zoneIndex, const char *ff, uint32_t *soundOut,
+                                uint32_t *runnerOut)
+{
+    uint32_t sound = 0, soundNull = 0, runner = 0;
+    for (uint32_t i = 0; i < g_registeredCount; ++i)
+    {
+        if (g_registered[i].type != ASSET_TYPE_FX)
+            continue;
+        if (g_registered[i].zoneIndex == zoneIndex && g_registered[i].header.fx)
+            DumpFxStringVisuals(ff, g_registered[i].header.fx, &sound, &soundNull, &runner);
+        if (g_registered[i].overrideZoneIndex == zoneIndex && g_registered[i].overrideHeader.fx)
+            DumpFxStringVisuals(ff, g_registered[i].overrideHeader.fx, &sound, &soundNull, &runner);
+    }
+    if (soundOut)
+        *soundOut = sound;
+    if (runnerOut)
+        *runnerOut = runner;
+    return soundNull;
+}
+
 // Registered multi-variant sound alias lists, and how many of them give their
 // same-named variants distinct aliasName pointers.  The engine matches a
 // playing loop by pointer (SND_ContinueLoopingSound), so a split list restarts

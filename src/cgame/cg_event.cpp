@@ -14,6 +14,10 @@
 #include <client/client.h>
 #include <universal/com_math.h>
 #include <port/switch_rumble.h>
+#ifdef KISAK_SP
+#include "cg_rumble.h"
+#include <port/switch_rumble_hd.h>
+#endif
 
 #ifdef KISAK_MP
 #include <cgame_mp/cg_local_mp.h>
@@ -336,24 +340,40 @@ void __cdecl CG_EntityEvent(int32_t localClientNum, centity_s *cent, int32_t eve
                     CL_SetADS(localClientNum, 0);
                 return;
             case EV_RELOAD:
+#if defined(__SWITCH__) && defined(KISAK_SP)
+                if (isPlayerView)
+                    CG_RumbleReload(localClientNum, SWITCH_RUMBLE_RELOAD_NORMAL, (float)weaponDef->iReloadTime * 0.001f);
+#endif
                 if (isPlayerView)
                     CG_PlayEntitySoundAlias(localClientNum, ent->number, weaponDef->reloadSoundPlayer);
                 else
                     CG_PlayEntitySoundAlias(localClientNum, ent->number, weaponDef->reloadSound);
                 return;
             case EV_RELOAD_FROM_EMPTY:
+#if defined(__SWITCH__) && defined(KISAK_SP)
+                if (isPlayerView)
+                    CG_RumbleReload(localClientNum, SWITCH_RUMBLE_RELOAD_EMPTY, (float)weaponDef->iReloadEmptyTime * 0.001f);
+#endif
                 if (isPlayerView)
                     CG_PlayEntitySoundAlias(localClientNum, ent->number, weaponDef->reloadEmptySoundPlayer);
                 else
                     CG_PlayEntitySoundAlias(localClientNum, ent->number, weaponDef->reloadEmptySound);
                 return;
             case EV_RELOAD_START:
+#if defined(__SWITCH__) && defined(KISAK_SP)
+                if (isPlayerView)
+                    CG_RumbleReload(localClientNum, SWITCH_RUMBLE_RELOAD_START, (float)weaponDef->iReloadStartTime * 0.001f);
+#endif
                 if (isPlayerView)
                     CG_PlayEntitySoundAlias(localClientNum, ent->number, weaponDef->reloadStartSoundPlayer);
                 else
                     CG_PlayEntitySoundAlias(localClientNum, ent->number, weaponDef->reloadStartSound);
                 return;
             case EV_RELOAD_END:
+#if defined(__SWITCH__) && defined(KISAK_SP)
+                if (isPlayerView)
+                    CG_RumbleReload(localClientNum, SWITCH_RUMBLE_RELOAD_END, (float)weaponDef->iReloadEndTime * 0.001f);
+#endif
                 if (isPlayerView)
                     CG_PlayEntitySoundAlias(localClientNum, ent->number, weaponDef->reloadEndSoundPlayer);
                 else
@@ -394,6 +414,10 @@ void __cdecl CG_EntityEvent(int32_t localClientNum, centity_s *cent, int32_t eve
                 CG_FireWeapon(localClientNum, cent, event, scr_const.tag_flash, 0, &cgameGlob->predictedPlayerState);
                 return;
             case EV_RECHAMBER_WEAPON:
+#if defined(__SWITCH__) && defined(KISAK_SP)
+                if (isPlayerView)
+                    CG_RumbleReload(localClientNum, SWITCH_RUMBLE_RELOAD_RECHAMBER, (float)weaponDef->iRechamberTime * 0.001f);
+#endif
                 if (isPlayerView)
                     CG_PlayEntitySoundAlias(localClientNum, ent->number, weaponDef->rechamberSoundPlayer);
                 else
@@ -899,24 +923,15 @@ void __cdecl CG_EntityEvent(int32_t localClientNum, centity_s *cent, int32_t eve
                     CG_PlayEntitySoundAlias(localClientNum, ent->number, weaponDef->nightVisionRemoveSound);
                 return;
 #ifdef KISAK_SP
-                // KISAKTODO: Implement the missing CG rumble functions (CG_PlayRumbleOnEntity, CG_PlayRumbleOnPosition, CG_PlayRumbleLoopOnEntity, CG_PlayRumbleLoopOnPosition, CG_StopRumble, CG_StopAllRumbles).
             case EV_PLAY_RUMBLE_ON_ENT:
-				//CG_PlayRumbleOnEntity(localClientNum, CL_GetConfigString(localClientNum, cent->nextState.eventParm + CS_RUMBLES), clientNum);
-                return;
             case EV_PLAY_RUMBLE_ON_POS:
-				//CG_PlayRumbleOnPosition(localClientNum, CL_GetConfigString(localClientNum, cent->nextState.eventParm + CS_RUMBLES), cent->pose.origin);
-                return;
             case EV_PLAY_RUMBLELOOP_ON_ENT:
-				//CG_PlayRumbleLoopOnEntity(localClientNum, CL_GetConfigString(localClientNum, cent->nextState.eventParm + CS_RUMBLES), clientNum);
-                return;
             case EV_PLAY_RUMBLELOOP_ON_POS:
-				//CG_PlayRumbleLoopOnPosition(localClientNum, CL_GetConfigString(localClientNum, cent->nextState.eventParm + CS_RUMBLES), cent->pose.origin);
-                return;
             case EV_STOP_RUMBLE:
-				//CG_StopRumble(localClientNum, clientNum, CL_GetConfigString(localClientNum, cent->nextState.eventParm + CS_RUMBLES));
-                return;
             case EV_STOP_ALL_RUMBLES:
-				//CG_StopAllRumbles(localClientNum);
+#if defined(__SWITCH__)
+                CG_RumbleEvent(localClientNum, event, eventParm, ent->number, cent->pose.origin);
+#endif
                 return;
 #endif
 #ifdef KISAK_MP

@@ -293,6 +293,15 @@ void Switch_RumbleNotifyLand(int32_t hard);
 // weapon's iExplosionRadius, both in map units.
 void Switch_RumbleNotifyExplosion(float distance, float radius);
 
+// Reload stage for the local player (kind: SwitchRumbleHdReloadKind in
+// switch_rumble_hd.h; seconds: the weapon's reload duration).
+void Switch_RumbleNotifyReload(int32_t kind, float seconds);
+
+// The shaped HD player script rumbles play through, or NULL while the
+// rumble_hd dvar is off (script rumbles have no fixed-frequency fallback).
+typedef struct SwitchRumbleHdPlayer SwitchRumbleHdPlayer;
+SwitchRumbleHdPlayer *Switch_RumbleHdPlayer(void);
+
 // Advances the decay envelopes, applies rumble_enable/rumble_intensity and
 // the pause/menu/focus-loss/disconnect gate, and sends the mixed band pair
 // to the active vibration device(s). Call once per engine frame (IN_Frame).

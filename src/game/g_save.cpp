@@ -1566,6 +1566,23 @@ char *__cdecl G_Save_DateStr()
     return va("%s %i, %i", monthStr[v1.tm_mon], v1.tm_mday, v1.tm_year + 1900);
 }
 
+// The retail SP save stores the whole hud element pool as one raw block:
+// 256 records of 172 bytes (44032).  game_hudelem_s holds no pointers, so the
+// native layout equals the 32-bit one and the block loads unchanged.
+static_assert(sizeof(game_hudelem_s) == HUDELEM_SAVE_RECORD_BYTES, "hud element record size drifted from the save format");
+static_assert(MAX_HUDELEMS_TOTAL * HUDELEM_SAVE_RECORD_BYTES == HUDELEM_SAVE_BYTES, "hud element pool size drifted from the save format");
+
+void __cdecl G_SaveHudElems(SaveGame *save)
+{
+    SaveMemory_SaveWrite(g_hudelems, HUDELEM_SAVE_BYTES, save);
+}
+
+void __cdecl G_LoadHudElems(SaveGame *save)
+{
+    SaveMemory_LoadRead(g_hudelems, HUDELEM_SAVE_BYTES, save);
+}
+
+
 void __cdecl G_SaveConfigstrings(int iFirst, int iCount, SaveGame *save)
 {
     int i; // r29
@@ -2001,10 +2018,7 @@ void __cdecl G_SaveMainState(bool savegame, SaveGame *save)
     iassert(save);
 
     Dvar_SaveDvars(SaveMemory_GetMemoryFile(save), 0x1000u);
-    // sizeof, matching the read side: 44032 is the ILP32 172-byte record x 256
-    // and game_hudelem_s is pointer-free, so the two agree today -- the gate
-    // keeps them from drifting apart.
-    SaveMemory_SaveWrite(g_hudelems, sizeof(game_hudelem_s) * 256, save);
+    G_SaveHudElems(save);
     //ProfMem_End(v11);
     //ProfMem_Begin("misc", v13);
     SaveMemory_SaveWrite(&level.fFogOpaqueDist, 4, save);
@@ -2567,7 +2581,7 @@ void __cdecl G_LoadMainState(SaveGame *save)
     iassert(save);
 
     Dvar_LoadDvars(SaveMemory_GetMemoryFile(save));
-    SaveMemory_LoadRead(g_hudelems, /*44032*/ sizeof(game_hudelem_s) * 256, save); // KISAKTODO: not the right array size
+    G_LoadHudElems(save);
     SaveMemory_LoadRead(&level.fFogOpaqueDist, 4, save);
     SaveMemory_LoadRead(&level.fFogOpaqueDistSqrd, 4, save);
     SaveMemory_LoadRead(&level.bDrawCompassFriendlies, 4, save);

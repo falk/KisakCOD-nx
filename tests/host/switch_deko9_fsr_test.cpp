@@ -26,6 +26,53 @@ namespace
 {
 int g_failures;
 
+// Whether a fragment program's code holds a LOP with immediate 0xfffffff0:
+// the 16-byte alignment UAM applies to the address of a uniform-block
+// vec4 read through a dynamic index. A dynamic component index folded into
+// that address is dropped by it (the load reads component x), so the gamma
+// programs must select their components statically. -1: no program.
+int HasVec4AddressMask(const std::string &glsl)
+{
+    std::vector<uint8_t> dksh;
+    std::string error;
+    if (!Deko9_CompileDksh(DEKO9_STAGE_PIXEL, glsl.c_str(), &dksh, &error) || dksh.size() < 24)
+        return -1;
+    uint32_t hdr[6];
+    std::memcpy(hdr, dksh.data(), sizeof(hdr));
+    const size_t start = (size_t)hdr[2] + 0x80, end = (size_t)hdr[2] + hdr[3];
+    for (size_t at = start, word = 0; at + 8 <= end && at + 8 <= dksh.size(); at += 8, ++word)
+    {
+        uint64_t w;
+        std::memcpy(&w, dksh.data() + at, 8);
+        // LOP (20-bit immediate, sign at bit 56): opcode 0x38[46]/0x39[46].
+        if (word % 4 && ((w >> 48) & 0xfef8) == 0x3840 && ((w >> 20) & 0x7ffff) == 0x7fff0 && (w >> 56 & 1))
+            return 1;
+    }
+    return 0;
+}
+
+// Maxwell instructions in a fragment program's DKSH (scheduling words and
+// NOPs excluded), -1 when it does not compile.
+int Instructions(const std::string &glsl)
+{
+    std::vector<uint8_t> dksh;
+    std::string error;
+    if (!Deko9_CompileDksh(DEKO9_STAGE_PIXEL, glsl.c_str(), &dksh, &error) || dksh.size() < 24)
+        return -1;
+    uint32_t hdr[6];
+    std::memcpy(hdr, dksh.data(), sizeof(hdr));
+    const size_t start = (size_t)hdr[2] + 0x80, end = (size_t)hdr[2] + hdr[3];
+    int count = 0;
+    for (size_t at = start, word = 0; at + 8 <= end && at + 8 <= dksh.size(); at += 8, ++word)
+    {
+        uint64_t w;
+        std::memcpy(&w, dksh.data() + at, 8);
+        if (word % 4 && w && w != 0x50b0000000070f00ull)
+            ++count;
+    }
+    return count;
+}
+
 void Check(bool ok, const char *what, const char *detail = "")
 {
     std::printf("%s:DEKO9_FSR_%s %s\n", ok ? "PASS" : "FAIL", what, detail);
@@ -35,15 +82,18 @@ void Check(bool ok, const char *what, const char *detail = "")
 
 // Reconvergence-stack ops of the programs that still branch per pixel: SGSR's
 // edge-direction tests, the gather probe, and the TAAU resolve's flat-2x2 and
-// history-validity skips (performance branches).
+// history-validity skips plus, with the Catmull-Rom history (not the _BH
+// variants), its one-tap fallback (performance branches).
 uint32_t KnownDivergentOps(const char *name)
 {
     if (!std::strncmp(name, "COMPILE_SGSR", 12))
         return 3;
     if (!std::strcmp(name, "COMPILE_GATHER_PROBE"))
         return 5;
-    if (!std::strncmp(name, "COMPILE_TAAU_RESOLVE", 20))
+    if (!std::strncmp(name, "COMPILE_TAAU_RESOLVE_BH", 23))
         return 6;
+    if (!std::strncmp(name, "COMPILE_TAAU_RESOLVE", 20))
+        return 9;
     return 0;
 }
 
@@ -164,6 +214,16 @@ int main()
     const std::string rcasRect = deko9::SourceRectVariant(deko9::kBilinearRcasGlsl);
     const std::string bilinearRect = deko9::SourceRectVariant(deko9::kBilinearGlsl);
     Check(sgsrRect.find("#version 460\n#define DEKO9_SOURCE_RECT 1\n") == 0, "SOURCE_RECT_VARIANT_TEXT");
+    const std::string sgsrGamma = deko9::GammaVariant(deko9::kSgsrGlsl);
+    const std::string rcasGamma = deko9::GammaVariant(deko9::kBilinearRcasGlsl);
+    const std::string bilinearGamma = deko9::GammaVariant(deko9::kBilinearGlsl);
+    const std::string sgsrCurve = deko9::GammaVariant(deko9::kSgsrGlsl, true);
+    const std::string rcasCurve = deko9::GammaVariant(deko9::kBilinearRcasGlsl, true);
+    const std::string bilinearCurve = deko9::GammaVariant(deko9::kBilinearGlsl, true);
+    Check(!sgsrGamma.empty() && !rcasGamma.empty() && !bilinearGamma.empty() && !sgsrCurve.empty() &&
+              !rcasCurve.empty() && !bilinearCurve.empty() && deko9::GammaVariant("void x(){}").empty() &&
+              deko9::GammaVariant("void x(){}", true).empty(),
+          "GAMMA_VARIANT_TEXT");
     const std::string taauResolve[4] = {
         deko9::TaauVariant(deko9::kTaauResolveGlsl, 0),
         deko9::TaauVariant(deko9::kTaauResolveGlsl, deko9::kTaauBilinearHistory),
@@ -182,6 +242,12 @@ int main()
                     {"COMPILE_SGSR_RECT", DEKO9_STAGE_PIXEL, sgsrRect.c_str()},
                     {"COMPILE_BILINEAR_RCAS_RECT", DEKO9_STAGE_PIXEL, rcasRect.c_str()},
                     {"COMPILE_BILINEAR_RECT", DEKO9_STAGE_PIXEL, bilinearRect.c_str()},
+                    {"COMPILE_SGSR_GAMMA", DEKO9_STAGE_PIXEL, sgsrGamma.c_str()},
+                    {"COMPILE_BILINEAR_RCAS_GAMMA", DEKO9_STAGE_PIXEL, rcasGamma.c_str()},
+                    {"COMPILE_BILINEAR_GAMMA", DEKO9_STAGE_PIXEL, bilinearGamma.c_str()},
+                    {"COMPILE_SGSR_GAMMA_CURVE", DEKO9_STAGE_PIXEL, sgsrCurve.c_str()},
+                    {"COMPILE_BILINEAR_RCAS_GAMMA_CURVE", DEKO9_STAGE_PIXEL, rcasCurve.c_str()},
+                    {"COMPILE_BILINEAR_GAMMA_CURVE", DEKO9_STAGE_PIXEL, bilinearCurve.c_str()},
                     {"COMPILE_GATHER_PROBE", DEKO9_STAGE_PIXEL, deko9::kGatherProbeGlsl},
                     {"COMPILE_FLOATZ", DEKO9_STAGE_PIXEL, deko9::kFloatZGlsl},
                     {"COMPILE_HRP_DEPTH", DEKO9_STAGE_PIXEL, deko9::kHrpDepthGlsl},
@@ -508,6 +574,138 @@ int main()
         }
         Check(deko9::FloatZReference(c, 1.0f) == 2000000.0f && deko9::FloatZReference(c, 0.99999994f) == 2000000.0f,
               "FLOATZ_REF_CLEAR");
+    }
+
+    // Display gamma: the ramp the engine builds (R_CalcGammaRamp: 65535 *
+    // (i / 255) ^ (1 / gamma), identity i * 257 at gamma 1) through the
+    // program's lookup, against the PC path (R_GammaCorrect: 255 * ramp / 65535).
+    {
+        auto buildRamp = [](double gamma, uint16_t *ramp) {
+            for (int i = 0; i < 256; ++i)
+                ramp[i] = gamma == 1.0 ? (uint16_t)(257 * i)
+                                       : (uint16_t)std::floor(std::pow(i / 255.0, 1.0 / gamma) * 65535.0 + 0.5);
+        };
+        uint16_t ramp[256];
+        buildRamp(1.0, ramp);
+        Check(deko9::GammaRampIsIdentity(ramp, ramp, ramp), "GAMMA_DEFAULT_IS_IDENTITY");
+        deko9::GammaConstants id;
+        deko9::GammaSetup(&id, ramp, ramp, ramp);
+        float worstId = 0.0f;
+        for (int i = 0; i < 256; ++i)
+            for (int ch = 0; ch < 3; ++ch)
+                worstId = std::fmax(worstId, std::fabs(deko9::GammaReference(id, ch, i / 255.0f) - i / 255.0f));
+        char detail[96];
+        std::snprintf(detail, sizeof(detail), "worst=%.3g of 1/255=%.3g", worstId, 1.0f / 255.0f);
+        Check(worstId < 1.0f / 255.0f / 4.0f, "GAMMA_IDENTITY_UNCHANGED", detail);
+
+        bool curveOk = true, changed = false, monotonic = true;
+        for (const double gamma : {0.6, 0.8, 1.25, 1.6, 2.2})
+        {
+            buildRamp(gamma, ramp);
+            Check(!deko9::GammaRampIsIdentity(ramp, ramp, ramp), "GAMMA_NON_DEFAULT_NOT_IDENTITY");
+            deko9::GammaConstants lut;
+            deko9::GammaSetup(&lut, ramp, ramp, ramp);
+            float previous = -1.0f;
+            for (int i = 0; i < 256; ++i)
+            {
+                const int pc = 255 * ramp[i] / 0xFFFF; // R_GammaCorrect
+                const float shader = deko9::GammaReference(lut, 1, i / 255.0f) * 255.0f;
+                curveOk = curveOk && std::fabs(shader - (float)ramp[i] * 255.0f / 65535.0f) < 0.01f &&
+                          std::fabs(std::floor(shader + 0.5f) - (float)pc) <= 1.0f;
+                changed = changed || (i > 0 && i < 255 && std::fabs(shader - (float)i) > 1.0f);
+                monotonic = monotonic && shader >= previous;
+                previous = shader;
+            }
+        }
+        Check(curveOk, "GAMMA_MATCHES_PC_CURVE");
+        Check(changed, "GAMMA_NON_DEFAULT_CHANGES_OUTPUT");
+        Check(monotonic, "GAMMA_MONOTONIC");
+        // In-between input (a filtered texel) interpolates between entries.
+        buildRamp(2.2, ramp);
+        deko9::GammaConstants lut;
+        deko9::GammaSetup(&lut, ramp, ramp, ramp);
+        const float mid = deko9::GammaReference(lut, 0, 100.5f / 255.0f);
+        Check(mid > (float)ramp[100] / 65535.0f && mid < (float)ramp[101] / 65535.0f, "GAMMA_INTERPOLATES");
+    }
+
+    // The ramp lookup reads uniform-block components statically. Control: a
+    // dynamically indexed component compiles to the masked address.
+    {
+        const char probe[] = "#version 460\n"
+                             "layout(location = 0) out vec4 outColor;\n"
+                             "layout(std140, binding = 1) uniform B { vec4 uLut[64]; };\n"
+                             "void main()\n"
+                             "{\n"
+                             "    int i = int(gl_FragCoord.x);\n"
+                             "    outColor = vec4(uLut[i >> 2][i & 3]);\n"
+                             "}\n";
+        const int control = HasVec4AddressMask(probe);
+        const int sgsr = HasVec4AddressMask(deko9::GammaVariant(deko9::kSgsrGlsl));
+        const int rcas = HasVec4AddressMask(deko9::GammaVariant(deko9::kBilinearRcasGlsl));
+        const int bilinear = HasVec4AddressMask(deko9::GammaVariant(deko9::kBilinearGlsl));
+        char detail[96];
+        std::snprintf(detail, sizeof(detail), "control=%d sgsr=%d bilinear_rcas=%d bilinear=%d", control, sgsr, rcas,
+                      bilinear);
+        Check(control == 1 && sgsr == 0 && rcas == 0 && bilinear == 0, "GAMMA_STATIC_COMPONENTS", detail);
+    }
+
+    // The engine's ramp is a power curve: the fit recovers 1 / r_gamma from
+    // the entries (not from the identity, nor from a ramp that is no single
+    // power curve), and the curve program's output equals the ramp's entry
+    // at every 8-bit level of every channel within one 16-bit step, with
+    // in-between inputs between the entries. The curve build reads no table
+    // (no per-pixel uniform address) and is the shorter program.
+    {
+        auto buildRamp = [](double gamma, uint16_t *ramp) {
+            for (int i = 0; i < 256; ++i)
+                ramp[i] = gamma == 1.0 ? (uint16_t)(257 * i)
+                                       : (uint16_t)std::floor(std::pow(i / 255.0, (double)(float)(1.0 / gamma)) * 65535.0 + 0.5);
+        };
+        uint16_t ramp[256], other[256];
+        bool fitOk = true, curveOk = true, between = true;
+        char detail[256] = "";
+        size_t used = 0;
+        for (const double gamma : {0.5, 0.6, 0.8, 1.25, 1.6, 2.2, 3.0})
+        {
+            buildRamp(gamma, ramp);
+            const float e = deko9::GammaFitExponent(ramp, ramp, ramp);
+            fitOk = fitOk && std::fabs(e - (float)(1.0 / gamma)) <= 2e-4f * (float)(1.0 / gamma);
+            float worst = 0.0f;
+            for (int i = 0; i < 256; ++i)
+            {
+                worst = std::fmax(worst, std::fabs(deko9::GammaCurveReference(e, i / 255.0f) - ramp[i] / 65535.0f));
+                if (i < 255)
+                {
+                    const float mid = deko9::GammaCurveReference(e, (i + 0.5f) / 255.0f);
+                    between = between && mid >= ramp[i] / 65535.0f && mid <= ramp[i + 1] / 65535.0f;
+                }
+            }
+            curveOk = curveOk && worst <= 1.5f / 65535.0f;
+            used += (size_t)std::snprintf(detail + used, sizeof(detail) - used, "g%.2f:e=%.4f worst=%.1e ", gamma, e,
+                                          worst * 65535.0f);
+        }
+        buildRamp(1.0, ramp);
+        const float identity = deko9::GammaFitExponent(ramp, ramp, ramp);
+        // Two channels on different curves, and one curve lifted by a
+        // brightness offset: no single power curve.
+        buildRamp(0.8, ramp);
+        buildRamp(1.6, other);
+        const float mixed = deko9::GammaFitExponent(ramp, other, ramp);
+        for (int i = 1; i < 255; ++i)
+            other[i] = (uint16_t)std::min(65535, ramp[i] + 2000);
+        other[0] = 0;
+        other[255] = 65535;
+        const float lifted = deko9::GammaFitExponent(other, other, other);
+        Check(fitOk && identity == 0.0f && mixed == 0.0f && lifted == 0.0f, "GAMMA_CURVE_FIT", detail);
+        Check(curveOk && between, "GAMMA_CURVE_MATCHES_RAMP", detail);
+        const int tableInstr = Instructions(bilinearGamma), curveInstr = Instructions(bilinearCurve),
+                  plainInstr = Instructions(deko9::kBilinearGlsl);
+        const int sgsrTable = Instructions(sgsrGamma), sgsrCurveInstr = Instructions(sgsrCurve);
+        std::snprintf(detail, sizeof(detail), "bilinear plain=%d table=%d curve=%d sgsr table=%d curve=%d curve_mask=%d",
+                      plainInstr, tableInstr, curveInstr, sgsrTable, sgsrCurveInstr, HasVec4AddressMask(bilinearCurve));
+        Check(plainInstr > 0 && curveInstr > plainInstr && curveInstr < tableInstr && sgsrCurveInstr < sgsrTable &&
+                  HasVec4AddressMask(bilinearCurve) == 0 && bilinearCurve.find("uLut") == std::string::npos,
+              "GAMMA_CURVE_COST", detail);
     }
 
     std::printf("%s:DEKO9_FSR\n", g_failures ? "FAIL" : "PASS");

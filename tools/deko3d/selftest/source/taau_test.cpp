@@ -251,6 +251,7 @@ void RunTaauTests(IDirect3D9 *d3d, HWND window, void (*check)(bool, const char *
     base.blend = 0.1f;
     base.antiFlicker = 0.5f;
     base.flat = deko9::kTaauFlatDefault / 255.0f;
+    base.bilinearRange = deko9::kTaauBilinearRangeDefault / 255.0f;
     const int32_t src[4] = {0, 0, w, h}, dst[4] = {0, 0, kOutW, kOutH};
     bool ran = true;
     const auto resolve = [&](const deko9::TaauFrame &f) {

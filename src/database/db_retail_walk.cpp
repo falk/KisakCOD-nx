@@ -1961,8 +1961,10 @@ bool ReadRetailFxElemVisualSlot(RetailZoneLoadSession *session,
     case 10:
     case 8:
     {
+        // Both string visuals (runner effect name, sound alias name) report
+        // the block-4 offset of their string so the decoder can bind them.
         uint32_t bytes = 0;
-        if (effectNameOut && elemType == 10)
+        if (effectNameOut)
         {
             if (reference == kInlineReference)
                 *effectNameOut = session->wire.cursor[4];
@@ -1976,8 +1978,8 @@ bool ReadRetailFxElemVisualSlot(RetailZoneLoadSession *session,
                     token.kind == RETAIL_WIRE_TOKEN_OFFSET && token.block == 4)
                     *effectNameOut = token.offset;
                 else
-                    Com_Printf(0, "ReadRetailFxElemVisualSlot: runner visual ref 0x%x did not decode to block 4\n",
-                               reference);
+                    Com_Printf(0, "ReadRetailFxElemVisualSlot: elemType %u string visual ref 0x%x did not decode to block 4\n",
+                               elemType, reference);
             }
         }
         return ReadRetailXString(session, reader, reference, &bytes);
@@ -2114,7 +2116,7 @@ bool ReadRetailFxElemDefBody(RetailZoneLoadSession *session,
             Material **materials = nullptr;
             XModel **models = nullptr;
             uint32_t *effectNames = nullptr;
-            if (offsets && elemType == 10)
+            if (offsets && (elemType == 8 || elemType == 10))
             {
                 effectNames = static_cast<uint32_t *>(RetailZoneLoadSessionAlloc(
                     session, static_cast<std::size_t>(visualCount) * sizeof(uint32_t),

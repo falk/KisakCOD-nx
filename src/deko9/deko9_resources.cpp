@@ -176,7 +176,7 @@ bool Device::CreateStore(ImageStore *store, std::string *error)
     if (!store->levels)
         store->levels = FullChain(store->width, store->height, store->depth);
     store->faces = store->type == D3DRTYPE_CUBETEXTURE ? 6 : 1;
-    // S4a: a render/depth target at creation is never "static"; see the
+    // A render/depth target at creation is never "static"; see the
     // ImageStore::attachment comment. Latched here, and again if a plain
     // store is later bound as a target (SetRenderTarget/SetDepthStencilSurface)
     // or a StretchRect blit destination.
@@ -1591,13 +1591,11 @@ bool ShaderBase::Finish(Device *device, const std::vector<uint8_t> &baseDksh, ui
 VariantSelect ShaderBase::Select(const Device *device, uint32_t shadowMask, const InstanceLayout &instance,
                                  bool earlyZ) const
 {
-    VariantSelect s;
-    s.shadowMask = shadowMask;
-    s.instance = instance;
-    s.earlyZ = earlyZ;
-    s.shadowFilter = VariantShadowFilter(m_stage, shadowMask, device->ShadowFilter());
-    s.shaderOpt = device->ShaderOpt();
-    return s;
+    // The same rule the prebake plan selects with: a draw finds what it baked.
+    PlanOptions options;
+    options.shadowFilter = device->ShadowFilter();
+    options.shaderOpt = device->ShaderOpt();
+    return MakeSelect(m_stage, shadowMask, instance, earlyZ, options);
 }
 
 const ShaderVariant *ShaderBase::Find(const VariantSelect &select) const

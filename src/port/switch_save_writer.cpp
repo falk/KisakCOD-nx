@@ -76,6 +76,7 @@ void SwitchSave_Submit(const SaveHeader *header, const unsigned char *body)
     job.tmpPath = ospath;
     FS_BuildOSPath(fs_homepath->current.string, "players", header->filename, ospath);
     job.finalPath = ospath;
+    SwitchSaveThumb_Request(ospath);
     Writer().Submit(std::move(job));
 }
 

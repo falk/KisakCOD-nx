@@ -212,7 +212,7 @@ void Device::FaultTraceTop(uint32_t crumb)
     uint32_t words[8];
     std::memcpy(words, m_topWords, m_topWordCount * sizeof(uint32_t));
     words[m_topPayload] = crumb;
-    dkCmdBufReplayCmds(m_cmd, words, m_topWordCount);
+    dkCmdBufReplayCmds(Rec(), words, m_topWordCount);
 }
 
 void Device::FaultTraceBeginList()
@@ -221,7 +221,7 @@ void Device::FaultTraceBeginList()
         return;
     m_crumbDraws = 0;
     m_drawRecords->BeginList(m_openSeq);
-    dkCmdBufReportValue(m_cmd, CrumbValue(m_openSeq, 0), m_crumbs.gpu);
+    dkCmdBufReportValue(Rec(), CrumbValue(m_openSeq, 0), m_crumbs.gpu);
 }
 
 void Device::FaultTraceDraw()
@@ -230,7 +230,7 @@ void Device::FaultTraceDraw()
     // draws before it reached CROP, the top value once its front end fetched
     // this far.
     if (m_crumbDraws && m_crumbDraws % m_faultTrace == 0)
-        dkCmdBufReportValue(m_cmd, CrumbValue(m_openSeq, m_crumbDraws), m_crumbs.gpu);
+        dkCmdBufReportValue(Rec(), CrumbValue(m_openSeq, m_crumbDraws), m_crumbs.gpu);
     if (m_crumbDraws % m_faultTrace == 0)
         FaultTraceTop(CrumbValue(m_openSeq, m_crumbDraws));
     DrawRecord r{};
@@ -573,6 +573,8 @@ bool Device::BlackBoxDump(const char *reason, uint64_t stalledNs)
     // budget is still there when the fault comes; queue errors always dump.
     static std::atomic<uint32_t> s_dumps{0};
     static std::atomic<uint64_t> s_lastDumpNs{0};
+    // The flight recorder first: short, and on the SD log ring as well.
+    FrDump(reason, !std::strcmp(reason, "watchdog"));
     const uint64_t now = armTicksToNs(armGetSystemTick());
     const bool queueError = reason[0] == 'q';
     if (!queueError)
@@ -756,6 +758,8 @@ void Deko9_BlackBoxDump(const char *reason)
     deko9::Device *d = deko9::s_liveDevice.load(std::memory_order_acquire);
     if (d)
         d->BlackBoxDump(reason, 0);
+    else
+        Deko9_FlightRecDump(reason); // the recorder part works without the fault trace
 }
 
 void Deko9_SetFaultTrace(IDirect3DDevice9 *device, uint32_t interval)

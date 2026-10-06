@@ -221,12 +221,12 @@ void Deko9_SetEarlyZ(IDirect3DDevice9 *device, bool enable);
 //     flag instead of scanning the dirty bitmask.
 //   DEKO9_PERDRAW_TEXTURES: a texture-binding change re-resolves only the
 //     sampler slots whose texture or sampler state changed.
-//   DEKO9_PERDRAW_STATICTEX (task/deko9-static-hazards, S4a): a store never
+//   DEKO9_PERDRAW_STATICTEX: a store never
 //     used as a render/depth/blit target (ImageStore::attachment) is added
 //     to a draw's hazard set only when newly bound or pendingRaw (a
 //     copy-write landed on it while it stayed bound); off, every sampled
-//     store is added every draw as before the optimization -- the pixel
-//     A/B proof toggles this alone via r_deko9EmissiveTourShots.
+//     store is added every draw as before the optimization (the selftest
+//     compares every bit on against off).
 // Takes effect at the next draw.
 enum : uint32_t
 {
@@ -244,14 +244,10 @@ void Deko9_SetPerDraw(IDirect3DDevice9 *device, uint32_t flags);
 // each one equals the registered default of the dvar named beside it.
 constexpr bool DEKO9_DEFAULT_VERIFY = false;      // r_deko9Verify
 constexpr bool DEKO9_DEFAULT_EARLY_Z = true;      // r_deko9EarlyZ
-// r_deko9HazardCache, r_deko9ConstFast, r_deko9TexIncremental, r_deko9StaticHazard (one bit each)
+// Every per-draw fast path on (r_deko9Verify re-derives each draw the slow way).
 constexpr uint32_t DEKO9_DEFAULT_PERDRAW =
     DEKO9_PERDRAW_HAZARD | DEKO9_PERDRAW_CONSTS | DEKO9_PERDRAW_TEXTURES | DEKO9_PERDRAW_STATICTEX;
 constexpr bool DEKO9_DEFAULT_GPU_PASSES = false;  // r_deko9GpuPasses
-constexpr uint32_t DEKO9_DEFAULT_DRAW_PROBE = 0;  // r_deko9DrawProbe
-constexpr uint32_t DEKO9_DEFAULT_DRAW_SPLIT = 1;  // r_deko9DrawSplit
-constexpr uint32_t DEKO9_DEFAULT_BARRIER_MODE = 0; // r_deko9LightBarriers
-constexpr uint32_t DEKO9_DEFAULT_TILED_CACHE = 0; // r_deko9TiledCache
 constexpr bool DEKO9_DEFAULT_ZCULL_STATS = false; // r_deko9ZcullStats
 constexpr uint32_t DEKO9_DEFAULT_SHADOW_FILTER = 0; // r_shadowFilter
 constexpr uint32_t DEKO9_DEFAULT_SHADER_OPT = 0;  // r_deko9ShaderOpt
@@ -262,17 +258,8 @@ constexpr bool DEKO9_DEFAULT_RT_COMPRESSION = true; // r_deko9RtCompression
 constexpr float DEKO9_DEFAULT_UPSCALE_SHARPNESS = 0.2f; // r_fsrSharpness
 constexpr uint32_t DEKO9_DEFAULT_UPSCALE_MODE = 0; // r_fsrMode
 constexpr uint32_t DEKO9_DEFAULT_CMD_CHUNK_KB = 0; // r_deko9CmdChunkKB (0: the device's chunk size)
-// r_deko9DrawProbe / r_deko9DrawSplit: GPU per-draw cost probe. Pixels are
-// unchanged; only the number of GPU draws or the per-draw feeding changes.
-// `split` > 1 issues each triangle-list draw as that many consecutive draws.
-enum : uint32_t
-{
-    DEKO9_PROBE_CONSTS = 1u << 0,    // re-push every shader constant each draw
-    DEKO9_PROBE_TEXTURES = 1u << 1,  // re-resolve textures/samplers each draw
-    DEKO9_PROBE_STREAMS = 1u << 2,   // re-bind vertex streams and index buffer each draw
-    DEKO9_PROBE_SUBCONSTS = 1u << 3, // each split sub-draw also re-pushes constants
-};
-void Deko9_SetDrawProbe(IDirect3DDevice9 *device, uint32_t flags, uint32_t split);
+constexpr bool DEKO9_DEFAULT_CMD_POISON = false;     // r_deko9CmdPoison
+constexpr bool DEKO9_DEFAULT_CMD_OWNER_CHECK = true; // r_deko9CmdOwnerCheck
 // Submits the open list and waits until the GPU has finished everything.
 void Deko9_WaitForGpuIdle(IDirect3DDevice9 *device);
 // Single-submitter rule: the calling thread becomes the render owner, the
@@ -438,17 +425,6 @@ void Deko9_SetFrameTag(IDirect3DDevice9 *device, uint32_t width, uint32_t height
 // waits and never takes the device lock. False before the first frame.
 bool Deko9_GetGpuFrame(IDirect3DDevice9 *device, float *gpuMs, uint32_t *width, uint32_t *height, uint32_t *count);
 
-// ---- hazard barrier strength (r_deko9LightBarriers) -----------------------------
-// 0 (default): every hazard records DkBarrier_Full + texture/L2 invalidate.
-// 1: hazards between 3D-pipe accesses only (render -> sample, sample ->
-//    render) record DkBarrier_Primitives + texture-cache invalidate.
-// 2: as 1 with DkBarrier_Fragments (assumes no vertex-shader texture reads of
-//    a target rendered since the last barrier).
-// Hazards involving the copy or 2D engine always record the full barrier.
-void Deko9_SetBarrierMode(IDirect3DDevice9 *device, uint32_t mode);
-// r_deko9TiledCache: 0 off, 1 = tiled caching (128x128 tiles), 2 = 64x64 tiles.
-void Deko9_SetTiledCache(IDirect3DDevice9 *device, uint32_t mode);
-
 // ---- zcull (r_deko9ZcullStats; deko9_zcull.cpp) --------------------------------
 // Zcull is always on (the queue created at init; deko3d has no
 // per-command-buffer switch). Stats: a CPU model of the zcull region per pass
@@ -587,7 +563,7 @@ void Deko9_NoteInstanceFallback(IDirect3DDevice9 *device, uint32_t draws);
 // DrawIndexedPrimitive(D3DPT_TRIANGLELIST, ranges[i].baseVertex, 0, numVertices,
 // ranges[i].firstIndex, ranges[i].triCount) calls back to back, recorded with
 // one state application and one deko3d draw per range. Used for static index
-// data (r_deko9StaticPretess): the visible runs of a world material batch in
+// data (static pretess): the visible runs of a world material batch in
 // the static world index buffer, or one static model's shared triangles
 // once per cached instance (baseVertex = the instance's cache slot).
 // Returns an HRESULT.
@@ -626,7 +602,6 @@ struct Deko9Counters
     // Per-draw fast paths (Deko9_SetPerDraw), per-60-frame window like draws:
     // draws that skipped hazard evaluation.
     uint64_t hazardSkips;
-    uint64_t probeExtraDraws; // Deko9_SetDrawProbe split sub-draws
     // Deko9_DrawIndexedRanges calls and the deko3d draws (ranges) they
     // recorded.
     uint64_t rangeCalls, rangeDraws;
@@ -696,6 +671,28 @@ bool Deko9_FaultTraceCommandWindow(IDirect3DDevice9 *device, uint32_t draw, char
 // else clamped to 1 KiB..4 MiB), applied at the next Present. Each chunk switch
 // starts a new GPFIFO entry, so small chunks put many into every list.
 void Deko9_SetCmdChunkBytes(IDirect3DDevice9 *device, uint32_t bytes);
+// Command flight recorder (always on, independent of r_deko9FaultTrace): a
+// record per GPFIFO segment and per command-chunk transition.
+// r_deko9CmdPoison 1 fills freed command chunks (tag A) and the words after
+// each chunk's end (tag B) with words the GPU rejects that name the chunk
+// and offset, and keeps freed chunks out of reuse for two lists.
+// r_deko9CmdOwnerCheck 1 reports recording without the device lock. Both
+// apply at the next Present.
+void Deko9_SetCmdPoison(IDirect3DDevice9 *device, bool on);
+void Deko9_SetCmdOwnerCheck(IDirect3DDevice9 *device, bool on);
+// Watchdog side (any thread, no device lock; no-ops before a device exists):
+// the compact "FR ..." dump to the SD log ring and log host (throttled to
+// one per 5 s, 32 in all), a one-line "FR hb" heartbeat, and the whole
+// recorder to sdmc:/switch/kisakcod/flightrec.bin (also when a dump on
+// another thread asked for it: FlightRecBinaryPending).
+void Deko9_FlightRecDump(const char *reason);
+void Deko9_FlightRecHeartbeat(void);
+bool Deko9_FlightRecBinaryPending(void);
+void Deko9_FlightRecWriteBinary(void);
+// TEST ONLY (switch_stallTest 2): with r_deko9CmdPoison on, the next list's
+// first command chunk is poisoned before it is submitted (a chunk retired one
+// list early), so the GPU faults on a tag A word the dump names.
+void Deko9_FlightRecEarlyRetireTest(void);
 void Deko9_SetGpuMap(IDirect3DDevice9 *device, uint32_t level);
 // Internal hook of Deko9_SetDebugName.
 void Deko9_GpuMapNoteName(IDirect3DBaseTexture9 *texture);

@@ -2,6 +2,7 @@
 
 #include "deko9_taau.h"
 
+#include <cfloat>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -134,34 +135,50 @@ void TaauSetup(TaauConstants *out, const int32_t srcRect[4], const int32_t dstRe
                uint32_t colorHeight, uint32_t histWidth, uint32_t histHeight, const TaauFrame &frame)
 {
     std::memset(out, 0, sizeof(*out));
-    // The NDC mapping of (u.x, u.y, z, 1) folded in: ndc = (2 u.x - 1, 1 - 2 u.y)
-    // in, (x + w) / 2, (w - y) / 2 out, so the shader divides by w and has
-    // the previous uv; then z = (depth - min) / (max - min) folded into the
-    // depth and constant rows.
+    // Rows k of (u.x, u.y, z, 1) -> previous clip, u the output uv: the NDC
+    // mapping ndc = (2 u.x - 1, 1 - 2 u.y) in, (x + w) / 2, (w - y) / 2, w
+    // out (divided by w: the previous uv); z = (depth - min) / (max - min)
+    // folded into the depth and constant rows.
+    double r[4][3] = {};
     for (int c = 0; c < 4; ++c)
     {
-        const float n[4] = {2.0f * frame.reproj[0][c], -2.0f * frame.reproj[1][c], frame.reproj[2][c],
-                            frame.reproj[3][c] + frame.reproj[1][c] - frame.reproj[0][c]};
+        const double n[4] = {2.0 * frame.reproj[0][c], -2.0 * frame.reproj[1][c], frame.reproj[2][c],
+                             (double)frame.reproj[3][c] + frame.reproj[1][c] - frame.reproj[0][c]};
         for (int k = 0; k < 4; ++k)
         {
             if (c == 0)
-                out->reproj[k][0] += 0.5f * n[k];
+                r[k][0] += 0.5 * n[k];
             else if (c == 1)
-                out->reproj[k][1] -= 0.5f * n[k];
+                r[k][1] -= 0.5 * n[k];
             else if (c == 3)
             {
-                out->reproj[k][0] += 0.5f * n[k];
-                out->reproj[k][1] += 0.5f * n[k];
-                out->reproj[k][2] = n[k];
+                r[k][0] += 0.5 * n[k];
+                r[k][1] += 0.5 * n[k];
+                r[k][2] = n[k];
             }
         }
     }
-    const float zScale = 1.0f / (frame.sceneMaxZ - frame.sceneMinZ);
+    const double zScale = 1.0 / ((double)frame.sceneMaxZ - frame.sceneMinZ);
     for (int c = 0; c < 3; ++c)
     {
-        out->reproj[3][c] -= frame.sceneMinZ * zScale * out->reproj[2][c];
-        out->reproj[2][c] *= zScale;
+        r[3][c] -= frame.sceneMinZ * zScale * r[2][c];
+        r[2][c] *= zScale;
     }
+    // The program feeds the fragment position (u = (frag - rect x, y) /
+    // rect w, h) and wants history px - 0.5 (uv * rect w, h + rect x, y - 0.5).
+    const double rect[4] = {(double)dstRect[0], (double)dstRect[1], (double)dstRect[2], (double)dstRect[3]};
+    for (int k = 0; k < 4; ++k)
+        for (int i = 0; i < 2; ++i)
+            r[k][i] = r[k][i] * rect[2 + i] + (rect[i] - 0.5) * r[k][2];
+    for (int c = 0; c < 3; ++c)
+    {
+        r[3][c] -= rect[0] / rect[2] * r[0][c] + rect[1] / rect[3] * r[1][c];
+        r[0][c] /= rect[2];
+        r[1][c] /= rect[3];
+    }
+    for (int k = 0; k < 4; ++k)
+        for (int c = 0; c < 3; ++c)
+            out->reproj[k][c] = (float)r[k][c];
     const float inv[2] = {1.0f / (float)colorWidth, 1.0f / (float)colorHeight};
     const float src[4] = {(float)srcRect[0], (float)srcRect[1], (float)srcRect[2], (float)srcRect[3]};
     const float dst[4] = {(float)dstRect[0], (float)dstRect[1], (float)dstRect[2], (float)dstRect[3]};
@@ -169,14 +186,13 @@ void TaauSetup(TaauConstants *out, const int32_t srcRect[4], const int32_t dstRe
     {
         out->pos[i] = src[2 + i] / dst[2 + i];
         out->pos[2 + i] = frame.jitter[i] - dst[i] * out->pos[i] - 0.5f;
-        out->uv[i] = 1.0f / dst[2 + i];
-        out->uv[2 + i] = -dst[i] / dst[2 + i];
+        out->edge[i] = dst[i] - 0.5f + 0.5f * dst[2 + i];
+        out->edge[2 + i] = 0.5f * dst[2 + i];
         out->gather[i] = inv[i];
         out->gather[2 + i] = (src[i] + 1.0f) * inv[i];
         out->texel[i] = inv[i] * frame.reactiveUv[i];
         out->texel[2 + i] = (src[i] + 0.5f) * inv[i] * frame.reactiveUv[i];
         out->dst[i] = dst[2 + i];
-        out->dst[2 + i] = dst[i] - 0.5f;
         const float histInv = 1.0f / (float)(i ? histHeight : histWidth);
         out->hist[i] = histInv;
         out->hist[2 + i] = -histInv;
@@ -185,17 +201,20 @@ void TaauSetup(TaauConstants *out, const int32_t srcRect[4], const int32_t dstRe
         out->scale[i] = TaauKernelScale(dst[2 + i] / src[2 + i]);
     }
     out->scale[2] = frame.flat;
+    out->scale[3] = frame.bilinearRange;
     out->depth[0] = frame.viewmodelSplit;
+    out->depth[1] = kTaauHistoryStillBar;
     out->depth[3] = frame.sceneMinZ + frame.farNdcZ * (frame.sceneMaxZ - frame.sceneMinZ);
     out->blend[0] = frame.blend;
     out->blend[1] = frame.reset ? -1.0f : 1.0f;
-    out->blend[3] = frame.motion ? 1.0f : 0.0f;
+    out->blend[3] = frame.motion ? FLT_MAX : kTaauMotionNone;
     out->reactive[1] = kTaauReactiveThreshold;
     out->reactive[2] = frame.opaque && frame.reactive > 0.0f ? kTaauReactiveScale : 0.0f;
     out->reactive[3] = frame.reactive;
     out->output[0] = frame.antiFlicker;
     out->output[1] = kTaauYouthWeight;
     out->output[2] = kTaauYouthStep;
+    out->output[3] = 4.0f * kTaauAntiFlickerLumaFloor;
 }
 
 // TAAU_HALF: the image is half the scene's size; one bilinear tap at the
@@ -273,7 +292,8 @@ void main()
 // kernel weighs them, their RGB range bounds the history, a flat 2x2 skips
 // the history (its clamp would give the current colour), the validity tests
 // are one sign, and the Catmull-Rom history fetch (TAAU_BILINEAR_HISTORY:
-// one bilinear tap, blurrier in motion) uses factored weights.
+// one bilinear tap, blurrier in motion) uses factored weights and falls
+// back to the one tap where the five taps cannot change the result.
 // TAAU_BILINEAR_CURRENT weighs the 4 texels bilinearly instead of by the
 // polynomial kernel (a wider, cheaper tent).
 const char kTaauResolveGlsl[] = R"GLSL(#version 460
@@ -286,48 +306,65 @@ layout(binding = 3) uniform sampler2D uMotion;
 layout(binding = 4) uniform sampler2D uReactiveDelta;
 layout(std140, binding = 1) uniform TaauBlock
 {
-    vec4 uReproj[4];  // rows: prev clip (x, y, w) of (u.x, u.y, z, 1), 0.5 folded
+    vec4 uReproj[4];  // rows: (x w, y w, w) of (frag.x, frag.y, z, 1); x, y in history px - 0.5
     vec4 uPos;        // output px -> jittered render px - 0.5: fr = frag * xy + zw
-    vec4 uUv;         // output px -> output uv: u = frag * xy + zw
+    vec4 uEdge;       // output rect centre x, y in history px - 0.5; half its width, height
     vec4 uGather;     // 2x2 gather uv = corner * xy + zw
     vec4 uTexel;      // point-sample uv = (render px - 0.5) * xy + zw
-    vec4 uDst;        // output rect w, h; x - 0.5, y - 0.5 (history px - 0.5 = u * xy + zw)
+    vec4 uDst;        // output rect w, h (motion uv -> px); 0, 0
     vec4 uHist;       // 1/w, 1/h, -1/w, -1/h of the history
     vec4 uHist2;      // 2/w, 2/h, 0.5/w, 0.5/h
-    vec4 uScale;      // kernel units per render px x, y; flat threshold; 0
-    vec4 uDepthParm;  // viewmodel split, 0, 0, depth at infinity
-    vec4 uBlend;      // blend, history valid sign, 0, motion texture
+    vec4 uScale;      // kernel units per render px x, y; flat threshold; one-tap history range
+    vec4 uDepthParm;  // viewmodel split, one-tap history position bar (f (1 - f)), 0, depth at infinity
+    vec4 uBlend;      // blend, history valid sign, 0, motion.x cap (FLT_MAX, or -16: no texture)
     vec4 uReactive;   // 0, threshold, scale (0: no mask), weight
-    vec4 uOutput;     // anti-flicker, youth weight, youth step, 0
+    vec4 uOutput;     // anti-flicker, youth weight, youth step, anti-flicker luma floor (x4)
 };
 
-float Luma(vec3 c)
+// Four times the luma (0.25, 0.5, 0.25): two instructions instead of three;
+// the blend below is written for the scaled value.
+float Luma4(vec3 c)
 {
-    return dot(c, vec3(0.25, 0.5, 0.25));
+    return (c.r + c.b) + 2.0 * c.g;
 }
 
 // The history at `fr` + 0.5 (history pixels); alpha carries the pixel's
-// youth (see main). The sampler clamps at the history's edge.
-vec4 History(vec2 fr)
+// youth (see main). The sampler clamps at the history's edge. `spread` is
+// the 2x2 colour range the result is clamped to.
+vec4 History(vec2 fr, float spread)
 {
 #ifndef TAAU_BILINEAR_HISTORY
     // Catmull-Rom in 5 bilinear taps (the four corner taps dropped). With
-    // e = 1 - f, twice the weights are W12 = 2 + f e, W0 = -f e e,
-    // W3 = -f f e; the common factor cancels in the normalisation, and the
-    // five tap weights sum to 2 (W12.x + W12.y) - W12.x W12.y.
+    // e = 1 - f and W = 2 + f e (twice the middle pair's weight), each tap
+    // weighs relative to the centre tap: the outer taps -f e e / W and
+    // -f e f / W per axis, and the five sum to 1 - f e / W (x) - f e / W (y).
+    // The middle pair's bilinear offset is f (1 + f + 3 f e) / W.
     vec2 fl = floor(fr);
-    vec2 f = fr - fl, e = 1.0 - f;
-    vec2 fe = f * e;
-    vec2 w12 = fe + 2.0, p0 = fe * e, p3 = fe * f;
-    vec2 off = f * (1.0 + f * (4.0 - 3.0 * f)) * (1.0 / w12);
+    vec2 f = fr - fl;
+    vec2 fe = f - f * f;
+    // One bilinear tap where the five cannot show: at a texel centre (f (1 - f)
+    // below the bar: a still camera, the viewmodel; the kernel is then the
+    // centre tap alone), or where the clamp range is below uScale.w (both
+    // filtered values land in that range, so they differ by less than it).
+    // Both cases hold across whole regions, so a warp rarely runs both paths.
+    if (max(fe.x, fe.y) < uDepthParm.y || spread < uScale.w)
+        return textureLod(uHistory, fr * uHist.xy + uHist2.zw, 0.0);
+    vec2 rw = 1.0 / (fe + 2.0);
+    vec2 q = fe * rw;
+    // The common factor folded into the weights keeps one value, not two,
+    // alive across the taps.
+    float norm = 1.0 / (1.0 - q.x - q.y);
+    q *= norm;
+    vec2 n3 = -q * f, n0 = q * f - q;
+    vec2 off = (f + f * (f + 3.0 * fe)) * rw;
     vec2 base = fl * uHist.xy + uHist2.zw;
     vec2 t0 = base + uHist.zw, t3 = base + uHist2.xy, t12 = off * uHist.xy + base;
-    float a = -w12.x * p0.y, b = -p0.x * w12.y, c = w12.x * w12.y, d = -p3.x * w12.y, e5 = -w12.x * p3.y;
     vec4 centre = textureLod(uHistory, t12, 0.0);
-    vec3 r = centre.rgb * c + textureLod(uHistory, vec2(t12.x, t0.y), 0.0).rgb * a +
-             textureLod(uHistory, vec2(t0.x, t12.y), 0.0).rgb * b + textureLod(uHistory, vec2(t3.x, t12.y), 0.0).rgb * d +
-             textureLod(uHistory, vec2(t12.x, t3.y), 0.0).rgb * e5;
-    return vec4(r / (2.0 * (w12.x + w12.y) - c), centre.a);
+    vec3 r = centre.rgb * norm + textureLod(uHistory, vec2(t12.x, t0.y), 0.0).rgb * n0.y +
+             textureLod(uHistory, vec2(t0.x, t12.y), 0.0).rgb * n0.x +
+             textureLod(uHistory, vec2(t3.x, t12.y), 0.0).rgb * n3.x +
+             textureLod(uHistory, vec2(t12.x, t3.y), 0.0).rgb * n3.y;
+    return vec4(r, centre.a);
 #else
     return textureLod(uHistory, fr * uHist.xy + uHist2.zw, 0.0);
 #endif
@@ -337,7 +374,6 @@ void main()
 {
     // The 2x2 scene texels around the sample point: one gather uv for the
     // colour and the depth. Gather order: x (0,1), y (1,1), z (1,0), w (0,0).
-    vec2 u = gl_FragCoord.xy * uUv.xy + uUv.zw;
     vec2 fr = gl_FragCoord.xy * uPos.xy + uPos.zw;
     vec2 corner = floor(fr);
     vec2 guv = corner * uGather.xy + uGather.zw;
@@ -352,9 +388,10 @@ void main()
     vec3 current = vec3(dot(r, w), dot(g, w), dot(b, w));
 #else
     // A (1 - d^2)^2 kernel in kernel units (TaauKernelScale).
+    // 1 - x^2 - y^2 as (1 - x^2) - y^2: the x terms are shared by two texels.
     vec2 f0 = (fr - corner) * uScale.xy, f1 = f0 - uScale.xy;
-    vec2 d0 = f0 * f0, d1 = f1 * f1;
-    vec4 w = clamp(1.0 - vec4(d0.x + d1.y, d1.x + d1.y, d1.x + d0.y, d0.x + d0.y), 0.0, 1.0);
+    vec2 s = vec2(1.0 - f0.x * f0.x, 1.0 - f1.x * f1.x);
+    vec4 w = clamp(vec4(s.x - f1.y * f1.y, s.y - f1.y * f1.y, s.y - f0.y * f0.y, s.x - f0.y * f0.y), 0.0, 1.0);
     w *= w;
     float wmax = max(max(w.x, w.y), max(w.z, w.w));
     vec3 current = vec3(dot(r, w), dot(g, w), dot(b, w)) / max(dot(w, vec4(1.0)), 9.5367431640625e-7);
@@ -376,8 +413,9 @@ void main()
     vec3 result = current;
     float youth = reactive;
     vec3 range = hi - lo;
+    float spread = max(max(range.r, range.g), range.b);
     // A flat 2x2 clamps any history onto the current colour: skip it.
-    if (max(max(range.r, range.g), range.b) > uScale.z)
+    if (spread > uScale.z)
     {
         youth = 1.0;
         // Nearest depth of the 2x2: edges take the motion of the foreground.
@@ -386,43 +424,60 @@ void main()
         float dz = min(col.x, col.y);
         vec2 near = vec2(col.y < col.x, min(dg.x, dg.y) < min(dg.w, dg.z));
 
-        // Per-object motion (uBlend.w) at the nearest texel, else depth
+        // Per-object motion at the nearest texel, else depth
         // reprojection; the viewmodel (in front of the split) stays put.
         // Depth clear (sky) and anything past it reprojects as infinitely far.
         vec2 motion = textureLod(uMotion, guv + (near - 0.5) * uGather.xy, 0.0).xy;
-        motion = uBlend.w != 0.0 ? motion : vec2(-16.0);
+        // Without a motion texture (another image is bound) the cap is the
+        // no-motion marker; motion.y is only read with motion.x past -8.
+        motion.x = min(motion.x, uBlend.w);
         float z = min(dz, uDepthParm.w);
-        vec3 prev = u.x * uReproj[0].xyz + u.y * uReproj[1].xyz + z * uReproj[2].xyz + uReproj[3].xyz;
+        // Positions below are history px - 0.5 (this pixel: frag - 0.5).
+        vec3 prev = gl_FragCoord.x * uReproj[0].xyz + gl_FragCoord.y * uReproj[1].xyz + z * uReproj[2].xyz +
+                    uReproj[3].xyz;
         vec2 reproj = prev.xy * (1.0 / prev.z);
-        vec2 moved = u + motion;
+        vec2 here = gl_FragCoord.xy - 0.5;
+        vec2 moved = motion * uDst.xy + here;
         bool useMotion = motion.x > -8.0;
         bool viewmodel = dz < uDepthParm.x;
-        vec2 still = viewmodel ? u : reproj;
-        vec2 prevU = useMotion ? moved : still;
+        vec2 still = viewmodel ? here : reproj;
         // Positive when the history is usable: not a reset frame, no reject
         // motion, a point in front of the previous camera (or the
         // viewmodel), and inside the history. The bar is 2^-20, not 0: a
         // tiny prev.z makes 1 / prev.z infinite (0 * inf = NaN when prev.xy
-        // is 0) and min/max drop a NaN edge term, so the reprojected uv is
-        // used only where prev.z exceeds the bar and its reciprocal is finite.
-        vec2 edge = abs(prevU - 0.5);
-        float good = useMotion ? 8.0 - motion.x : max(uDepthParm.x - dz, prev.z);
-        good = min(min(good, 0.5 - max(edge.x, edge.y)), uBlend.y);
+        // is 0) and min/max drop a NaN edge term, so the reprojected position
+        // is used only where prev.z exceeds the bar and its reciprocal is finite.
+        vec2 prevX;
+        float good;
+        if (useMotion)
+        {
+            prevX = moved;
+            good = 8.0 - motion.x;
+        }
+        else
+        {
+            prevX = still;
+            good = max(uDepthParm.x - dz, prev.z);
+        }
+        vec2 edge = uEdge.zw - abs(prevX - uEdge.xy);
+        good = min(min(good, min(edge.x, edge.y)), uBlend.y);
         if (good > 9.5367431640625e-7)
         {
-            vec4 h = History(prevU * uDst.xy + uDst.zw);
+            vec4 h = History(prevX, spread);
             vec3 hist = clamp(h.rgb, lo, hi);
-            float histY = Luma(hist), currentY = Luma(current);
+            float histY = Luma4(hist), currentY = Luma4(current);
             float alpha = clamp(uBlend.x * wmax, 0.0, 1.0);
             // Anti-flicker: agreeing luma (relative difference near 0)
             // trusts the history more; disagreement keeps the full weight.
-            float agree = 1.0 - clamp(abs(currentY - histY) / max(max(currentY, histY), 0.2), 0.0, 1.0);
-            alpha *= 1.0 - uOutput.x * agree * agree;
+            // The relative difference is the same for the scaled lumas.
+            float agree = 1.0 - clamp(abs(currentY - histY) / max(max(currentY, histY), uOutput.w), 0.0, 1.0);
+            alpha -= alpha * (uOutput.x * agree) * agree;
             alpha = max(alpha, max(reactive * uReactive.w, h.a * uOutput.y));
             youth = max(reactive, h.a - uOutput.z);
-            // Luma-weighted blend (1 / (1 + luma) per side) as one lerp.
-            float t = alpha * (1.0 + histY);
-            t /= t + (1.0 - alpha) * (1.0 + currentY);
+            // Luma-weighted blend (1 / (1 + luma) per side, both sides
+            // scaled by 4 with the lumas) as one lerp.
+            float t = alpha * (4.0 + histY);
+            t /= t + (1.0 - alpha) * (4.0 + currentY);
             result = mix(hist, current, t);
         }
     }

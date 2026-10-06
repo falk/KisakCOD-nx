@@ -625,6 +625,9 @@ GfxIndexBufferState *RB_SwapBuffers();
 // readback (PNG); RB_PollRequestedScreenshot reports when it was written.
 void RB_RequestScreenshot(const char *ospath);
 bool RB_PollRequestedScreenshot(bool *ok);
+// Saved-game thumbnail (switch_save_thumb.h) of the next presented frame,
+// written to `ospath`; any thread.
+void RB_RequestSaveThumbnail(const char *ospath);
 #endif
 void RB_UpdateBackEndDvarOptions();
 void __cdecl RB_ExecuteRenderCommandsLoop(const void *cmds);

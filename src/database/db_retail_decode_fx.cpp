@@ -99,6 +99,27 @@ static const FxEffectDef *RetailResolveEffectRef(const char *name)
     return fx;
 }
 
+// Copy a NUL-terminated string out of the block-4 mirror into the zone's
+// session arena (the mirror is scratch); null for UINT32_MAX or a string
+// that runs off the end of the block.
+static const char *CopyBlock4String(RetailZoneLoadSession *session, uint32_t start)
+{
+    const uint8_t *block4 = session->zoneMemory->blocks[4].data;
+    const uint32_t size = session->zoneMemory->blocks[4].size;
+    if (start == UINT32_MAX || !block4 || start >= size)
+        return nullptr;
+    uint32_t end = start;
+    while (end < size && block4[end])
+        ++end;
+    if (end >= size)
+        return nullptr;
+    const uint32_t bytes = end - start + 1u;
+    char *copy = static_cast<char *>(RetailZoneLoadSessionAlloc(session, bytes, 1));
+    if (copy)
+        std::memcpy(copy, block4 + start, bytes);
+    return copy;
+}
+
 void WidenElemNested(RetailZoneLoadSession *session, FxElemDef *native,
                      const uint8_t *wire, const RetailWalkFxElemOffsets &off)
 {
@@ -195,7 +216,7 @@ void WidenElemNested(RetailZoneLoadSession *session, FxElemDef *native,
     // B7 general fix: assemble the live-widened visual union. elemType/
     // visualCount are already correct (copied verbatim by
     // WidenElemDefPrefix, called before this). Elem types 6/7 (no visual
-    // asset), 8/10 (string visuals, bound elsewhere) and a null
+    // asset) and a null
     // off.visual*/off.visualMarks (declared-null slot, or a pure walk-only
     // call with no worldContext) leave native->visuals zeroed, matching the
     // caller's zero-fill.
@@ -258,7 +279,33 @@ void WidenElemNested(RetailZoneLoadSession *session, FxElemDef *native,
                 reinterpret_cast<const char *>(block4 + off.visualEffectName));
         }
     }
-    else if (elemType != 6 && elemType != 7 && elemType != 8)
+    else if (elemType == 8)
+    {
+        // Sound visuals: the original Load_FxElemVisuals keeps soundName as
+        // the loaded XString; FX_SpawnSound looks the alias up by that name.
+        if (visualCount > 1)
+        {
+            if (off.visualEffectNameArray)
+            {
+                FxElemVisuals *array = static_cast<FxElemVisuals *>(RetailZoneLoadSessionAlloc(
+                    session, static_cast<std::size_t>(visualCount) * sizeof(FxElemVisuals),
+                    alignof(FxElemVisuals)));
+                if (array)
+                {
+                    for (uint32_t i = 0; i < visualCount; ++i)
+                        array[i].soundName =
+                            CopyBlock4String(session, off.visualEffectNameArray[i]);
+                    native->visuals.array = array;
+                }
+            }
+        }
+        else
+        {
+            native->visuals.instance.soundName =
+                CopyBlock4String(session, off.visualEffectName);
+        }
+    }
+    else if (elemType != 6 && elemType != 7)
     {
         if (visualCount > 1)
         {

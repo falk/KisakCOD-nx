@@ -13,6 +13,9 @@
 #include "cg_modelpreviewer.h"
 #include <stringed/stringed_hooks.h>
 #include "cg_view.h"
+#ifdef KISAK_SP
+#include "cg_rumble.h"
+#endif
 
 int __cdecl CG_CheatsOK(const char *cmdName)
 {
@@ -476,7 +479,9 @@ void CG_PlayRumble_f()
         {
             v0 = Cmd_Argv(1);
             v1 = Cmd_LocalClientNum();
-            //CG_PlayRumbleOnClient(v1, v0); // KISAKTODO
+#if defined(__SWITCH__) && defined(KISAK_SP)
+            CG_PlayRumbleOnClient(v1, v0);
+#endif
         }
         else
         {

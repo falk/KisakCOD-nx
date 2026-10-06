@@ -1,7 +1,7 @@
 // Host test (ASan/UBSan) for the pure parts of the deko9 native submission
 // fast path: the device lock and single-submitter rule, sampler-state packing
 // and caches, the engine's
-// live-texture memo, and (task/deko9-static-hazards, S4a) the static-texture
+// live-texture memo, and the static-texture
 // hazard-skip model against the full per-draw tracker. Run by ./test host
 // (deko9_fastpath_sanitizer_check).
 
@@ -736,16 +736,15 @@ void TestConstantFile()
     Check(pushes.size() == 4 && pushes[3] == std::make_pair(192u, 64u), "constants: 1 KB chunks");
 }
 
-// ---- S4a: static-texture hazard-skip model vs. the full per-draw tracker --
+// ---- static-texture hazard-skip model vs. the full per-draw tracker -------
 //
 // Drives OldTracker (today: every draw hazard-checks every sampled store)
-// and NewTracker (S4a: a static store is checked only when newly bound or
+// and NewTracker (a static store is checked only when newly bound or
 // pendingRaw) through the identical random op stream -- bind, draw, copy
 // (UpdateTexture/UpdateSurface/CopyBufferToImage), blit (StretchRect), and a
 // barrier from elsewhere (e.g. ReadImage) -- and asserts every single
-// barrier decision (fired, kind) and the running barrier count agree. See
-// src/deko9/deko9_hazard_model.h and
-// section 5 brief S4a.
+// barrier decision (fired, kind) and the running barrier count agree
+// (src/deko9/deko9_hazard_model.h).
 void TestStaticHazardModel()
 {
     using namespace deko9_hazard_model;

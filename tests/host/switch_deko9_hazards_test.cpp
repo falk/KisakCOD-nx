@@ -40,9 +40,9 @@
 //         DEKO9_DEFAULT_*) against the dvar's registered default in the
 //         engine sources (argv[1] = repository root); every dvar a
 //         Deko9_Set* call passes must be covered. Negative control: the
-//         previous device defaults (shader options all on, no
-//         static-texture hazard bit) must show exactly those two
-//         mismatches.
+//         previous device defaults (shader options all on) must show
+//         exactly that mismatch. The per-draw fast paths have no dvar:
+//         the device default must hold all of them.
 //  switch r_deko9Prebake 0 skips the zone-load prebake: the gate runs
 //         nothing when off (on, the negative control, runs it once), and the
 //         engine's entry point collects and builds only through it.
@@ -1360,19 +1360,10 @@ struct DeviceDefault
 
 std::vector<DeviceDefault> CurrentDefaults()
 {
-    const uint32_t pd = DEKO9_DEFAULT_PERDRAW;
     return {
         {"r_deko9Verify", DEKO9_DEFAULT_VERIFY ? 1.0 : 0.0},
         {"r_deko9EarlyZ", DEKO9_DEFAULT_EARLY_Z ? 1.0 : 0.0},
-        {"r_deko9HazardCache", (pd & DEKO9_PERDRAW_HAZARD) ? 1.0 : 0.0},
-        {"r_deko9ConstFast", (pd & DEKO9_PERDRAW_CONSTS) ? 1.0 : 0.0},
-        {"r_deko9TexIncremental", (pd & DEKO9_PERDRAW_TEXTURES) ? 1.0 : 0.0},
-        {"r_deko9StaticHazard", (pd & DEKO9_PERDRAW_STATICTEX) ? 1.0 : 0.0},
         {"r_deko9GpuPasses", DEKO9_DEFAULT_GPU_PASSES ? 1.0 : 0.0},
-        {"r_deko9DrawProbe", (double)DEKO9_DEFAULT_DRAW_PROBE},
-        {"r_deko9DrawSplit", (double)DEKO9_DEFAULT_DRAW_SPLIT},
-        {"r_deko9LightBarriers", (double)DEKO9_DEFAULT_BARRIER_MODE},
-        {"r_deko9TiledCache", (double)DEKO9_DEFAULT_TILED_CACHE},
         {"r_deko9ZcullStats", DEKO9_DEFAULT_ZCULL_STATS ? 1.0 : 0.0},
         {"r_shadowFilter", (double)DEKO9_DEFAULT_SHADOW_FILTER},
         {"r_deko9ShaderOpt", (double)DEKO9_DEFAULT_SHADER_OPT},
@@ -1383,6 +1374,8 @@ std::vector<DeviceDefault> CurrentDefaults()
         {"r_fsrSharpness", (double)DEKO9_DEFAULT_UPSCALE_SHARPNESS},
         {"r_fsrMode", (double)DEKO9_DEFAULT_UPSCALE_MODE},
         {"r_deko9CmdChunkKB", (double)DEKO9_DEFAULT_CMD_CHUNK_KB},
+        {"r_deko9CmdPoison", DEKO9_DEFAULT_CMD_POISON ? 1.0 : 0.0},
+        {"r_deko9CmdOwnerCheck", DEKO9_DEFAULT_CMD_OWNER_CHECK ? 1.0 : 0.0},
         {"r_deko9Prebake", DEKO9_DEFAULT_PREBAKE ? 1.0 : 0.0},
         // The device starts with the draw census off (its slots are set up
         // by the first non-zero mode).
@@ -1440,15 +1433,23 @@ void TestDefaults(const std::string &root)
     {
         if (!std::strcmp(d.dvar, "r_deko9ShaderOpt"))
             d.value = (double)DEKO9_SHADER_OPT_ALL;
-        if (!std::strcmp(d.dvar, "r_deko9StaticHazard"))
-            d.value = 0.0;
     }
     const std::vector<std::string> oldBad = CompareDefaults(sources, old);
     std::printf("defaults: %zu rows checked, %zu mismatches; previous device defaults: %zu mismatches\n",
                 current.size(), bad.size(), oldBad.size());
-    Check(oldBad.size() == 2 && oldBad[0] == "r_deko9StaticHazard" && oldBad[1] == "r_deko9ShaderOpt",
-          "defaults negative control: the previous device defaults differ in exactly r_deko9StaticHazard and "
-          "r_deko9ShaderOpt");
+    Check(oldBad.size() == 1 && oldBad[0] == "r_deko9ShaderOpt",
+          "defaults negative control: the previous device defaults differ in exactly r_deko9ShaderOpt");
+    // The per-draw fast paths have no dvar: the engine never calls
+    // Deko9_SetPerDraw, so the device default must hold every one of them
+    // (the previous default lacked DEKO9_PERDRAW_STATICTEX).
+    const uint32_t allPerDraw =
+        DEKO9_PERDRAW_HAZARD | DEKO9_PERDRAW_CONSTS | DEKO9_PERDRAW_TEXTURES | DEKO9_PERDRAW_STATICTEX;
+    const uint32_t previousPerDraw = DEKO9_PERDRAW_HAZARD | DEKO9_PERDRAW_CONSTS | DEKO9_PERDRAW_TEXTURES;
+    Check(DEKO9_DEFAULT_PERDRAW == allPerDraw && previousPerDraw != allPerDraw,
+          "defaults: the device starts with every per-draw fast path on (negative control: the previous default "
+          "differs)");
+    Check(sources.find("Deko9_SetPerDraw(") == std::string::npos,
+          "defaults: the engine leaves the per-draw fast paths at the device default");
     // The plan's options are the device's defaults (what a prebake before the
     // first frame would use).
     const deko9::PlanOptions plan;

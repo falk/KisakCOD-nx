@@ -431,6 +431,123 @@ std::string SourceRectVariant(const char *glsl)
     return text;
 }
 
+uint32_t GammaLutOffset(uint32_t mode)
+{
+    return mode == UPSCALE_BILINEAR ? 32u : 64u;
+}
+
+bool GammaRampIsIdentity(const uint16_t *red, const uint16_t *green, const uint16_t *blue)
+{
+    for (int i = 0; i < 256; ++i)
+    {
+        const uint16_t identity = (uint16_t)(i * 257);
+        if (red[i] != identity || green[i] != identity || blue[i] != identity)
+            return false;
+    }
+    return true;
+}
+
+void GammaSetup(GammaConstants *out, const uint16_t *red, const uint16_t *green, const uint16_t *blue)
+{
+    for (int i = 0; i < 256; ++i)
+    {
+        out->value[i][0] = (float)red[i] / 65535.0f;
+        out->value[i][1] = (float)green[i] / 65535.0f;
+        out->value[i][2] = (float)blue[i] / 65535.0f;
+        out->value[i][3] = 0.0f;
+    }
+    for (int i = 0; i < 256; ++i)
+        for (int c = 0; c < 4; ++c)
+            out->slope[i][c] = i < 255 ? out->value[i + 1][c] - out->value[i][c] : 0.0f;
+}
+
+float GammaReference(const GammaConstants &c, int channel, float v)
+{
+    const float clamped = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+    const float x = clamped * 255.0f;
+    const float f = std::floor(x);
+    const int i = (int)f;
+    return c.value[i][channel] + c.slope[i][channel] * (x - f);
+}
+
+float GammaFitExponent(const uint16_t *red, const uint16_t *green, const uint16_t *blue)
+{
+    // A power curve maps 0 to 0 and 1 to 1; its exponent follows from the
+    // middle entry, and every entry of every channel must then round to it
+    // (within one step: the engine evaluates the curve with a float
+    // exponent, this fit recovers it from a rounded entry).
+    const uint16_t *channels[3] = {red, green, blue};
+    for (const uint16_t *c : channels)
+        if (c[0] != 0 || c[255] != 65535 || c[128] == 0 || c[128] == 65535)
+            return 0.0f;
+    const double e = std::log(red[128] / 65535.0) / std::log(128.0 / 255.0);
+    if (!(e > 0.0) || !std::isfinite(e))
+        return 0.0f;
+    const float exponent = (float)e;
+    for (int i = 1; i < 255; ++i)
+    {
+        const double want = std::floor(std::pow(i / 255.0, (double)exponent) * 65535.0 + 0.5);
+        for (const uint16_t *c : channels)
+            if (std::fabs(want - c[i]) > 1.0)
+                return 0.0f;
+    }
+    return exponent == 1.0f ? 0.0f : exponent;
+}
+
+void GammaCurveSetup(GammaCurveConstants *out, float exponent)
+{
+    out->curve[0] = exponent;
+    out->curve[1] = out->curve[2] = out->curve[3] = 0.0f;
+}
+
+float GammaCurveReference(float exponent, float v)
+{
+    const float clamped = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+    return std::pow(clamped, exponent);
+}
+
+std::string GammaVariant(const char *glsl, bool curve)
+{
+    std::string text = glsl;
+    auto replaceOnce = [&](const char *from, const std::string &to) {
+        const size_t at = text.find(from);
+        if (at != std::string::npos)
+            text.replace(at, std::strlen(from), to);
+        return at != std::string::npos;
+    };
+    // The program keeps writing a global outColor; main() applies the ramp.
+    const bool outOk = replaceOnce("layout(location = 0) out vec4 outColor;",
+                                   "layout(location = 0) out vec4 gammaOut;\nvec4 outColor;");
+    const size_t block = text.find("layout(std140, binding = 1) uniform");
+    const size_t close = block == std::string::npos ? std::string::npos : text.find("};", block);
+    if (close != std::string::npos)
+        text.insert(close, curve ? "    vec4 uGammaCurve;\n" : "    vec4 uLut[256];\n    vec4 uLutSlope[256];\n");
+    const bool mainOk = replaceOnce("void main()", "void shadeMain()");
+    if (!outOk || !mainOk || close == std::string::npos)
+        return std::string(); // the caller treats an empty program as a build failure
+    text += "void main()\n"
+            "{\n"
+            "    shadeMain();\n";
+    if (curve)
+    {
+        // pow(0, e) with e > 0 is 0 (lg2 -inf, ex2 0): no guard needed.
+        text += "    gammaOut = vec4(pow(clamp(outColor.rgb, 0.0, 1.0), uGammaCurve.xxx), outColor.a);\n";
+    }
+    else
+    {
+        // Level i's red, green, blue are uLut[i].rgb (static components);
+        // linear to level i + 1 with uLutSlope[i].
+        text += "    vec3 x = clamp(outColor.rgb, 0.0, 1.0) * 255.0;\n"
+                "    vec3 f = floor(x);\n"
+                "    ivec3 i = ivec3(f);\n"
+                "    vec3 t = x - f;\n"
+                "    gammaOut = vec4(uLut[i.r].r + uLutSlope[i.r].r * t.r, uLut[i.g].g + uLutSlope[i.g].g * t.g,\n"
+                "                    uLut[i.b].b + uLutSlope[i.b].b * t.b, outColor.a);\n";
+    }
+    text += "}\n";
+    return text;
+}
+
 void UpscaleSourceSetup(UpscaleSource *out, int texWidth, int texHeight, int x, int y, int w, int h)
 {
     const float tw = (float)texWidth, th = (float)texHeight;

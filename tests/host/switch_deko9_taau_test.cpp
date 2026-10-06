@@ -76,14 +76,21 @@ TaauMat View(const double eye[3], double yaw, double pitch)
 }
 
 // Maxwell instructions in a fragment program's DKSH (scheduling words and
-// NOPs excluded), -1 when it does not compile.
-int Instructions(const std::string &glsl)
+// NOPs excluded), -1 when it does not compile; `gprs` gets its register count.
+int Instructions(const std::string &glsl, uint32_t *gprs = nullptr)
 {
     std::vector<uint8_t> dksh;
     std::string error;
     if (!Deko9_CompileDksh(DEKO9_STAGE_PIXEL, glsl.c_str(), &dksh, &error) || dksh.size() < 24)
         return -1;
     uint32_t hdr[6];
+    if (gprs)
+    {
+        std::memcpy(hdr, dksh.data(), sizeof(hdr));
+        *gprs = hdr[4] && hdr[4] + 12 <= dksh.size() ? 0 : 999;
+        if (!*gprs)
+            std::memcpy(gprs, dksh.data() + hdr[4] + 8, 4);
+    }
     std::memcpy(hdr, dksh.data(), sizeof(hdr));
     const size_t start = (size_t)hdr[2] + 0x80, end = (size_t)hdr[2] + hdr[3];
     int count = 0;
@@ -97,11 +104,13 @@ int Instructions(const std::string &glsl)
     return count;
 }
 
-// The resolve's depth-reprojection validity and history uv
+// The resolve's depth-reprojection validity and history position
 // (kTaauResolveGlsl, no object motion) in float: fminf/fmaxf drop a NaN
-// operand as the GPU's min/max do. `prev` is the folded previous clip
-// (x, y, w); `gap` = viewmodel split - nearest depth (> 0: viewmodel);
-// `bar` is the sign test's threshold (2^-20 in the program, 0 before).
+// operand as the GPU's min/max do. `prev` is the folded previous position
+// (x w, y w, w); `gap` = viewmodel split - nearest depth (> 0: viewmodel);
+// `bar` is the sign test's threshold (2^-20 in the program, 0 before). The
+// output rectangle is the unit square here (centre 0.5, half size 0.5), so
+// positions read as uv.
 struct Reprojected
 {
     bool good;
@@ -115,8 +124,8 @@ Reprojected ResolveReproject(const float prev[3], const float u[2], float gap, f
     Reprojected r;
     r.u[0] = viewmodel ? u[0] : reproj[0];
     r.u[1] = viewmodel ? u[1] : reproj[1];
-    const float edge = std::fmax(std::fabs(r.u[0] - 0.5f), std::fabs(r.u[1] - 0.5f));
-    const float good = std::fmin(std::fmin(std::fmax(gap, prev[2]), 0.5f - edge), resetSign);
+    const float edge = std::fmin(0.5f - std::fabs(r.u[0] - 0.5f), 0.5f - std::fabs(r.u[1] - 0.5f));
+    const float good = std::fmin(std::fmin(std::fmax(gap, prev[2]), edge), resetSign);
     r.good = good > bar;
     return r;
 }
@@ -155,7 +164,14 @@ int main()
     }
 
     {
-        // Each variant costs less than the one it simplifies.
+        // Each variant costs less than the one it simplifies; every resolve
+        // variant fits 32 registers (64 warps per Maxwell SM; 33..40 give 48).
+        uint32_t gprs[deko9::kTaauResolveVariants] = {};
+        for (uint32_t v = 0; v < deko9::kTaauResolveVariants; ++v)
+            Instructions(deko9::TaauVariant(deko9::kTaauResolveGlsl, v), &gprs[v]);
+        char regs[96];
+        std::snprintf(regs, sizeof(regs), "gprs=%u/%u/%u/%u", gprs[0], gprs[1], gprs[2], gprs[3]);
+        Check(*std::max_element(gprs, gprs + deko9::kTaauResolveVariants) <= 32, "RESOLVE_REGISTERS", regs);
         const int resolve = Instructions(deko9::kTaauResolveGlsl);
         const int bilinearHistory =
             Instructions(deko9::TaauVariant(deko9::kTaauResolveGlsl, deko9::kTaauBilinearHistory));
@@ -170,7 +186,9 @@ int main()
         std::snprintf(detail, sizeof(detail),
                       "resolve=%d bilinear_history=%d bilinear_current=%d both=%d opaque=%d opaque_half=%d sgsr=%d",
                       resolve, bilinearHistory, bilinearCurrent, both, opaque, opaqueHalf, sgsr);
-        Check(resolve > 0 && resolve <= 280 && bilinearHistory > 0 && bilinearHistory <= 215 && bilinearCurrent > 0 &&
+        // The full program's count includes the one-tap history fallback's
+        // body (11 slots), which a pixel runs instead of the five taps.
+        Check(resolve > 0 && resolve <= 270 && bilinearHistory > 0 && bilinearHistory <= 203 && bilinearCurrent > 0 &&
                   bilinearCurrent < resolve && both > 0 && both < bilinearHistory && opaque > 0 && opaqueHalf > 0 &&
                   sgsr > 0,
               "RESOLVE_INSTRUCTIONS", detail);
@@ -300,32 +318,31 @@ int main()
         f.farNdcZ = 0.99951172f;
         f.blend = 0.1f;
         f.flat = 2.0f / 255.0f;
+        f.bilinearRange = 4.0f / 255.0f;
         f.reset = true;
         const int32_t src[4] = {0, 0, 960, 540}, dst[4] = {0, 0, 1280, 720};
         deko9::TaauConstants c;
         deko9::TaauSetup(&c, src, dst, 1024, 576, 1280, 720, f);
-        // Row k of the folded reprojection: (u.x, u.y, z, 1) -> (x + w) / 2,
-        // (w - y) / 2, w of the previous clip position.
-        const float n2[4] = {f.reproj[2][0], f.reproj[2][1], f.reproj[2][2], f.reproj[2][3]};
-        const float n3[4] = {f.reproj[3][0] + f.reproj[1][0] - f.reproj[0][0], f.reproj[3][1] + f.reproj[1][1] - f.reproj[0][1],
-                             0.0f, f.reproj[3][3] + f.reproj[1][3] - f.reproj[0][3]};
+        // The reprojection rows are checked by SETUP_REPROJ_FOLD below; the
+        // w column takes the fragment position (u = frag / 1280, 720).
         const float zs = 64.0f / 63.0f;
-        const bool ok = std::fabs(c.reproj[2][0] - 0.5f * (n2[0] + n2[3]) * zs) < 1e-5f &&
-                        std::fabs(c.reproj[2][1] - 0.5f * (n2[3] - n2[1]) * zs) < 1e-5f &&
-                        std::fabs(c.reproj[2][2] - n2[3] * zs) < 1e-5f && c.reproj[0][2] == 2.0f * f.reproj[0][3] &&
-                        c.reproj[1][2] == -2.0f * f.reproj[1][3] &&
-                        std::fabs(c.reproj[3][0] - (0.5f * (n3[0] + n3[3]) - 0.5f * (n2[0] + n2[3]) * zs / 64.0f)) < 1e-5f &&
-                        std::fabs(c.reproj[3][1] - (0.5f * (n3[3] - n3[1]) - 0.5f * (n2[3] - n2[1]) * zs / 64.0f)) < 1e-5f &&
-                        c.pos[0] == 0.75f && c.pos[2] == -0.25f &&
-                        c.uv[0] == 1.0f / 1280 && c.gather[0] == 1.0f / 1024 && c.gather[3] == 1.0f / 576 &&
-                        c.texel[1] == 1.0f / 576 && c.texel[2] == 0.5f / 1024 && c.dst[0] == 1280.0f && c.dst[2] == -0.5f &&
+        const bool ok = std::fabs(c.reproj[2][2] - f.reproj[2][3] * zs) < 1e-5f &&
+                        std::fabs(c.reproj[0][2] - 2.0f * f.reproj[0][3] / 1280.0f) < 1e-7f &&
+                        std::fabs(c.reproj[1][2] + 2.0f * f.reproj[1][3] / 720.0f) < 1e-7f &&
+                        c.pos[0] == 0.75f && c.pos[2] == -0.25f && c.edge[0] == 639.5f && c.edge[1] == 359.5f &&
+                        c.edge[2] == 640.0f && c.edge[3] == 360.0f && c.gather[0] == 1.0f / 1024 &&
+                        c.gather[3] == 1.0f / 576 && c.texel[1] == 1.0f / 576 && c.texel[2] == 0.5f / 1024 &&
+                        c.dst[0] == 1280.0f && c.dst[1] == 720.0f && c.output[3] == 0.8f &&
                         c.hist[1] == 1.0f / 720 && c.hist[3] == -1.0f / 720 && c.hist2[0] == 2.0f / 1280 &&
                         std::fabs(c.scale[0] - 4.0f / 3.0f / 1.2f) < 1e-6f && c.scale[2] == f.flat &&
+                        c.scale[3] == f.bilinearRange && c.depth[1] == deko9::kTaauHistoryStillBar &&
                         c.blend[1] == -1.0f && std::fabs(c.depth[3] - (f.sceneMinZ + f.farNdcZ * 63.0f / 64.0f)) < 1e-6f;
         Check(ok, "SETUP");
 
         // The folded rows reproduce the reference path (depth to z, ndc,
-        // clip, divide, uv) for any matrix.
+        // clip, divide, uv, history px - 0.5) for any matrix, from the
+        // fragment position, in output rectangles at and off the origin.
+        const int32_t offRect[4] = {64, 40, 1152, 648};
         uint32_t seed = 12345;
         const auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return (float)(seed >> 8) / 16777216.0f * 2.0f - 1.0f; };
         double worst = 0.0;
@@ -334,8 +351,10 @@ int main()
             for (int i = 0; i < 4; ++i)
                 for (int j = 0; j < 4; ++j)
                     f.reproj[i][j] = (i == j ? 1.0f : 0.0f) + 0.3f * rnd();
-            deko9::TaauSetup(&c, src, dst, 1024, 576, 1280, 720, f);
+            const int32_t *rect = trial & 1 ? dst : offRect;
+            deko9::TaauSetup(&c, src, rect, 1024, 576, 1280, 720, f);
             const float u[2] = {0.5f + 0.5f * rnd(), 0.5f + 0.5f * rnd()}, depth = 0.5f + 0.5f * rnd();
+            const float frag[2] = {rect[0] + u[0] * rect[2], rect[1] + u[1] * rect[3]};
             const float z = (depth - f.sceneMinZ) / (f.sceneMaxZ - f.sceneMinZ);
             const float p[4] = {2.0f * u[0] - 1.0f, 1.0f - 2.0f * u[1], z, 1.0f};
             float clip[4];
@@ -343,12 +362,14 @@ int main()
                 clip[col] = p[0] * f.reproj[0][col] + p[1] * f.reproj[1][col] + p[2] * f.reproj[2][col] + p[3] * f.reproj[3][col];
             if (std::fabs(clip[3]) < 0.2f)
                 continue;
-            const float want[2] = {clip[0] / clip[3] * 0.5f + 0.5f, 0.5f - clip[1] / clip[3] * 0.5f};
+            const float want[2] = {(clip[0] / clip[3] * 0.5f + 0.5f) * rect[2] + rect[0] - 0.5f,
+                                   (0.5f - clip[1] / clip[3] * 0.5f) * rect[3] + rect[1] - 0.5f};
             float prev[3];
             for (int k = 0; k < 3; ++k)
-                prev[k] = u[0] * c.reproj[0][k] + u[1] * c.reproj[1][k] + depth * c.reproj[2][k] + c.reproj[3][k];
-            worst = std::fmax(worst, std::fabs(prev[0] / prev[2] - want[0]));
-            worst = std::fmax(worst, std::fabs(prev[1] / prev[2] - want[1]));
+                prev[k] = frag[0] * c.reproj[0][k] + frag[1] * c.reproj[1][k] + depth * c.reproj[2][k] + c.reproj[3][k];
+            // Pixels relative to the rectangle's size, as uv before.
+            worst = std::fmax(worst, std::fabs(prev[0] / prev[2] - want[0]) / rect[2]);
+            worst = std::fmax(worst, std::fabs(prev[1] / prev[2] - want[1]) / rect[3]);
             worst = std::fmax(worst, std::fabs(prev[2] - clip[3]));
         }
         char detail[64];

@@ -48,7 +48,7 @@ void __cdecl R_DrawPreTessTris(
 
 void __cdecl R_DrawBspDrawSurfsPreTess(const uint32_t *primDrawSurfPos, GfxCmdBufContext context);
 // Index data for one world surface's triangles (brush models): the surface's
-// range of the static world index buffer with r_deko9StaticPretess (binding
+// range of the static world index buffer (static pretess; binding
 // it), else a copy into the dynamic index buffer (R_SetIndexData). Returns
 // the first index to draw.
 int R_SetWorldIndexData(GfxCmdBufPrimState *state, const struct srfTriangles_t *tris, int triCount);

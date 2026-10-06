@@ -194,6 +194,19 @@ kisak_host_test(core-snd-restore-asan
     LABELS "core"
     ENV "ASAN_OPTIONS=detect_leaks=0")
 
+kisak_host_test(core-rumble-script-asan
+    SOURCES ${R}/src/cgame/cg_rumble.cpp ${H}/switch_rumble_script_test.cpp
+    LIBS host_asan_ubsan
+    COMPILE_OPTIONS -std=c++20 -Wall -Wextra -ffunction-sections -fdata-sections -I${R} -I${S} -I${R}/deps ${D3D9_INCLUDES}
+        -D_iobuf=FILE "SHELL:-include cstdio" "SHELL:-include ${H}/switch_retail_ui_compat.h"
+        -Wno-return-type -Wno-int-to-pointer-cast -Wno-unused-function
+        -Wno-unused-variable -Wno-unused-parameter -Wno-class-memaccess -Wno-psabi
+        -D__cdecl= -D__stdcall= "-D__declspec(x)=" -D_vsnprintf=vsnprintf -D__unix__
+    DEFINES KISAK_SP __SWITCH__ WIN32
+    LINK_OPTIONS -Wl,--gc-sections
+    LABELS "core"
+    ENV "ASAN_OPTIONS=detect_leaks=0")
+
 kisak_host_test(core-save-field-layout-asan
     SOURCES ${R}/src/game/g_save.cpp ${H}/switch_save_field_layout_test.cpp
     LIBS host_asan_ubsan

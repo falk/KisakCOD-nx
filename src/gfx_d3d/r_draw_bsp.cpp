@@ -337,7 +337,7 @@ void __cdecl R_DrawBspTris(GfxCmdBufPrimState *state, const srfTriangles_t *tris
     args.triCount = triCount;
     if (IDirect3DIndexBuffer9 *staticIb = R_StaticPretessWorldIb())
     {
-        // r_deko9StaticPretess: the merged surfaces are contiguous in
+        // Static pretess: the merged surfaces are contiguous in
         // rgp.world->indices (R_DrawTriangles merges only then), so draw
         // them straight from the static world index buffer.
         if (state->indexBuffer != staticIb)
@@ -477,7 +477,7 @@ struct StaticRangeGroup
 
 static bool R_BindStaticWorldIndices(GfxCmdBufPrimState *prim)
 {
-    IDirect3DIndexBuffer9 *ib = R_StaticPretessWorldIbAny();
+    IDirect3DIndexBuffer9 *ib = R_StaticPretessWorldIb();
     if (!ib)
     {
         // The front end recorded a static batch for a world whose static

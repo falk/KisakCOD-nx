@@ -79,13 +79,17 @@ struct PrebakePassInputs
     uint32_t instanceRegCount;
 };
 
+// Whether rigid static-model runs draw instanced: the draw side and the
+// prebake share this one rule (r_portDebugChecks needs one draw per model).
+bool R_StaticModelInstancingEnabled();
+
 // Calls emit(const PrebakePassInputs &) for every pass of every technique
 // of `techSet` drawn for `material`: the material's own technique set or the
 // one the feature remap (r_specular, r_normal, hardware shadow maps, ...)
 // selects for it, both drawn with the material's state bits.
 // `hardwareShadowmap`: shadow maps are depth textures
 // (gfxMetrics.hasHardwareShadowmap); `instancing`: rigid static models may
-// draw instanced (r_deko9Instancing on, r_portDebugChecks off).
+// draw instanced (R_StaticModelInstancingEnabled).
 template <typename Emit>
 void R_ForEachPrebakePass(const Material *material, const MaterialTechniqueSet *techSet, bool hardwareShadowmap,
                           bool instancing, Emit &&emit)

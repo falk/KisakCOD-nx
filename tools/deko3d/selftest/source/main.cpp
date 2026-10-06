@@ -1149,88 +1149,6 @@ void RunTests()
               "BAKED_VERIFY", detail);
     }
     Deko9_SetVerify(g_device, false);
-    // Light barriers (r_deko9LightBarriers 1/2): render -> sample -> render
-    // -> sample within the 3D pipe, in one list, with the lighter barrier.
-    for (uint32_t mode = 1; mode <= 2; ++mode)
-    {
-        Deko9_SetBarrierMode(g_device, mode);
-        BeginPass();
-        g_device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-        g_device->SetPixelShader(g_psColor);
-        g_device->SetRenderTarget(0, rttSurface);
-        g_device->Clear(0, nullptr, D3DCLEAR_TARGET, green, 1.0f, 0);
-        SetColor(0, 0, 1, 1);
-        DrawQuad(-1, -0.5f, 1, -1); // bottom quarter blue
-        g_device->SetRenderTarget(0, g_targetSurface);
-        g_device->SetPixelShader(g_psTexture);
-        g_device->SetTexture(0, rtt);
-        DrawQuad(-1, 1, 0, -1); // left half: sampled rtt
-        g_device->SetPixelShader(g_psColor);
-        g_device->SetRenderTarget(0, rttSurface);
-        SetColor(1, 0, 0, 1);
-        DrawQuad(-1, 1, 1, 0.5f); // top quarter red, after it was sampled
-        g_device->SetRenderTarget(0, g_targetSurface);
-        g_device->SetPixelShader(g_psTexture);
-        DrawQuad(0, 1, 1, -1); // right half: sampled again
-        g_device->SetTexture(0, nullptr);
-        Read(px);
-        ExpectPixels(mode == 1 ? "LIGHT_BARRIER_PRIMITIVES" : "LIGHT_BARRIER_FRAGMENTS", px,
-                     {{P(10, 5), green}, {P(10, 30), green}, {P(10, 60), blue}, {P(40, 5), red},
-                      {P(40, 30), green}, {P(40, 60), blue}});
-    }
-    Deko9_SetBarrierMode(g_device, 0);
-
-    // Tiled caching (r_deko9TiledCache 1/2) must render exactly like off: many
-    // overlapping translucent layers (blend read-modify-write on every pixel),
-    // with a render-to-texture sampled in the middle of the list.
-    {
-        static uint32_t ref[kSize * kSize], got[kSize * kSize];
-        for (uint32_t mode = 0; mode <= 2; ++mode)
-        {
-            Deko9_SetTiledCache(g_device, mode);
-            g_device->Present(nullptr, nullptr, nullptr, nullptr); // the mode applies at the next list
-            BeginPass();
-            g_device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-            g_device->SetPixelShader(g_psColor);
-            g_device->SetRenderTarget(0, rttSurface);
-            g_device->Clear(0, nullptr, D3DCLEAR_TARGET, green, 1.0f, 0);
-            SetColor(0, 0, 1, 1);
-            DrawQuad(-1, -0.5f, 1, -1);
-            g_device->SetRenderTarget(0, g_targetSurface);
-            g_device->Clear(0, nullptr, D3DCLEAR_TARGET, black, 1.0f, 0);
-            g_device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-            g_device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-            g_device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-            for (int layer = 0; layer < 24; ++layer)
-            {
-                const float t = (float)layer / 24.0f;
-                SetColor(t, 1.0f - t, 0.5f, 0.2f + 0.02f * (float)(layer % 7));
-                DrawQuad(-1.0f + 0.05f * (float)(layer % 9), 1.0f - 0.04f * (float)(layer % 5),
-                         0.2f + 0.04f * (float)(layer % 11), -1.0f + 0.03f * (float)(layer % 13));
-                if (layer == 11)
-                {
-                    g_device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-                    g_device->SetPixelShader(g_psTexture);
-                    g_device->SetTexture(0, rtt);
-                    DrawQuad(0.5f, 1, 1, 0);
-                    g_device->SetTexture(0, nullptr);
-                    g_device->SetPixelShader(g_psColor);
-                    g_device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-                }
-            }
-            g_device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-            Read(mode ? got : ref);
-            if (mode)
-            {
-                char detail[64];
-                std::snprintf(detail, sizeof(detail), "mode=%u", mode);
-                Check(!std::memcmp(ref, got, sizeof(ref)), "TILED_CACHE_IDENTICAL", detail);
-            }
-        }
-        Deko9_SetTiledCache(g_device, 0);
-        g_device->Present(nullptr, nullptr, nullptr, nullptr);
-    }
-
     // Zcull (r_deko9ZcullStats; deko9_zcull.cpp; zcull itself is always on,
     // no toggle). The region model: a full depth clear makes the region
     // valid for the pass's depth-tested draws; binding another depth surface
@@ -2524,10 +2442,8 @@ void RunPerDrawTests()
         uint32_t px[kSize * kSize];
         uint64_t hazardSkips, verified, mismatches;
     };
-    uint32_t probeFlags = 0, probeSplit = 1;
     const auto scene = [&](uint32_t flags, Result *r) {
         Deko9_SetPerDraw(g_device, flags);
-        Deko9_SetDrawProbe(g_device, probeFlags, probeSplit);
         Deko9_SetVerify(g_device, true);
         fill(texA, red);
         fill(texB, green);
@@ -2646,46 +2562,6 @@ void RunPerDrawTests()
     std::snprintf(detail, sizeof(detail), "band3 off=%08x on=%08x (want %08x)", (unsigned)off.px[36 * kSize + 32],
                   (unsigned)on.px[36 * kSize + 32], (unsigned)red);
     Check(Near(off.px[36 * kSize + 32], red) && Near(on.px[36 * kSize + 32], red), "PERDRAW_REUPLOAD_ORDER", detail);
-    // GPU per-draw probe (Deko9_SetDrawProbe): split draws and forced
-    // re-binds change the draw count, never the pixels.
-    const struct
-    {
-        uint32_t flags, split;
-        const char *name;
-    } kProbes[] = {{0, 2, "SPLIT2"}, {0, 3, "SPLIT3"}, {DEKO9_PROBE_SUBCONSTS, 2, "SPLIT2_SUBCONSTS"},
-                   {DEKO9_PROBE_CONSTS | DEKO9_PROBE_TEXTURES | DEKO9_PROBE_STREAMS, 1, "REBIND_ALL"},
-                   {15, 2, "ALL"}};
-    for (const auto &probe : kProbes)
-    {
-        probeFlags = probe.flags;
-        probeSplit = probe.split;
-        scene(kAllPerDraw, &single);
-        uint32_t d = 0;
-        for (uint32_t i = 0; i < kSize * kSize; ++i)
-            d += off.px[i] != single.px[i];
-        char name[64];
-        std::snprintf(name, sizeof(name), "DRAWPROBE_PIXELS_IDENTICAL_%s", probe.name);
-        std::snprintf(detail, sizeof(detail), "differing=%u of %u mismatches=%llu", (unsigned)d,
-                      (unsigned)(kSize * kSize), (unsigned long long)single.mismatches);
-        Check(d == 0 && single.mismatches == 0, name, detail);
-    }
-    {
-        // The split really issues more draws.
-        Deko9Counters c0{}, c1{};
-        probeFlags = 0;
-        probeSplit = 2;
-        Deko9_SetDrawProbe(g_device, 0, 2);
-        Deko9_GetCounters(g_device, &c0);
-        g_device->SetStreamSource(0, vb, 0, sizeof(Vertex));
-        g_device->SetPixelShader(g_psColor);
-        g_device->DrawPrimitive(D3DPT_TRIANGLELIST, 0, 2);
-        Deko9_GetCounters(g_device, &c1);
-        Deko9_SetDrawProbe(g_device, 0, 1);
-        g_device->SetStreamSource(0, nullptr, 0, 0);
-        std::snprintf(detail, sizeof(detail), "extra=%llu", (unsigned long long)c1.probeExtraDraws - c0.probeExtraDraws);
-        Check(c1.probeExtraDraws - c0.probeExtraDraws == 1, "DRAWPROBE_SPLIT_COUNTS", detail);
-    }
-    Deko9_SetDrawProbe(g_device, 0, 1);
     Deko9_SetPerDraw(g_device, kAllPerDraw);
     g_device->SetTexture(0, nullptr);
     vb->Release();

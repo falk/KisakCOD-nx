@@ -56,7 +56,7 @@ export VPATH := $(CURDIR)/source:$(REPO)/src/deko9:$(REPO)/src/platform/switch:$
 export DEPSDIR := $(CURDIR)/$(BUILD)
 export LD := $(CXX)
 # switch_perf.o: deko9 feeds the port profiler's frame extras; it stays off (SwitchPerf_g_enabled 0) here.
-export OFILES := main.o taau_test.o deko9_callcensus.o deko9_drawcensus.o deko9_d3d.o deko9_device.o deko9_draw.o deko9_fsr.o deko9_fsr_shaders.o deko9_gpufault.o \
+export OFILES := main.o taau_test.o deko9_callcensus.o deko9_drawcensus.o deko9_d3d.o deko9_device.o deko9_draw.o deko9_flightrec.o deko9_fsr.o deko9_fsr_shaders.o deko9_gpufault.o \
 	deko9_memory.o deko9_resources.o deko9_shader.o deko9_state_map.o deko9_taau.o deko9_taau_shaders.o deko9_zcull.o switch_port_log.o \
 	switch_perf.o
 export INCLUDE := $(foreach dir,$(LIBDIRS),-I$(dir)/include) -I$(CURDIR)/$(BUILD) \

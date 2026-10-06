@@ -16,6 +16,11 @@ constexpr uint64_t kStallMs = 3000;
 // A zone load legitimately keeps the main thread out of Com_Frame.
 constexpr uint64_t kLoadStallMs = 15000;
 constexpr uint64_t kPollMs = 250;
+// The GPU channel's owner kills the process about 3 s into a faulted
+// channel's stall: the command flight recorder (short text, then its binary
+// file) goes out at 1 s, before the STALL report.
+constexpr uint64_t kRecorderLookMs = 1000;
+constexpr uint64_t kHeartbeatMs = 5000;
 const char *const kSlotNames[CRUMB_COUNT] = {"main_frame", "backend",  "worker0",  "worker1",
                                              "sound_mix",  "stream",   "database", "gpu_hb"};
 
@@ -38,9 +43,19 @@ void Report(const uint32_t *last, const uint64_t *changedAt, uint64_t now)
     Port_LogFlush(500);
 }
 
+void RecorderLook()
+{
+    Deko9_FlightRecDump("watchdog_1s");
+    Port_LogFlush(300);
+    Deko9_FlightRecWriteBinary();
+    Port_LogFlush(100);
+}
+
 void WatchdogMain(void *)
 {
     StallTrigger trigger(kStallMs);
+    StallTrigger early(kRecorderLookMs);
+    uint64_t lastBeat = 0;
     uint32_t last[CRUMB_COUNT] = {};
     uint64_t changedAt[CRUMB_COUNT] = {};
     for (;;)
@@ -56,12 +71,24 @@ void WatchdogMain(void *)
                 changedAt[i] = now;
             }
         }
-        trigger.SetThreshold(g_crumbs[CRUMB_DATABASE].site.load(std::memory_order_relaxed) == 2 ? kLoadStallMs
-                                                                                              : kStallMs);
+        const bool loading = g_crumbs[CRUMB_DATABASE].site.load(std::memory_order_relaxed) == 2;
+        trigger.SetThreshold(loading ? kLoadStallMs : kStallMs);
+        early.SetThreshold(loading ? kLoadStallMs : kRecorderLookMs);
         // Nothing to judge before the first frame (boot and map loads run
         // outside Com_Frame's counter only until it starts ticking).
+        if (last[CRUMB_MAIN_FRAME] != 0 && early.Sample(last[CRUMB_MAIN_FRAME], now))
+            RecorderLook();
         if (last[CRUMB_MAIN_FRAME] != 0 && trigger.Sample(last[CRUMB_MAIN_FRAME], now))
             Report(last, changedAt, now);
+        if (now - lastBeat >= kHeartbeatMs)
+        {
+            lastBeat = now;
+            Deko9_FlightRecHeartbeat();
+        }
+        // A dump on another thread (GPU stall watcher, queue error) leaves the
+        // binary file to this thread.
+        if (Deko9_FlightRecBinaryPending())
+            Deko9_FlightRecWriteBinary();
     }
 }
 

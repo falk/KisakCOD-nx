@@ -103,10 +103,13 @@ static void SetPerfConfig(uint32_t id)
     Com_Printf(16, "SWITCH_PERFCONFIG request=0x%08x rc=0x%x\n", (unsigned)config, (unsigned)rc);
 }
 
+void Switch_StallTestFrame(void); // switch_stall_test.cpp
+
 // Main thread, once per frame: applies r_switchPerfConfig when it changes
 // (apm is not safe from the render threads).
 void Switch_PerfConfigFrame(void)
 {
+    Switch_StallTestFrame();
     static bool registered;
     static char applied[24] = "0";
     if (!registered)

@@ -10,6 +10,8 @@
 #include "src/port/switch_menu_patch.h"
 #include "src/port/switch_menu_settings.h"
 #include "src/port/switch_text_input.h"
+#include "src/port/switch_sp_launch.h"
+#include "src/port/switch_save_thumb.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +19,7 @@
 
 #include <map>
 #include <set>
+#include <vector>
 #include <string>
 
 static int g_failures;
@@ -461,10 +464,119 @@ void TestDirTree()
     CHECK(Switch_RemoveDirTree((std::string(root) + "/profiles").c_str()) == 1);
     CHECK(Switch_RemoveDirTree(root) == 1);
 }
+std::string g_printed;
+void CapturePrint(const char *line) { g_printed += line; }
+
+void TestStartMultiplayerRefused()
+{
+    g_printed.clear();
+    CHECK(!Switch_StartMultiplayerRefused(CapturePrint));
+    CHECK(g_printed.find("not available") != std::string::npos);
+    CHECK(!Switch_StartMultiplayerRefused(0)); // no sink: still refuses
+}
+void TestSaveThumb()
+{
+    // A 1280x720 frame: left half red, right half blue, with row padding.
+    const uint32_t w = 1280, h = 720, pitch = w * 4 + 64;
+    std::vector<uint8_t> frame((size_t)pitch * h, 0xEE);
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x)
+        {
+            uint8_t *p = &frame[(size_t)y * pitch + x * 4];
+            p[0] = x < w / 2 ? 0 : 200; // B
+            p[1] = 30;                  // G
+            p[2] = x < w / 2 ? 200 : 0; // R
+            p[3] = 0;
+        }
+    std::vector<uint8_t> thumb(kSaveThumbBgraBytes);
+    CHECK(SaveThumb_FromFrame(frame.data(), w, h, pitch, thumb.data()));
+    CHECK(thumb[(10 * kSaveThumbWidth + 5) * 4 + 2] == 200 && thumb[(10 * kSaveThumbWidth + 5) * 4 + 0] == 0);
+    CHECK(thumb[(10 * kSaveThumbWidth + 250) * 4 + 0] == 200 && thumb[(10 * kSaveThumbWidth + 250) * 4 + 3] == 255);
+    CHECK(!SaveThumb_FromFrame(frame.data(), 0, h, pitch, thumb.data()));
+    CHECK(!SaveThumb_FromFrame(frame.data(), w, h, w * 4 - 1, thumb.data())); // pitch too small
+
+    // Encode -> decode is lossless; the file is exactly the documented size.
+    std::vector<uint8_t> file(kSaveThumbFileBytes), back(kSaveThumbBgraBytes);
+    SaveThumb_Encode(thumb.data(), file.data());
+    CHECK(SaveThumb_Decode(file.data(), file.size(), back.data()));
+    CHECK(back == thumb);
+    // Anything else is refused: truncated, over-long, bad magic, bad size field.
+    CHECK(!SaveThumb_Decode(file.data(), file.size() - 1, back.data()));
+    std::vector<uint8_t> longer = file;
+    longer.push_back(0);
+    CHECK(!SaveThumb_Decode(longer.data(), longer.size(), back.data()));
+    std::vector<uint8_t> bad = file;
+    bad[0] = 'X';
+    CHECK(!SaveThumb_Decode(bad.data(), bad.size(), back.data()));
+    bad = file;
+    bad[4] = 128;
+    CHECK(!SaveThumb_Decode(bad.data(), bad.size(), back.data()));
+
+    // Path next to the save, and a real file round trip on disk.
+    char path[64];
+    CHECK(SaveThumb_PathForSave("profiles/p/save/autosave/a.b.svg", path, sizeof(path)) &&
+          !strcmp(path, "profiles/p/save/autosave/a.b.svt"));
+    CHECK(SaveThumb_PathForSave("profiles/p.x/save/name", path, sizeof(path)) &&
+          !strcmp(path, "profiles/p.x/save/name.svt"));
+    CHECK(!SaveThumb_PathForSave("profiles/p/save/a.svg", path, 8));
+    char tmpl[] = "/tmp/swmenu-thumb-XXXXXX";
+    char *root = mkdtemp(tmpl);
+    CHECK(root != 0);
+    if (!root)
+        return;
+    const std::string file1 = std::string(root) + "/a.svt";
+    CHECK(SaveThumb_WriteFile(file1.c_str(), thumb.data()));
+    FILE *f = fopen(file1.c_str(), "rb");
+    CHECK(f != 0);
+    if (f)
+    {
+        std::vector<uint8_t> disk(kSaveThumbFileBytes + 1);
+        const size_t n = fread(disk.data(), 1, disk.size(), f);
+        fclose(f);
+        CHECK(n == (size_t)kSaveThumbFileBytes && SaveThumb_Decode(disk.data(), n, back.data()) && back == thumb);
+    }
+    CHECK(!Exists(file1 + ".tmp"));
+    CHECK(!SaveThumb_WriteFile((std::string(root) + "/missing/a.svt").c_str(), thumb.data()));
+    // Horizon rename semantics: an existing target is refused, not replaced.
+    // Saving over a slot that already has a thumbnail must still succeed.
+    const auto strictRename = [](const char *from, const char *to) -> int {
+        if (Exists(to))
+            return -1;
+        return rename(from, to);
+    };
+    std::vector<uint8_t> second(thumb.size());
+    for (size_t i = 0; i < second.size(); ++i)
+        second[i] = (uint8_t)(thumb[i] ^ 0x5a);
+    CHECK(SaveThumb_WriteFile(file1.c_str(), second.data(), strictRename));
+    std::vector<uint8_t> reread(thumb.size());
+    {
+        FILE *g = fopen(file1.c_str(), "rb");
+        std::vector<uint8_t> disk(kSaveThumbFileBytes);
+        const size_t n = g ? fread(disk.data(), 1, disk.size(), g) : 0;
+        if (g)
+            fclose(g);
+        CHECK(n == (size_t)kSaveThumbFileBytes && SaveThumb_Decode(disk.data(), n, reread.data()) &&
+              reread != thumb);
+    }
+    CHECK(!Exists(file1 + ".tmp"));
+    // Negative control: the old single rename fails against Horizon semantics.
+    {
+        const std::string tmp = file1 + ".tmp";
+        FILE *t = fopen(tmp.c_str(), "wb");
+        if (t)
+            fclose(t);
+        CHECK(strictRename(tmp.c_str(), file1.c_str()) != 0);
+        remove(tmp.c_str());
+    }
+    remove(file1.c_str());
+    rmdir(root);
+}
 } // namespace
 
 int main()
 {
+    TestSaveThumb();
+    TestStartMultiplayerRefused();
     TestPresets();
     TestPresetDvarsAreEditable();
     TestPresetAtomicAndReset();

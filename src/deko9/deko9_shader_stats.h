@@ -117,10 +117,6 @@ public:
                              U(w.drawBuilds));
     }
 
-    // Live totals since the last Take (the slow-frame line reads these).
-    uint64_t CompileNs() const { return m_compileNs.load(std::memory_order_relaxed); }
-    uint64_t BakeNs() const { return m_bakeNs.load(std::memory_order_relaxed); }
-
 private:
     std::atomic<uint64_t> m_packHits{0}, m_packMisses{0}, m_translates{0}, m_translateNs{0};
     std::atomic<uint64_t> m_compiles{0}, m_compileNs{0}, m_compileMaxNs{0};

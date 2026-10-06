@@ -2192,7 +2192,7 @@ void __cdecl Com_Frame_Try_Block_Function()
         Ragdoll_Update(msec);
         iassert(Sys_IsMainThread());
 #ifdef KISAK_SP
-        //SCR_UpdateRumble(); // KISAKTODO
+        SCR_UpdateRumble();
 #endif
         deltaTime = cls.frametime * EQUAL_EPSILON;
         DevGui_Update(0, deltaTime);

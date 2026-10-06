@@ -31,6 +31,7 @@ const dvar_t *r_taauBilinearHistory;
 const dvar_t *r_taauBilinearCurrent;
 const dvar_t *r_taauReactiveHalf;
 const dvar_t *r_taauFlat;
+const dvar_t *r_taauBilinearRange;
 
 // A view that moved or turned more than this between two frames starts a
 // new history.
@@ -108,6 +109,11 @@ void R_TaauRegisterDvars()
                                     "deko3d renderer: r_taau skips the history where the 2x2 scene texels around "
                                     "the output pixel differ by no more than this (8-bit units; the history would "
                                     "be clamped to that range anyway)");
+    r_taauBilinearRange = Dvar_RegisterFloat(
+        "r_taauBilinearRange", deko9::kTaauBilinearRangeDefault, flatLimits, DVAR_NOFLAG,
+        "deko3d renderer: r_taau fetches the Catmull-Rom history with one bilinear tap where the 2x2 scene texels "
+        "around the output pixel differ by less than this (8-bit units; the history is clamped to that range, so "
+        "the filters cannot differ by more; 0 = always the five taps)");
 }
 
 void R_TaauJitterView(GfxViewParms *viewParms, const GfxViewport &sceneViewport)
@@ -235,6 +241,7 @@ bool RB_TaauResolveView(const GfxViewInfo *viewInfo, IDirect3DBaseTexture9 *scen
     f.bilinearHistory = r_taauBilinearHistory->current.enabled;
     f.bilinearCurrent = r_taauBilinearCurrent->current.enabled;
     f.flat = r_taauFlat->current.value / 255.0f;
+    f.bilinearRange = r_taauBilinearRange->current.value / 255.0f;
     f.reset = reset;
     RB_GPU_PASS(TaauResolve);
     if (!Deko9_TaauResolve(dx.device, scene, depth, srcRect, dst, dstRect, &f))

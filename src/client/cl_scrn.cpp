@@ -31,6 +31,9 @@ extern bool Sys_IsMainThread();
 #include <gfx_d3d/rb_stats.h>
 #include <gfx_d3d/r_cinematic.h>
 #include <gfx_d3d/r_add_staticmodel.h>
+#ifdef KISAK_SP
+#include <cgame/cg_rumble.h>
+#endif
 
 const char *WeaponStateNames_51[27] =
 {
@@ -311,16 +314,12 @@ float __cdecl CL_GetMenuBlurRadius(int localClientNum)
 
 void __cdecl SCR_UpdateRumble()
 {
-    // KISAKTODO
-    //int v0; // r3
-    //
-    //if (!cl_paused)
-    //    MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\client\\cl_scrn.cpp", 284, 0, "%s", "cl_paused");
-    //v0 = CL_ControllerIndexFromClientNum(0);
-    //if (clientUIActives[0].connectionState != CA_ACTIVE || cl_paused->current.integer)
-    //    GPad_StopRumbles(v0);
-    //else
-    //    GPad_UpdateRumbles(v0);
+#if defined(__SWITCH__) && defined(KISAK_SP)
+    // Points the rumble falloff at the view and moves entity-bound rumbles;
+    // the mixer itself runs in IN_Frame.
+    if (clientUIActives[0].connectionState == CA_ACTIVE)
+        CG_RumbleFrame(0);
+#endif
 }
 
 void SCR_UpdateFrame()

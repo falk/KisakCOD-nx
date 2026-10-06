@@ -43,6 +43,9 @@ extern "C" {
 #include "deko9_callcensus.h"
 #include "deko9_com_defaults.h"
 #include "deko9_fastpath.h"
+#include "deko9_flightrec.h"
+#define DEKO9_VTXBIND_DK 1
+#include "deko9_vtxbind.h"
 #include "deko9_framepace.h"
 #include "deko9_fsr.h"
 #include "deko9_gpufault.h"
@@ -109,6 +112,11 @@ public:
         m_events = events;
         m_openSeq = openSeq;
     }
+    // Image heaps: one CPU-visible sentinel memblock after each image
+    // memblock (fr::FillSentinel). Checks sentinel `index % count`; on a hit
+    // fills *report and refills it. Returns false when clean or none exist.
+    bool CheckSentinel(uint32_t index, char *report, size_t reportSize);
+    uint32_t SentinelCount() const { return (uint32_t)m_sentinels.size(); }
 
 private:
     struct Chunk
@@ -117,6 +125,16 @@ private:
         uint32_t size;
         std::map<uint32_t, uint32_t> freeSpans; // offset -> size
     };
+    struct Sentinel
+    {
+        DkMemBlock block;
+        uint32_t *cpu;
+        DkGpuAddr gpu;
+        DkGpuAddr imageGpu; // the image memblock it follows
+        uint32_t imageSize;
+        uint32_t hits;
+    };
+    std::vector<Sentinel> m_sentinels;
     Pool m_pool;
     uint32_t m_flags;
     uint32_t m_chunkSize;
@@ -184,7 +202,7 @@ struct ImageStore
     // GPU size at creation: ResizeStore re-lays the image out inside the
     // memory it was created with, so this size always stays reachable.
     uint32_t capacityWidth = 0, capacityHeight = 0;
-    // S4a (task/deko9-static-hazards): true for a store ever used as a
+    // True for a store ever used as a
     // render, depth, copy-source-of-render or blit target -- set at creation
     // from D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL (CreateStore) and
     // latched on for any store later bound as a render/depth target
@@ -200,7 +218,7 @@ struct ImageStore
     // regardless of hit), so a later copy-write into a store still bound
     // still sees the read (WAR) the way it would have.
     bool attachment = false;
-    // S4a: set by a copy-write (CopyBufferToImage, so also UpdateTexture/
+    // Set by a copy-write (CopyBufferToImage, so also UpdateTexture/
     // UpdateSurface) into this store while it is bound in a sampler-cache
     // slot and it is not `attachment`: the per-draw skip above would
     // otherwise miss the RAW hazard the old per-draw tracker always caught.
@@ -868,12 +886,6 @@ public:
     // discard (or draw with the alpha test on) use their early-Z variant for
     // draws that test but write neither depth nor stencil
     // (RasterAllowsEarlyZ), outside occlusion queries.
-    // Deko9_SetDrawProbe.
-    void SetDrawProbe(uint32_t flags, uint32_t split)
-    {
-        m_probe.flags = flags;
-        m_probe.split = split;
-    }
     void SetPerDraw(uint32_t flags)
     {
         if (flags == m_perDraw)
@@ -923,7 +935,6 @@ public:
         if (enable != m_earlyZ)
             m_earlyZ = enable, m_dirtyEarlyZ = true;
     }
-    bool EarlyZEnabled() const { return m_earlyZ; }
     // Deko9_PrebakeVariants: builds every variant the passes can select
     // (deko9_variant_plan.h) off the device lock, on a compile thread when
     // one can be started, and installs them; returns false only on bad input.
@@ -941,13 +952,6 @@ public:
     void SetGpuPasses(bool enable) { m_gpuPassesWanted.store(enable, std::memory_order_relaxed); }
     bool GpuPassesOn() const { return m_gpuPasses.load(std::memory_order_relaxed); }
     void GpuMarker(uint32_t pass);
-    // r_deko9LightBarriers: 0 = DkBarrier_Full + L2 flush for every hazard;
-    // 1 = 3D-only hazards use DkBarrier_Primitives + texture-cache invalidate;
-    // 2 = 3D-only hazards use DkBarrier_Fragments + texture-cache invalidate.
-    void SetBarrierMode(uint32_t mode) { m_barrierMode = mode <= 2 ? mode : 0; }
-    // r_deko9TiledCache: 0 off; 1 = Maxwell tiled caching with 128x128 tiles;
-    // 2 = 64x64 tiles. Applied at the start of the next command list.
-    void SetTiledCache(uint32_t mode) { m_tiledWanted = mode <= 2 ? mode : 0; }
     // ---- zcull (deko9_zcull.cpp; r_deko9ZcullStats) -------------------------
     // Zcull itself is always on (the queue's default); only the stats model
     // is a toggle, applied at the next Present.
@@ -1028,8 +1032,20 @@ public:
     // submitted by another thread is reported once (FAIL:DEKO9_SUBMIT_THREAD).
     void ClaimSubmitThread() { m_submitOwner.Claim(ThreadTag()); }
     void ReportForeignSubmit();
-    DkDevice Dk() const { return m_dk; }
-    DkCmdBuf Cmd() { return m_cmd; }
+    // The command buffer for recording. Recording is single-writer at any
+    // instant: the thread holding the device lock (the frame APIs that run
+    // without it never record). With the ownership check on, a call from a
+    // thread that does not hold the lock, or into another thread's bake
+    // capture, is reported once (FAIL:DEKO9_CMD_THREAD); a change of the
+    // recording thread is logged in the flight recorder.
+    DkCmdBuf Rec()
+    {
+        const uintptr_t self = ThreadTag();
+        if (__builtin_expect(self != m_recWriter || (m_ownerCheck && m_lock.OwnerTag() != self), 0))
+            RecordSlow(self);
+        return m_cmd;
+    }
+    DkCmdBuf Cmd() { return Rec(); }
     // Sequence number of the command list being recorded. A resource used
     // by it stays alive until CompletedSeq() >= this value.
     uint64_t OpenSeq() const { return m_openSeq; }
@@ -1039,7 +1055,6 @@ public:
     // True once the GPU has passed list `seq`. The cached completed sequence
     // answers without touching a fence (it only ever lags the GPU, so a
     // cached "done" is never early); otherwise one CompletedSeq() poll pass.
-    uint64_t CachedCompletedSeq() const { return m_completedSeq; }
     bool SeqDone(uint64_t seq)
     {
         if (seq <= m_completedSeq)
@@ -1152,12 +1167,12 @@ public:
     bool HazardWouldAct() const;
     void HazardAdd(ImageStore *store, Access access);
     void HazardCommit();
-    // S4a: true if `store` sits valid in a sampler-cache slot right now
+    // True if `store` sits valid in a sampler-cache slot right now
     // (either stage). A copy-write into a bound static store sets
     // pendingRaw so the next draw that samples it runs the real hazard
     // check instead of skipping it (see CopyBufferToImage).
     bool StaticStoreBound(const ImageStore *store) const;
-    // S4a: whether a sampled store's per-draw hazard should be added for
+    // Whether a sampled store's per-draw hazard should be added for
     // real this draw -- always for an attachment store or one flagged
     // pendingRaw, or (DEKO9_PERDRAW_STATICTEX off, r_deko9StaticHazard --
     // the pixel A/B proof's knob) always, matching the earlier tracker.
@@ -1166,11 +1181,9 @@ public:
         return store->attachment || store->pendingRaw || !(m_perDraw & DEKO9_PERDRAW_STATICTEX);
     }
     void BeforeSample(ImageStore *store) { HazardBegin(); HazardAdd(store, Access::Sample); HazardCommit(); }
-    void BeforeRender(ImageStore *store) { HazardBegin(); HazardAdd(store, Access::Render); HazardCommit(); }
     void BeforeCopyRead(ImageStore *store) { HazardBegin(); HazardAdd(store, Access::CopyRead); HazardCommit(); }
     void BeforeCopyWrite(ImageStore *store) { HazardBegin(); HazardAdd(store, Access::CopyWrite); HazardCommit(); }
-    void BeforeBlitWrite(ImageStore *store) { HazardBegin(); HazardAdd(store, Access::BlitWrite); HazardCommit(); }
-    void Barrier(bool copyEngine);
+    void Barrier();
     // Submits the open list early once it holds many barriers. Each full
     // barrier splits the list into another GPFIFO entry and libnx queues at
     // most GPFIFO_QUEUE_SIZE (2048) per submit; past that deko3d aborts in
@@ -1360,7 +1373,33 @@ private:
         bool rectSlotCopy[kRectSlots] = {};
         uint64_t rectCalls = 0, rectGpuNs = 0, rectSamples = 0, rectCopies = 0;
         uint32_t rectInW = 0, rectInH = 0, rectOutW = 0, rectOutH = 0;
+        // Display gamma (deko9_fsr.h GammaVariant): the present pass built
+        // with the ramp, per mode, compiled the first frame a ramp is set:
+        // gammaCurve for a power-curve ramp, gamma (the table) otherwise.
+        // `gammaOnly`: the back buffer already has the display size, so
+        // the pass exists only to apply the ramp (plain bilinear, 1:1).
+        ShaderVariant gamma[3], gammaCurve[3];
+        bool gammaOnly = false;
     } m_fsr;
+    // The ramp the engine last set (SetGammaRamp); `on` is false for the
+    // identity ramp, which keeps the present path exactly as it was.
+    // `exponent` is the power curve the ramp is (GammaFitExponent), 0 when
+    // it is none and the table applies.
+    struct
+    {
+        bool on = false;
+        float exponent = 0.0f;
+        GammaCurveConstants curve;
+        GammaConstants lut;
+    } m_gamma;
+    bool PrepareGammaPass();
+    // The ramp's form (GammaVariant's `curve`) and the program the present
+    // pass of `mode` uses for it.
+    bool GammaIsCurve() const { return m_gamma.exponent != 0.0f; }
+    ShaderVariant &GammaProgram(uint32_t mode) { return (GammaIsCurve() ? m_fsr.gammaCurve : m_fsr.gamma)[mode]; }
+    // m_gamma's curve or table into the uniform buffer `buffer` (bufferBytes
+    // long) at `offset`, recorded in the open list.
+    void PushGammaRamp(DkGpuAddr buffer, uint32_t bufferBytes, uint32_t offset);
     bool EnsureUpscaler(std::string *error);
     const ShaderVariant *UpscaleProgram(uint32_t mode, bool sourceRect, std::string *error);
     // Frame GPU time for dynamic resolution (RetireSeq accumulates each
@@ -1499,11 +1538,6 @@ private:
     // last draw's commit records it with m_writeClock, and a later draw with
     // the same sampled set (no ApplyShaders) and targets (no m_dirtyTargets)
     // skips evaluation while both still match.
-    struct DrawProbe
-    {
-        uint32_t flags = DEKO9_DEFAULT_DRAW_PROBE;
-        uint32_t split = DEKO9_DEFAULT_DRAW_SPLIT;
-    } m_probe;
     void EmitDraw(bool indexed, DkPrimitive prim, uint32_t count, uint32_t first, int32_t baseVertex);
     uint32_t m_perDraw = DEKO9_DEFAULT_PERDRAW;
     uint64_t m_hazardSerial = 0;
@@ -1641,12 +1675,12 @@ public:
         // slots resolved by ApplyTextures (all used slots, or only the
         // changed ones with DEKO9_PERDRAW_TEXTURES).
         uint64_t hazardSkips, texSlotsResolved;
-        // S4a (task/deko9-static-hazards): every sample of a non-attachment
-        // ("static") store counts staticSamples (what the tracker before S4a
+        // Every sample of a non-attachment
+        // ("static") store counts staticSamples (what the per-draw tracker
         // would have hazard-checked every time); staticHazardChecks is how
         // many of those actually ran a real HazardAdd (a new bind, a
         // pendingRaw catch-up, or DEKO9_PERDRAW_STATICTEX off) -- the gap is
-        // the per-draw hazard checks S4a's skip removes.
+        // the per-draw hazard checks the static-store skip removes.
         uint64_t staticSamples, staticHazardChecks;
         // SetStreamSource/SetIndices calls (non-owning: no COM reference each).
         uint64_t bufferBinds;
@@ -1657,8 +1691,6 @@ public:
         // registers written by Set*ShaderConstantF vs actually changed, and
         // the bytes the former [lo, hi) range scheme would have pushed.
         uint64_t constBytes[2], constPushes[2], constRegsSet, constRegsChanged;
-        // Extra GPU draws the probe split mode issued.
-        uint64_t probeExtraDraws;
         // GPU-progress checks (DEKO9 perf sync line): fence polls
         // (dkFenceWait timeout 0) and how many found the list done, checks
         // the cached completed sequence answered without a poll,
@@ -1721,20 +1753,25 @@ public:
     uint64_t m_passNs[32]{};
     uint64_t m_passDropped = 0;
     uint64_t m_passFrames = 0;
-    uint32_t m_barrierMode = DEKO9_DEFAULT_BARRIER_MODE;
-    // Tiled cache: the mode the GPU state is in, and the one asked for.
-    uint32_t m_tiledWanted = DEKO9_DEFAULT_TILED_CACHE, m_tiledOn = 0;
-    void TiledSync();
     void CmdBarrier(DkBarrier mode, uint32_t invalidate);
+    // Makes new CPU-written descriptors (AllocImageDescriptor/SamplerDescriptor)
+    // visible to the GPU before the next bind that may use them.
+    void FlushDescriptors()
+    {
+        if (m_descriptorsDirty)
+        {
+            CmdBarrier(DkBarrier_None, DkInvalidateFlags_Descriptors | DkInvalidateFlags_L2Cache);
+            m_descriptorsDirty = false;
+        }
+    }
     void CmdBindTargets(const DkImageView *const colors[], uint32_t count, const DkImageView *depth);
     // Cheap per-60-frame command-stream counters (perf census line).
     struct CmdCensus
     {
         uint64_t barrier[5]{}; // by DkBarrier
         uint64_t inval[5]{};   // L2, image, shader, descriptors, zcull
-        uint64_t targetBinds = 0, clears = 0, tiledOps = 0, submits = 0, flushes = 0;
+        uint64_t targetBinds = 0, clears = 0, submits = 0, flushes = 0;
     } m_cc;
-    uint64_t m_lightBarriers = 0; // per 60 frames, reported on the perf line
     // Cumulative: copy/blit writes into an image read (sampled or copied
     // from) since the last barrier, each ordered by a full barrier
     // (write-after-read; Deko9Counters::uploadAfterReadBarriers).
@@ -1972,10 +2009,67 @@ private:
     // hardware crash log. Called from SubmitOpenList and, so a stall with no
     // further submit still gets reported, once per PresentFrame.
     void ReportQueueError();
+
+    // ---- command flight recorder (deko9_flightrec.cpp, always on) ----
+public:
+    // Applied at the next Present (r_deko9CmdPoison, r_deko9CmdOwnerCheck).
+    void SetCmdPoison(bool on) { m_cmdPoisonWanted.store(on, std::memory_order_relaxed); }
+    void SetCmdOwnerCheck(bool on) { m_ownerCheckWanted.store(on, std::memory_order_relaxed); }
+    // Text dump ("FR ..." lines) to the SD log ring and the log host; any
+    // thread, no device lock. Returns false when throttled.
+    bool FrDump(const char *reason, bool checkQueue);
+    void FrHeartbeat();
+    bool FrWriteBinary(const char *path);
+
+private:
+    void RecordSlow(uintptr_t self);
+    uint32_t FrChunkId(const GpuAlloc &chunk);
+    void FrEvent(uint32_t chunk, uint32_t ev, uint64_t seq, uint32_t aux);
+    // Between dkCmdBufFinishList and the submit: one record per segment,
+    // the first-word check and tag B after each chunk's last word.
+    void FrSubmit(DkCmdList list, uint32_t slot);
+    // Re-hashes the segments of every list completed since the last call
+    // (before their chunks are freed and poisoned).
+    void FrVerifyRetired();
+    void FrVerifyLists();
+    // A chunk whose list completed: tag A over the words it held.
+    void FrPoisonFreed(const GpuAlloc &chunk);
+    void FrApplySettings();
+    void FrDetach();
+    // Chunk lifecycle: added to the open list (alloc or reuse), retired with
+    // a list (seq 0: unsubmitted, queue error), freed once it completed
+    // (poisoned with poison on), returned to the heap.
+    void FrNoteOpen(const GpuAlloc &chunk, uint32_t ev);
+    void FrNoteBusy(const GpuAlloc &chunk, uint64_t seq);
+    void FrNoteFree(const GpuAlloc &chunk, uint64_t seq);
+    void FrNoteDrop(const GpuAlloc &chunk);
+    int FrPickFree(uint32_t size);
+    void FrStallTest(uint64_t seq);
+    uintptr_t m_recWriter = 0;     // thread that recorded last (owner-only)
+    uintptr_t m_captureTag = 0;    // thread in Capture (bake), 0 outside
+    bool m_ownerCheck = false;     // armed once Init finished
+    bool m_cmdPoison = false;
+    std::atomic<bool> m_cmdPoisonWanted{DEKO9_DEFAULT_CMD_POISON};
+    std::atomic<bool> m_ownerCheckWanted{DEKO9_DEFAULT_CMD_OWNER_CHECK};
+    struct FrPending
+    {
+        uint64_t seq = 0;
+        uint32_t first = 0, count = 0;
+    };
+    FrPending m_frPending[kFenceRing];
+    uint64_t m_frVerified = 0;
+    uint32_t m_frWriterEvents = 0; // writer-change events logged for the open list
     UINT m_presentInterval = 1;
     // Upload ring overflow uses dedicated allocations freed after the list.
     static constexpr uint32_t kUploadChunk = 8u << 20;
     static constexpr uint32_t kCmdChunk = 256u << 10; // default chunk; each list starts a fresh one
+    // Guard words after each command chunk (fr::FillGuard); checked at
+    // submit, retire and reuse, reported as FAIL:DEKO9_CMD_GUARD.
+    static constexpr uint32_t kCmdGuardBytes = fr::kGuardWords * 4;
+    std::atomic<uint32_t> m_cmdGuardHits{0};
+    uint32_t m_sentinelCursor = 0;
+    std::atomic<uint32_t> m_imageOverruns{0};
+    void CheckCmdGuard(const GpuAlloc &chunk, const char *where, uint64_t seq);
 };
 
 // ---- helpers ----------------------------------------------------------------

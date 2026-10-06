@@ -14,8 +14,10 @@
 //     otherwise the scene depth and the matrix that maps this frame's
 //     unjittered clip space to the previous frame's; depth-hack (viewmodel)
 //     pixels without object motion keep their screen position;
-//   - fetches the history (Catmull-Rom in 5 bilinear taps, or one bilinear
-//     tap), clamps it to the RGB range of the 4 texels, and blends; where the
+//   - fetches the history (Catmull-Rom in 5 bilinear taps, one tap where
+//     the five cannot differ from it: at a texel centre or inside a
+//     low-contrast 2x2; or always one bilinear tap), clamps it to the RGB
+//     range of the 4 texels, and blends; where the
 //     transparent passes changed the pixel (its luma against a snapshot of
 //     the opaque scene taken before them: TaauOpaque), the current frame
 //     weighs more, so particles and effects do not smear into the history
@@ -92,6 +94,7 @@ struct TaauFrame
     float reactive;       // current-frame weight where transparents changed the pixel fully (0 = off)
     float antiFlicker;    // 0..1: how much less the current frame weighs where it agrees with the history
     float flat;           // 2x2 colour range (0..1 units) at or below which the history is skipped
+    float bilinearRange = 0.0f; // 2x2 colour range below which the Catmull-Rom fetch takes one tap (kTaauBilinearRangeDefault / 255)
     bool reset;           // ignore the history (first frame, cut, map load, resize)
     bool motion;          // the object motion texture is valid (set by the device)
     bool opaque;          // the transparents' luma change is valid (set by the device)
@@ -122,6 +125,9 @@ constexpr float kTaauReactiveScale = 8.0f;
 // (0.6, 0.4, 0.2), close to an even average of the first four frames.
 constexpr float kTaauYouthWeight = 0.6f;
 constexpr float kTaauYouthStep = 0.4f;
+// Anti-flicker compares the lumas relative to the larger one, but never to
+// less than this luma (dark pixels are not flicker-damped by noise).
+constexpr float kTaauAntiFlickerLumaFloor = 0.2f;
 
 // The resolve kernel's unit in output pixels: 1.2, or 0.75 render pixels
 // where that is wider (render scale below 0.625), so the nearest jittered
@@ -140,23 +146,37 @@ inline float TaauKernelScale(float outputPerRender)
 // than this clamps the history onto the current colour within that range,
 // so the resolve skips the history (TaauFrame::flat = this / 255).
 constexpr float kTaauFlatDefault = 2.0f;
+// Where the Catmull-Rom history fetch (five taps) takes one bilinear tap
+// instead, because the five cannot change the result:
+//  - the fetch position within f (1 - f) < kTaauHistoryStillBar of a texel
+//    centre per axis (f the fraction: below 1/512 of a pixel), where the
+//    kernel's outer weights and the centre's offset vanish: a still camera
+//    or the viewmodel, which reproject onto their own pixel;
+//  - a 2x2 whose colour range is below r_taauBilinearRange (8-bit units,
+//    TaauFrame::bilinearRange = this / 255; 0 = never): the history is
+//    clamped into that range, so the two filters differ by less than it.
+// Both hold over whole regions (a frame, a flat wall), so the branch rarely
+// splits a warp. Measured on a Cargoship frame at 0.75 scale: 64% of 8x4
+// pixel tiles have every 2x2 range below 8/255, 44% below 4/255.
+constexpr float kTaauHistoryStillBar = 1.0f / 512.0f;
+constexpr float kTaauBilinearRangeDefault = 4.0f;
 
 // std140 layout of the resolve's uniform block.
 struct TaauConstants
 {
-    float reproj[4][4];  // rows k of (u.x, u.y, depth, 1) -> previous clip (x + w) / 2, (w - y) / 2, w: divided, the previous uv
+    float reproj[4][4];  // rows k of (frag.x, frag.y, depth, 1) -> (x w, y w, w): x, y the previous position in history px - 0.5
     float pos[4];        // output px -> jittered render px - 0.5: fr = frag * xy + zw
-    float uv[4];         // output px -> output uv: u = frag * xy + zw
+    float edge[4];       // output rect centre x, y in history px - 0.5; half its width, height
     float gather[4];     // 2x2 gather uv = corner * xy + zw
     float texel[4];      // point-sample uv of render px p = p * xy + zw
-    float dst[4];        // output rect w, h, x - 0.5, y - 0.5
+    float dst[4];        // output rect w, h (motion uv -> px); 0, 0
     float hist[4];       // 1 / w, 1 / h, -1 / w, -1 / h of the history
     float hist2[4];      // 2 / w, 2 / h, 0.5 / w, 0.5 / h
-    float scale[4];      // kernel units per render px x, y; flat threshold; 0
-    float depth[4];      // viewmodel split, 0, 0, depth at infinity (the clear lies beyond it)
-    float blend[4];      // blend, history valid (1, reset -1), 0, motion texture (0/1)
+    float scale[4];      // kernel units per render px x, y; flat threshold; one-tap history range
+    float depth[4];      // viewmodel split, one-tap history position bar (kTaauHistoryStillBar), 0, depth at infinity (the clear lies beyond it)
+    float blend[4];      // blend, history valid (1, reset -1), 0, motion.x cap (FLT_MAX; kTaauMotionNone: no texture)
     float reactive[4];   // 0, threshold, scale (0: no reactive mask), weight
-    float output[4];     // anti-flicker, youth weight, youth step, 0
+    float output[4];     // anti-flicker, youth weight, youth step, 4 * kTaauAntiFlickerLumaFloor
 };
 void TaauSetup(TaauConstants *out, const int32_t srcRect[4], const int32_t dstRect[4], uint32_t colorWidth,
                uint32_t colorHeight, uint32_t histWidth, uint32_t histHeight, const TaauFrame &frame);

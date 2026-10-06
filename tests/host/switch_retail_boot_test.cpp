@@ -103,6 +103,8 @@ uint32_t StubRegisteredCount(void);
 uint32_t StubSoundAliasNameSplitCount(uint32_t *multiVariantListsOut, const char **firstSplitOut);
 uint32_t StubFxVelIntervalZeroCount(uint32_t *effectsOut, uint32_t *elemsOut, const char **firstOut,
                                     int *firstElemOut);
+uint32_t StubFxStringVisualDump(uint32_t zoneIndex, const char *ff, uint32_t *soundOut,
+                                uint32_t *runnerOut);
 XAssetHeader StubFindXAssetHeader(XAssetType type, const char *name);
 uint32_t StubOverrideCount(void);
 uint32_t StubRetiredPtrCount(void);
@@ -1587,6 +1589,13 @@ int main(int argc, char **argv)
                     StubFxVelIntervalZeroCount(&fxEffects, &fxElems, &firstBad, &firstBadElem);
                 std::printf("CORPUS_FX_VEL ff=%s effects=%u elems=%u vel_samples_zero_intervals=%u first=%s elem=%d\n",
                             rel, fxEffects, fxElems, badVel, firstBad ? firstBad : "-", firstBadElem);
+            }
+            {
+                uint32_t sound = 0, runner = 0;
+                const uint32_t soundNull =
+                    StubFxStringVisualDump(result.zoneIndex, rel, &sound, &runner);
+                std::printf("FX_STRING_VISUAL_ZONE ff=%s sound=%u sound_null=%u runner=%u\n",
+                            rel, sound, soundNull, runner);
             }
             if (liveCount >= kMaxLive)
             {

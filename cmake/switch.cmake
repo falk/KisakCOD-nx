@@ -58,6 +58,7 @@ add_library(switch_deko9 STATIC
     "${SRC_DIR}/deko9/deko9_d3d.cpp"
     "${SRC_DIR}/deko9/deko9_device.cpp"
     "${SRC_DIR}/deko9/deko9_draw.cpp"
+    "${SRC_DIR}/deko9/deko9_flightrec.cpp"
     "${SRC_DIR}/deko9/deko9_fsr.cpp"
     "${SRC_DIR}/deko9/deko9_fsr_shaders.cpp"
     "${SRC_DIR}/deko9/deko9_gpufault.cpp"
@@ -143,6 +144,7 @@ function(kisak_switch_configure_sp)
         "${SRC_DIR}/port/switch_ui_menus.cpp"
         "${SRC_DIR}/port/switch_cmdline_dvars.cpp"
         "${SRC_DIR}/platform/switch/switch_clocks.cpp"
+        "${SRC_DIR}/platform/switch/switch_stall_test.cpp"
         # Statistical stack sampler behind `switch_pcSample` (off by default).
         "${SRC_DIR}/port/switch_pcsample.cpp"
         # In-process crash reporter: prints CRASH: lines to the nxlink stream.

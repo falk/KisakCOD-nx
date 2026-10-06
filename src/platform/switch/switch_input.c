@@ -141,6 +141,9 @@ void Switch_InputInit(SwitchInputState *state)
 
     state->buttons = 0;
     state->previousButtons = 0;
+    state->previousMenuButtons = 0;
+    state->repeatButton = 0;
+    state->repeatNextMs = 0;
     state->leftStick[0] = 0.0f;
     state->leftStick[1] = 0.0f;
     state->rightStick[0] = 0.0f;
@@ -189,30 +192,95 @@ void Switch_InputShutdown(SwitchInputState *state)
 #endif
 }
 
+/* d-pad bits the left stick is currently holding: the dominant axis only,
+ * with engage/release hysteresis against the bits it held last frame. */
+static uint64_t Switch_InputStickDirections(const SwitchInputState *state)
+{
+    const uint64_t dirMask = SWITCH_INPUT_BUTTON_UP | SWITCH_INPUT_BUTTON_DOWN |
+                             SWITCH_INPUT_BUTTON_LEFT | SWITCH_INPUT_BUTTON_RIGHT;
+    float x = state->leftStick[0];
+    float y = state->leftStick[1];
+    float ax = x < 0.0f ? -x : x;
+    float ay = y < 0.0f ? -y : y;
+    uint64_t held = 0;
+    uint64_t previous = state->previousMenuButtons & dirMask;
+    float major = ax > ay ? ax : ay;
+    uint64_t candidate;
+
+    if (ax > ay)
+        candidate = x < 0.0f ? SWITCH_INPUT_BUTTON_LEFT : SWITCH_INPUT_BUTTON_RIGHT;
+    else
+        candidate = y < 0.0f ? SWITCH_INPUT_BUTTON_DOWN : SWITCH_INPUT_BUTTON_UP;
+
+    if (major >= SWITCH_INPUT_MENU_STICK_ENGAGE ||
+        (major >= SWITCH_INPUT_MENU_STICK_RELEASE && (previous & candidate) != 0))
+        held = candidate;
+    return held;
+}
+
 void Switch_InputTranslate(SwitchInputState *state, uint64_t buttons, uint32_t timestamp,
                            SwitchInputEventSink sink, void *context)
 {
     size_t index;
+    uint64_t menuButtons;
+    const uint64_t dirMask = SWITCH_INPUT_BUTTON_UP | SWITCH_INPUT_BUTTON_DOWN |
+                             SWITCH_INPUT_BUTTON_LEFT | SWITCH_INPUT_BUTTON_RIGHT;
 
     if (state == NULL)
         return;
+
+    menuButtons = buttons;
+    if (!state->gameplayActive)
+        menuButtons |= Switch_InputStickDirections(state);
 
     if (sink != NULL)
     {
         for (index = 0; index < sizeof(switch_input_menu_bindings) / sizeof(switch_input_menu_bindings[0]); ++index)
         {
             const SwitchInputBinding *binding = &switch_input_menu_bindings[index];
-            int was_pressed = (state->previousButtons & binding->button) != 0;
-            int is_pressed = (buttons & binding->button) != 0;
+            int was_pressed = (state->previousMenuButtons & binding->button) != 0;
+            int is_pressed = (menuButtons & binding->button) != 0;
 
             if (binding->menuOnly && state->gameplayActive)
                 continue;
             if (was_pressed != is_pressed)
+            {
                 sink(context, timestamp, binding->key, is_pressed);
+                if (is_pressed && (binding->button & dirMask) != 0)
+                {
+                    state->repeatButton = binding->button;
+                    state->repeatNextMs = timestamp + SWITCH_INPUT_MENU_REPEAT_DELAY_MS;
+                }
+            }
         }
+
+        if (state->repeatButton != 0)
+        {
+            if (state->gameplayActive || (menuButtons & state->repeatButton) == 0)
+            {
+                state->repeatButton = 0;
+            }
+            else if ((int32_t)(timestamp - state->repeatNextMs) >= 0)
+            {
+                for (index = 0; index < sizeof(switch_input_menu_bindings) / sizeof(switch_input_menu_bindings[0]); ++index)
+                {
+                    if (switch_input_menu_bindings[index].button == state->repeatButton)
+                    {
+                        sink(context, timestamp, switch_input_menu_bindings[index].key, 1);
+                        break;
+                    }
+                }
+                state->repeatNextMs = timestamp + SWITCH_INPUT_MENU_REPEAT_INTERVAL_MS;
+            }
+        }
+    }
+    else
+    {
+        state->repeatButton = 0;
     }
     state->buttons = buttons;
     state->previousButtons = buttons;
+    state->previousMenuButtons = menuButtons;
 }
 
 void Switch_InputFrameUpdate(SwitchInputState *state, float leftX, float leftY,

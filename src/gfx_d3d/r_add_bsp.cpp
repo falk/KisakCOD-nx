@@ -78,7 +78,7 @@ static void R_PreTessCountBatch(const uint16_t *list, uint32_t count, bool copie
     SwitchPerf_AddEvent(SWITCH_PERF_EV_PRETESS_DRAWS_REBASED, drawsRebased);
 }
 
-// r_deko9StaticPretess (r_pretess.h): record the batch as runs of the static
+// Static pretess (r_pretess.h): record the batch as runs of the static
 // world index buffer instead of copying its indices. A run ends where the
 // next surface's indices do not follow in rgp.world->indices, and wherever
 // the copying path starts a new entry (firstVertex, lightmap or reflection

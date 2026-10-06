@@ -197,13 +197,6 @@
   const dvar_t *r_captureRing;
   const dvar_t *r_deko9Verify;
   const dvar_t *r_deko9EarlyZ;
-  const dvar_t *r_deko9HazardCache;
-  const dvar_t *r_deko9ConstFast;
-  const dvar_t *r_deko9TexIncremental;
-  const dvar_t *r_deko9StaticHazard;
-  const dvar_t *r_deko9Instancing;
-  const dvar_t *r_deko9StaticPretess;
-  const dvar_t *r_deko9StaticPretessModels;
   const dvar_t *r_renderResolution;
   const dvar_t *r_fsrSharpness;
   const dvar_t *r_fsrMode;
@@ -215,14 +208,10 @@
   const dvar_t *r_dynresFakeWave;
   const dvar_t *r_deko9GpuPasses;
   const dvar_t *r_deko9RtCompression;
-  const dvar_t *r_deko9LightBarriers;
-  const dvar_t *r_deko9TiledCache;
   const dvar_t *r_halfResParticles;
   const dvar_t *r_halfResParticlesUpsample;
   const dvar_t *r_halfResParticlesAutoOnMs;
   const dvar_t *r_halfResParticlesAutoOffMs;
-  const dvar_t *r_deko9DrawProbe;
-  const dvar_t *r_deko9DrawSplit;
   const dvar_t *r_halfResParticlesDepthTol;
   const dvar_t *r_halfResParticlesStats;
   const dvar_t *r_halfResParticlesOrder;
@@ -960,54 +949,6 @@
           DVAR_NOFLAG,
           "deko3d renderer: draws that test depth but write neither depth nor stencil use the pixel shader's "
           "early-fragment-tests variant when it can discard (texkill or alpha test), so hidden pixels skip the shader");
-      // Per-draw CPU fast paths (deko9_native.h Deko9_SetPerDraw), each
-      // re-derived per draw by r_deko9Verify.
-      r_deko9HazardCache = Dvar_RegisterBool(
-          "r_deko9HazardCache",
-          1,
-          DVAR_NOFLAG,
-          "deko3d renderer: a draw with the previous draw's sampled images and render targets, and no barrier or "
-          "other hazard-tracked operation since, skips hazard evaluation");
-      r_deko9ConstFast = Dvar_RegisterBool(
-          "r_deko9ConstFast",
-          1,
-          DVAR_NOFLAG,
-          "deko3d renderer: shader-constant pushes checked with a per-stage any-dirty flag instead of scanning "
-          "the dirty bitmask");
-      r_deko9TexIncremental = Dvar_RegisterBool(
-          "r_deko9TexIncremental",
-          1,
-          DVAR_NOFLAG,
-          "deko3d renderer: a texture/shader binding change re-resolves only the sampler slots whose texture or "
-          "sampler state changed");
-      // Off reverts to full per-draw hazard tracking of every sampled
-      // store, for the A/B pixel proof
-      // via r_deko9EmissiveTourShots.
-      r_deko9StaticHazard = Dvar_RegisterBool(
-          "r_deko9StaticHazard",
-          1,
-          DVAR_NOFLAG,
-          "deko3d renderer: a store never used as a render/depth/blit target is added to a draw's hazard set only "
-          "when newly bound or a copy wrote it while it stayed bound, instead of every draw it is sampled");
-      r_deko9Instancing = Dvar_RegisterBool(
-          "r_deko9Instancing",
-          1,
-          DVAR_NOFLAG,
-          "deko3d renderer: draw runs of rigid static models with one instanced draw (per-instance vertex "
-          "constants from an instance stream) instead of one draw per model");
-      r_deko9StaticPretess = Dvar_RegisterBool(
-          "r_deko9StaticPretess",
-          1,
-          DVAR_NOFLAG,
-          "deko3d renderer: draw world (BSP and brush-model) triangles as ranges of one static index buffer built "
-          "at map load instead of copying their indices into the dynamic index buffers every frame");
-      r_deko9StaticPretessModels = Dvar_RegisterBool(
-          "r_deko9StaticPretessModels",
-          1,
-          DVAR_NOFLAG,
-          "deko3d renderer: draw cached static-model lists from the model's static "
-          "index buffer, one ranged draw per instance (cache slot as base vertex), instead of copying every "
-          "instance's indices each frame");
       {
           // Render resolution (deko3d only). The engine renders exactly as if
           // the screen were this size (vidConfig, back buffer, every target,
@@ -1121,24 +1062,6 @@
           "deko3d renderer: hardware compression (DkImageFlags_HwCompression) for render targets and depth "
           "buffers (default on: lowers GPU time); read when the device and render targets are "
           "created (set on the command line)");
-      r_deko9LightBarriers = Dvar_RegisterInt(
-          "r_deko9LightBarriers",
-          0,
-          0,
-          2,
-          DVAR_NOFLAG,
-          "deko3d renderer: barrier for render->sample hazards inside the 3D pipe: 0 full barrier + L2 flush, "
-          "1 DkBarrier_Primitives, 2 DkBarrier_Fragments (copy/2D-engine hazards stay full)");
-      // Off: binned rasterization adds to the frame time on this GPU.
-      r_deko9TiledCache = Dvar_RegisterInt(
-          "r_deko9TiledCache",
-          0,
-          0,
-          2,
-          DVAR_NOFLAG,
-          "deko3d renderer: Maxwell tiled caching (binned rasterization in the L2): 0 off, 1 on with 128x128 "
-          "tiles, 2 on with 64x64 tiles; takes effect at the next command list and flushes before every "
-          "barrier, render-target change and submit");
       // Off-screen soft particles (zfeather* over/additive
       // sprites) drawn into an off-screen premultiplied target and
       // composited once per run.
@@ -1167,23 +1090,6 @@
           50.0f,
           DVAR_NOFLAG,
           "deko3d renderer: r_halfResParticles 3 turns it off below this average emissive + off-screen GPU ms");
-      r_deko9DrawProbe = Dvar_RegisterInt(
-          "r_deko9DrawProbe",
-          0,
-          0,
-          15,
-          DVAR_NOFLAG,
-          "deko3d renderer, GPU per-draw cost probe (pixels unchanged): bit 1 re-push all shader constants every "
-          "draw, 2 re-resolve textures/samplers every draw, 4 re-bind vertex streams and index buffer every "
-          "draw, 8 each r_deko9DrawSplit sub-draw also re-pushes constants");
-      r_deko9DrawSplit = Dvar_RegisterInt(
-          "r_deko9DrawSplit",
-          1,
-          1,
-          16,
-          DVAR_NOFLAG,
-          "deko3d renderer, GPU per-draw cost probe: issue every triangle-list draw as this many consecutive "
-          "draws of the same triangles (identical pixels, more GPU draws)");
       r_halfResParticlesUpsample = Dvar_RegisterInt(
           "r_halfResParticlesUpsample",
           1,

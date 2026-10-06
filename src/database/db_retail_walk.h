@@ -216,9 +216,10 @@ struct RetailWalkFxElemOffsets
     FxElemMarkVisuals *visualMarks;   // elemType==9 marks, length visualCount
     XModel *visualModel;              // elemType==5 single visual
     XModel **visualModelArray;        // elemType==5 array visual, length visualCount
-    // elemType==10 (runner) visuals are effect-name strings the original
-    // Load_FxEffectDefRef resolves to FxEffectDef handles in place; these
-    // are the inline string starts (UINT32_MAX = none), single/array.
+    // String visuals: elemType==10 (runner) effect names, which the original
+    // Load_FxEffectDefRef resolves to FxEffectDef handles in place, and
+    // elemType==8 (sound) alias names, kept as strings. These are the block-4
+    // string starts (UINT32_MAX = none), single/array.
     uint32_t visualEffectName;
     uint32_t *visualEffectNameArray;  // length visualCount
 };

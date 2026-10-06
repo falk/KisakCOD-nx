@@ -22,6 +22,7 @@
 #include <server_mp/server_mp.h>
 #elif KISAK_SP
 #include "cg_main.h"
+#include <port/switch_settings_hud.h>
 #include <server/server.h>
 #include <game/g_local.h>
 #endif
@@ -360,7 +361,7 @@ void __cdecl CG_DrawUpperRightDebugInfo(int32_t localClientNum)
         y = cg_debugInfoCornerOffset->current.vector[1];
 
         if (cg_drawFPS->current.integer)
-            y = CG_DrawFPS(&scrPlaceFull, y, &v4);
+            y = SwSettingsHud_Draw(&scrPlaceFull, (float)CG_DrawFPS(&scrPlaceFull, y, &v4));
 
         if (com_statmon->current.enabled)
             y = CG_DrawStatmon(&scrPlaceFull, y, &v4);

@@ -2,6 +2,7 @@
 #error This file is for SinglePlayer only
 #endif
 
+#include <port/switch_sp_launch.h>
 #include <universal/q_shared.h>
 #include "client.h"
 #include <game/g_local.h>
@@ -13,6 +14,9 @@
 #include <platform/switch/switch_input_lifecycle.h>
 #include <platform/switch/switch_platform.h>
 #include <port/switch_rumble.h>
+#ifdef KISAK_SP
+#include <cgame/cg_rumble.h>
+#endif
 extern bool Sys_IsMainThread();
 #else
 #include <win32/win_local.h>
@@ -869,7 +873,8 @@ void __cdecl CL_Frame(int localClientNum, int msec)
         if ((clientUIActives[0].keyCatchers & KEYCATCH_UI) != 0)
         {
             v24 = CL_ControllerIndexFromClientNum(localClientNum);
-            //CL_GamepadRepeatScrollingButtons(localClientNum, v24); // KISAKTODO
+            // Held menu directions repeat in the platform input layer
+            // (Switch_InputTranslate), which owns the pad edge events.
         }
         CL_SetCGameTime(localClientNum);
     }
@@ -1097,8 +1102,19 @@ void __cdecl CL_VoidCommand()
     ;
 }
 
+#ifdef KISAK_SP
+static void CL_PrintStartMultiplayerRefusal(const char *line)
+{
+    Com_Printf(CON_CHANNEL_CLIENT, "%s", line);
+}
+#endif
+
 void __cdecl CL_startMultiplayer_f()
 {
+#ifdef KISAK_SP
+    Switch_StartMultiplayerRefused(CL_PrintStartMultiplayerRefusal);
+    return;
+#endif
     iassert(0); // KISAKTODO
     if (!Sys_IsMainThread())
         MyAssertHandler("c:\\trees\\cod3\\cod3src\\src\\client\\cl_main.cpp", 1453, 0, "%s", "Sys_IsMainThread()");
@@ -1339,10 +1355,8 @@ void __cdecl CL_InitOnceForAllClients()
 
 void __cdecl CL_StopControllerRumbles()
 {
-    //CG_StopAllRumbles(0); // no CG-side rumble-graph system exists to
-    // stop (see switch_rumble.cpp's top comment); this is the explicit hard
-    // reset for the Switch HD Rumble path this port has instead.
 #ifdef __SWITCH__
+    CG_StopAllRumbles(0);
     Switch_RumbleStopAllDevices();
 #endif
 }

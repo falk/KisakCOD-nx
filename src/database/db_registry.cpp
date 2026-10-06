@@ -2121,6 +2121,16 @@ XAssetEntryPoolEntry *__cdecl DB_LinkXAssetEntry(XAssetEntryPoolEntry *newEntry,
     }
     if (!existingEntryIndex)
     {
+        // g_defaultAssetCount is the number of zone-0 entries. Assets the
+        // engine registers outside any zone load (the generated "$" images)
+        // land in zone 0 too and must be counted like the default stubs, or
+        // DB_FreeDefaultEntries finds entries the counter does not know.
+        if (!newEntry->entry.zoneIndex)
+        {
+            ++g_defaultAssetCount;
+            Com_Printf(CON_CHANNEL_SYSTEM, "DB: zone-0 %s '%s' registered outside a zone load\n",
+                       g_assetNames[type], name);
+        }
         newEntry->entry.nextHash = db_hashTable[hash];
         db_hashTable[hash] = newEntry - g_assetEntryPool;
         return newEntry;
@@ -2186,7 +2196,10 @@ XAssetEntryPoolEntry *__cdecl DB_LinkXAssetEntry(XAssetEntryPoolEntry *newEntry,
         }
         return existingEntry;
     }
-    --g_defaultAssetCount;
+    // The existing zone-0 entry takes the new asset's zone: it stops being a
+    // zone-0 entry unless the new asset is zone 0 as well.
+    if (newEntry->entry.zoneIndex)
+        --g_defaultAssetCount;
     if (existingEntry->entry.inuse)
     {
         varXAsset = &existingEntry->entry.asset;
@@ -3711,6 +3724,14 @@ void DB_FreeDefaultEntries()
     uint32_t hash; // [esp+4h] [ebp-Ch]
     uint32_t assetEntryIndex; // [esp+8h] [ebp-8h]
     XAssetEntryPoolEntry *assetEntry; // [esp+Ch] [ebp-4h]
+
+    int32_t zoneZeroEntries = 0;
+    for (hash = 0; hash < 0x8000; ++hash)
+        for (assetEntryIndex = db_hashTable[hash]; assetEntryIndex;
+             assetEntryIndex = g_assetEntryPool[assetEntryIndex].entry.nextHash)
+            ++zoneZeroEntries;
+    Com_Printf(CON_CHANNEL_SYSTEM, "DB_FreeDefaultEntries: %d zone-0 entries, counter %d\n", zoneZeroEntries,
+               g_defaultAssetCount);
 
     for (hash = 0; hash < 0x8000; ++hash)
     {

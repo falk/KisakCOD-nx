@@ -8,18 +8,20 @@
 // (src/game/g_scr_main.cpp ScrCmd_PlayRumbleOnEntity_Internal, event 70/72,
 // and ScrCmd_StopRumble), CS_RUMBLES configstrings that carry a rumble
 // asset *name* string, and WeaponDef::fireRumble/meleeImpactRumble name
-// fields (bg_weapons_load_obj.cpp) -- but every client-side consumer that
-// would turn a rumble asset name into an actual curve is a no-op
-// (cg_event.cpp's EV_PLAY_RUMBLE_* cases, CG_PlayRumble_f in
-// cg_consolecmds.cpp, CG_FireWeapon's fireRumble path in cg_weapons.cpp).
+// fields (bg_weapons_load_obj.cpp).  The curves behind those names are not in
+// the PC zones, so the port maps the names itself (cg_rumble.cpp).
 // There is no rumble asset TYPE in the zone/database layer at all
 // (src/database has no ASSET_TYPE_RUMBLE*/RumbleInfo/rumble-graph reader):
 // the low/high-frequency motor-intensity-over-time "rumble graphs"
 // are Xenon/PS3 XAsset data this PC-derived retail zone
-// format never carries, so there is nothing to evaluate even where the
-// event plumbing does reach a hook.
+// format never carries.
 //
-// Path taken: the minimal engine-side events the task allows for exactly
+// Script rumbles (cgame/cg_rumble.cpp) play named effects from the
+// port-owned table in switch_rumble_names.h through the same HD player; a
+// script rumble and a port effect of the same kind (damage, blast) that start
+// together collapse to one.  Reload stages are local-player only.
+//
+// Path taken for the built-in effects: the minimal engine-side events the task allows for exactly
 // this case. Three call sites feed Switch_RumbleNotify*: CG_FireWeapon
 // (src/cgame/cg_weapons.cpp, local player's own fire, weapon class),
 // CG_DamageFeedback (src/cgame/cg_playerstate.cpp, local player's own
@@ -65,10 +67,14 @@ SwitchRumbleState s_state;
 uint32_t s_lastFrameMs;
 bool s_haveLastFrameMs;
 
+uint32_t s_counterFrames;
+uint32_t s_lastCounterTotal;
+
 bool s_devicesReady;
 u32 s_deviceStyle;
 HidVibrationDeviceHandle s_handles[2];
 s32 s_handleCount;
+u32 s_failedStyle;
 
 u32 PickStyleTag(u32 styleSet)
 {
@@ -175,8 +181,19 @@ bool EnsureDevices(const PadState *pad)
     if (R_FAILED(rc))
     {
         s_devicesReady = false;
+        // Once per style change: the caller retries every frame.
+        if (s_failedStyle != styleTag)
+        {
+            s_failedStyle = styleTag;
+            Com_Printf(CON_CHANNEL_DONT_FILTER,
+                       "SWITCH_RUMBLE init FAILED style=0x%x handles=%d result=0x%x\n", (unsigned)styleTag,
+                       (int)s_handleCount, (unsigned)rc);
+        }
         return false;
     }
+    s_failedStyle = 0;
+    Com_Printf(CON_CHANNEL_DONT_FILTER, "SWITCH_RUMBLE init ok style=0x%x handles=%d result=0x%x\n",
+               (unsigned)styleTag, (int)s_handleCount, (unsigned)rc);
 
     s_deviceStyle = styleTag;
     s_devicesReady = true;
@@ -191,7 +208,18 @@ void Switch_RumbleRegisterDvars(void)
     s_intensity = Dvar_RegisterFloat(
         "rumble_intensity", 0.8f, 0.0f, 2.0f, DVAR_ARCHIVE, "Global HD Rumble intensity scale");
     s_hd = Dvar_RegisterBool("rumble_hd", true, DVAR_ARCHIVE, "Shaped HD Rumble effects (0 = fixed-frequency fallback)");
-    SwitchRumbleHd_Reset(&s_hdPlayer);
+    SwitchRumbleHd_Init(&s_hdPlayer);
+}
+
+SwitchRumbleHdPlayer *Switch_RumbleHdPlayer(void)
+{
+    return HdOn() ? &s_hdPlayer : nullptr;
+}
+
+void Switch_RumbleNotifyReload(int32_t kind, float seconds)
+{
+    if (HdOn())
+        SwitchRumbleHd_TriggerReload(&s_hdPlayer, kind, seconds);
 }
 
 void Switch_RumbleNotifyWeaponFire(int32_t weapClass, int32_t boltAction)
@@ -289,7 +317,7 @@ void Switch_RumbleFrame(void)
     {
         SwitchRumbleHd_Advance(&s_hdPlayer, dtSeconds, &hdOut);
         if (!enabled)
-            SwitchRumbleHd_Reset(&s_hdPlayer);
+            SwitchRumbleHd_DropOneShots(&s_hdPlayer);
         SwitchRumbleHd_ApplyIntensity(&hdOut, intensity, enabled ? 1 : 0);
     }
     else
@@ -302,6 +330,23 @@ void Switch_RumbleFrame(void)
         Switch_RumbleApplyIntensity(mixLow, mixHigh, intensity, enabled ? 1 : 0, &outLow, &outHigh);
         hdOut.left = {outLow, SWITCH_RUMBLE_LOW_FREQ_HZ, outHigh, SWITCH_RUMBLE_HIGH_FREQ_HZ};
         hdOut.right = hdOut.left;
+    }
+
+    // One line a second at 60 fps while the counters move, so an OLED run
+    // can see which sources fired.
+    if (++s_counterFrames >= 60)
+    {
+        s_counterFrames = 0;
+        uint32_t total = s_hdPlayer.deduped;
+        for (uint32_t c : s_hdPlayer.started)
+            total += c;
+        if (total != s_lastCounterTotal)
+        {
+            s_lastCounterTotal = total;
+            char line[192];
+            SwitchRumbleHd_FormatCounters(&s_hdPlayer, line, sizeof(line));
+            Com_Printf(CON_CHANNEL_DONT_FILTER, "%s", line);
+        }
     }
 
     const SwitchInputState *input = Switch_GetInputState();

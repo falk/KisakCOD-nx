@@ -314,7 +314,7 @@ void SwitchPerf_AddServerThreadTicks(uint64_t ticks, int frames);
 //   used_peak / cap  most pretess indices used in one frame / buffer capacity
 //   pt_bytes     index bytes the pretess paths copied (world + static models)
 //   st_draws     world sub-draws drawn straight from the static world index
-//                buffer (r_deko9StaticPretess: a run splits at every index
+//                buffer (static pretess: a run splits at every index
 //                discontinuity as well as firstVertex/lightmap/probe), and
 //                st_surfs the world surfaces they cover
 //   sm_lists / sm_inst  static-model cached lists pretessed and the model

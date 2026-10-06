@@ -37,7 +37,16 @@ static void TestTableSane()
         const SwitchRumbleHdEffect *fx = &kSwitchRumbleHdEffects[e];
         CHECK(fx->keyCount >= 2 && fx->keyCount <= SWITCH_RUMBLE_HD_MAX_KEYS);
         CHECK(fx->keys[0].t == 0.0f);
-        CHECK(fx->keys[fx->keyCount - 1].ampLow == 0.0f && fx->keys[fx->keyCount - 1].ampHigh == 0.0f);
+        // Cycle effects (steady engine/rotor/chatter/lock tones) loop
+        // seamlessly: their last key repeats the first.  All others end silent.
+        const bool cycle = e == SWITCH_RUMBLE_HD_SCRIPT_TANK || e == SWITCH_RUMBLE_HD_SCRIPT_ROTOR ||
+                           e == SWITCH_RUMBLE_HD_SCRIPT_MINIGUN || e == SWITCH_RUMBLE_HD_SCRIPT_LOCK;
+        const SwitchRumbleHdKey *last = &fx->keys[fx->keyCount - 1];
+        if (cycle)
+            CHECK(last->ampLow == fx->keys[0].ampLow && last->ampHigh == fx->keys[0].ampHigh &&
+                  last->freqLow == fx->keys[0].freqLow && last->freqHigh == fx->keys[0].freqHigh);
+        else
+            CHECK(last->ampLow == 0.0f && last->ampHigh == 0.0f);
         for (int k = 0; k < fx->keyCount; ++k)
         {
             const SwitchRumbleHdKey *key = &fx->keys[k];
@@ -51,7 +60,7 @@ static void TestTableSane()
 
 static void TestInterpolation()
 {
-    SwitchRumbleHdPlayer p;
+    SwitchRumbleHdPlayer p{};
     SwitchRumbleHdOut out;
     SwitchRumbleHd_Reset(&p);
 
@@ -78,7 +87,7 @@ static void TestInterpolation()
 
 static void TestAutoRetrigger()
 {
-    SwitchRumbleHdPlayer p;
+    SwitchRumbleHdPlayer p{};
     SwitchRumbleHdOut out;
     SwitchRumbleHd_Reset(&p);
 
@@ -131,7 +140,7 @@ static void TestAutoRetrigger()
 
 static void TestMixAndClamp()
 {
-    SwitchRumbleHdPlayer p;
+    SwitchRumbleHdPlayer p{};
     SwitchRumbleHdOut single;
     SwitchRumbleHdOut mixed;
 
@@ -181,7 +190,7 @@ static void TestMixAndClamp()
 
 static void TestBalance()
 {
-    SwitchRumbleHdPlayer p;
+    SwitchRumbleHdPlayer p{};
     SwitchRumbleHdOut out;
 
     SwitchRumbleHd_Reset(&p);
@@ -209,7 +218,7 @@ static void TestBalance()
 
 static void TestExplosionDistance()
 {
-    SwitchRumbleHdPlayer p;
+    SwitchRumbleHdPlayer p{};
     SwitchRumbleHdOut nearOut;
     SwitchRumbleHdOut farOut;
 
@@ -230,7 +239,7 @@ static void TestExplosionDistance()
 
 static void TestStopAndSend()
 {
-    SwitchRumbleHdPlayer p;
+    SwitchRumbleHdPlayer p{};
     SwitchRumbleHdOut out;
     SwitchRumbleHd_Reset(&p);
     SwitchRumbleHd_Trigger(&p, SWITCH_RUMBLE_HD_LAUNCHER, 1.0f, 0.0f);

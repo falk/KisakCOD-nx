@@ -173,10 +173,10 @@ void Device::CensusBegin(const char *material, const char *technique, const char
     // this slot's previous lap).
     std::memset(m_censusReports.cpu + index * kCensusSlotBytes, 0xff, kCensusSlotBytes);
     const DkGpuAddr base = m_censusReports.gpu + index * kCensusSlotBytes;
-    dkCmdBufReportCounter(m_cmd, DkCounter_SamplesPassed, base);
+    dkCmdBufReportCounter(Rec(), DkCounter_SamplesPassed, base);
     if (m_censusMode >= 2)
-        dkCmdBufReportCounter(m_cmd, DkCounter_FragmentShaderInvocations, base + 16);
-    dkCmdBufReportCounter(m_cmd, DkCounter_Timestamp, base + 32);
+        dkCmdBufReportCounter(Rec(), DkCounter_FragmentShaderInvocations, base + 16);
+    dkCmdBufReportCounter(Rec(), DkCounter_Timestamp, base + 32);
     MarkWork();
     m_censusOpen = true;
     m_censusKeyPass = m_curPass;
@@ -211,10 +211,10 @@ void Device::CensusEnd()
     m_censusOpen = false;
     const uint32_t index = (uint32_t)(m_censusHead % kCensusSlots);
     const DkGpuAddr base = m_censusReports.gpu + index * kCensusSlotBytes;
-    dkCmdBufReportCounter(m_cmd, DkCounter_SamplesPassed, base + 48);
+    dkCmdBufReportCounter(Rec(), DkCounter_SamplesPassed, base + 48);
     if (m_censusMode >= 2)
-        dkCmdBufReportCounter(m_cmd, DkCounter_FragmentShaderInvocations, base + 64);
-    dkCmdBufReportCounter(m_cmd, DkCounter_Timestamp, base + 80);
+        dkCmdBufReportCounter(Rec(), DkCounter_FragmentShaderInvocations, base + 64);
+    dkCmdBufReportCounter(Rec(), DkCounter_Timestamp, base + 80);
     MarkWork();
     uint64_t psHash = 0;
     Deko9DkshStats ps{};

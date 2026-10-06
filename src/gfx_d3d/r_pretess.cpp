@@ -206,7 +206,7 @@ int __cdecl R_ReadBspPreTessDrawSurfs(
     return 1;
 }
 
-// ---- Static world index buffer (r_deko9StaticPretess, see r_pretess.h) -----
+// ---- Static world index buffer (see r_pretess.h) ---------------------------
 
 namespace
 {
@@ -256,22 +256,10 @@ void R_StaticPretessSetWorld(const GfxWorld *world)
                bytes);
 }
 
-IDirect3DIndexBuffer9 *R_StaticPretessWorldIbAny()
+IDirect3DIndexBuffer9 *R_StaticPretessWorldIb()
 {
     const StaticPretessWorld &s = s_staticPretess;
     if (!s.ib || !rgp.world || s.world != rgp.world || s.indices != rgp.world->indices)
         return nullptr;
     return s.ib;
-}
-
-IDirect3DIndexBuffer9 *R_StaticPretessWorldIb()
-{
-    if (!r_deko9StaticPretess || !r_deko9StaticPretess->current.enabled)
-        return nullptr;
-    return R_StaticPretessWorldIbAny();
-}
-
-bool R_StaticPretessModels()
-{
-    return r_deko9StaticPretessModels && r_deko9StaticPretessModels->current.enabled;
 }

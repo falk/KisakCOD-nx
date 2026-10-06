@@ -10,14 +10,16 @@
 // reported on the frame after that (RB_PollRequestedScreenshot), so the
 // console message reflects what actually landed on the card.
 //
-// The levelshot/savegame variants of the Win32 command feed the Win32-only
-// save-thumbnail path (R_SaveGameShot / R_LevelShot) and are reported as
-// unsupported here rather than silently ignored.
+// `screenshot savegame <path>` writes the 256x128 saved-game thumbnail
+// <path>.svt (switch_save_thumb.h) under the game directory; the save
+// writer requests the same capture for every save. `levelshot` feeds the
+// Win32-only level-shot path and is reported as unsupported.
 #include <universal/q_shared.h>
 #include <gfx_d3d/r_screenshot.h>
 #include <gfx_d3d/rb_backend.h>
 #include <qcommon/cmd.h>
 #include <universal/com_files.h>
+#include "switch_save_writer.h"
 
 #include <cstdio>
 #include <cstring>
@@ -31,7 +33,20 @@ static bool s_pendingSilent = false;
 void __cdecl R_ScreenshotCommand(GfxScreenshotType type)
 {
     (void)type; // both spellings write PNG on Switch
-    if (!strcmp(Cmd_Argv(1), "levelshot") || !strcmp(Cmd_Argv(1), "savegame"))
+    if (!strcmp(Cmd_Argv(1), "savegame"))
+    {
+        if (Cmd_Argc() != 3 || !*Cmd_Argv(2))
+        {
+            Com_Printf(8, "Usage: screenshot savegame <path>\n");
+            return;
+        }
+        char qpath[256], ospath[260];
+        Com_sprintf(qpath, sizeof(qpath), "%s.svg", Cmd_Argv(2));
+        FS_BuildOSPath(fs_homepath->current.string, fs_gameDirVar->current.string, qpath, ospath);
+        SwitchSaveThumb_Request(ospath);
+        return;
+    }
+    if (!strcmp(Cmd_Argv(1), "levelshot"))
     {
         Com_Printf(8, "ScreenShot: %s is not supported on Switch\n", Cmd_Argv(1));
         return;

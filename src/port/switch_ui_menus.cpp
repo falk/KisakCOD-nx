@@ -20,6 +20,7 @@
 #include "switch_menu_patch.h"
 #include "switch_menu_settings.h"
 #include "switch_text_input.h"
+#include "switch_save_thumb.h"
 #include "switch_ui_menus.h"
 
 #ifdef __SWITCH__
@@ -343,6 +344,12 @@ void Switch_UI_FillSaveInfo(SavegameInfo *info, const char *saveName)
     }
     if (header.mapName[0])
         info->mapName = String_Alloc(header.mapName);
+
+    // The thumbnail written at save time (switch_save_thumb.h); the draw call
+    // asks the renderer for it by the save's name.
+    char thumbPath[96];
+    if (SaveThumb_PathForSave(path, thumbPath, sizeof(thumbPath)) && FS_FileExists(thumbPath))
+        info->imageName = String_Alloc(saveName);
 
     info->tm = header.time;
     if (header.time.tm_year > 0)

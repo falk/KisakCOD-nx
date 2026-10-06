@@ -63,7 +63,7 @@ void __cdecl R_DrawStaticModelsPreTessDrawSurfLighting(
     GfxCmdBufContext context,
     const uint16_t *staticList = nullptr);
 // True when the surface's triangle indices sit in its zone's static index
-// buffer (r_deko9StaticPretessModels can draw it without copying); returns
+// buffer (the static pretess path draws it without copying); returns
 // the buffer and first index.
 bool R_StaticModelSurfHasStaticIndices(
     const XSurface *xsurf,

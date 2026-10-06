@@ -171,7 +171,7 @@ void TestPerThreadCursorsNeverOverlap()
 }
 
 // "large requests": a request bigger than the chunk size gets a dedicated
-// chunk of its own (2.2 "Model"), not a truncated/failed allocation.
+// chunk of its own, not a truncated/failed allocation.
 void TestLargeRequest()
 {
     constexpr uint32_t kChunk = 1u << 16; // 64 KiB, deliberately small

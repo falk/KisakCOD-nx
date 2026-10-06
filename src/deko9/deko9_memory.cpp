@@ -72,6 +72,23 @@ bool Heap::Alloc(DkDevice device, uint32_t size, uint32_t align, GpuAlloc *out)
         chunk.freeSpans[0] = chunkSize - m_tailReserve;
         m_chunks.push_back(std::move(chunk));
         m_reserved += chunkSize;
+        if (m_flags & DkMemBlockFlags_Image)
+        {
+            DkMemBlockMaker sm;
+            dkMemBlockMakerDefaults(&sm, device, fr::kSentinelBytes);
+            sm.flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuUncached;
+            if (DkMemBlock sb = dkMemBlockCreate(&sm))
+            {
+                Sentinel s{sb, static_cast<uint32_t *>(dkMemBlockGetCpuAddr(sb)), dkMemBlockGetGpuAddr(sb),
+                           dkMemBlockGetGpuAddr(block), chunkSize, 0};
+                fr::FillSentinel(s.cpu, fr::kSentinelBytes / 4);
+                m_sentinels.push_back(s);
+                Log("image sentinel %zu gpu=0x%llx-0x%llx after image memblock gpu=0x%llx (+aliases to 0x%llx)",
+                    m_sentinels.size() - 1, (unsigned long long)s.gpu,
+                    (unsigned long long)s.gpu + fr::kSentinelBytes, (unsigned long long)s.imageGpu,
+                    (unsigned long long)s.imageGpu + 3ull * chunkSize);
+            }
+        }
     }
     return false;
 }
@@ -140,8 +157,37 @@ bool CheckCanary(const uint8_t *tail)
     return true;
 }
 
+bool Heap::CheckSentinel(uint32_t index, char *report, size_t reportSize)
+{
+    if (m_sentinels.empty())
+        return false;
+    Sentinel &s = m_sentinels[index % m_sentinels.size()];
+    const uint32_t words = fr::kSentinelBytes / 4;
+    uint32_t first = words;
+    const uint32_t dirty = fr::CheckSentinel(s.cpu, words, &first);
+    if (!dirty)
+        return false;
+    ++s.hits;
+    const uint32_t *w = s.cpu + first;
+    const uint32_t n = words - first;
+    std::snprintf(report, reportSize,
+                  "sentinel %u gpu=0x%llx (after image memblock gpu=0x%llx size=0x%x, aliases to 0x%llx) hit %u: "
+                  "%u of %u sampled words written, first at +0x%x (gpu 0x%llx): %08x %08x %08x %08x %08x %08x %08x "
+                  "%08x; a GPU write ran past the end of an image memblock",
+                  (unsigned)(index % m_sentinels.size()), (unsigned long long)s.gpu, (unsigned long long)s.imageGpu,
+                  s.imageSize, (unsigned long long)s.imageGpu + 3ull * s.imageSize, s.hits, dirty,
+                  words / fr::kSentinelStrideWords, first * 4, (unsigned long long)s.gpu + first * 4ull, w[0],
+                  n > 1 ? w[1] : 0, n > 2 ? w[2] : 0, n > 3 ? w[3] : 0, n > 4 ? w[4] : 0, n > 5 ? w[5] : 0,
+                  n > 6 ? w[6] : 0, n > 7 ? w[7] : 0);
+    fr::FillSentinel(s.cpu, words);
+    return true;
+}
+
 void Heap::Destroy()
 {
+    for (Sentinel &s : m_sentinels)
+        dkMemBlockDestroy(s.block);
+    m_sentinels.clear();
     for (Chunk &chunk : m_chunks)
         dkMemBlockDestroy(chunk.block);
     m_chunks.clear();
@@ -394,10 +440,13 @@ void Device::CollectCompleted()
             ++it;
         }
     }
+    FrVerifyRetired();
     for (auto it = m_busyCmdChunks.begin(); it != m_busyCmdChunks.end();)
     {
         if (it->seq <= m_completedSeq)
         {
+            CheckCmdGuard(it->mem, "retire", it->seq);
+            FrNoteFree(it->mem, it->seq);
             m_freeCmdChunks.push_back(it->mem);
             it = m_busyCmdChunks.erase(it);
         }

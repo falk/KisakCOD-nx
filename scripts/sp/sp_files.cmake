@@ -26,6 +26,8 @@ set(CGAME
     "${SRC_DIR}/cgame/cg_ents.cpp"
     "${SRC_DIR}/cgame/cg_ents.h"
     "${SRC_DIR}/cgame/cg_main.cpp"
+    "${SRC_DIR}/cgame/cg_rumble.cpp"
+    "${SRC_DIR}/cgame/cg_rumble.h"
     "${SRC_DIR}/cgame/cg_main.h"
     "${SRC_DIR}/cgame/cg_modelpreviewer.cpp"
     "${SRC_DIR}/cgame/cg_modelpreviewer.h"
